@@ -1,7 +1,10 @@
 from dataclasses import dataclass
 from typing import Tuple, Dict
-import math, pandas as pd, os, json
-from bot.utils.time_utils import now_utc, to_iso
+import math
+import pandas as pd
+import os
+import json
+import numpy as np  # <-- Te aseguré que numpy esté importado aquí
 
 @dataclass
 class RiskParams:
