@@ -6,3 +6,4 @@ numpy==1.26.4
 aiohttp==3.9.5
 python-dotenv==1.0.1
 PyYAML==6.0.2
+pytz==2024.1
