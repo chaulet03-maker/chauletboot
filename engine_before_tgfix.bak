@@ -1,0 +1,501 @@
+﻿from __future__ import annotations
+import json
+
+import os
+import asyncio
+from dataclasses import dataclass, field
+from typing import Optional, Dict, List
+
+from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters
+
+from .config import Config
+from .exchanges import get_exchange
+from .persistence import Persist, Paths
+from .strategy import RegimeDetector, Trailing
+from .notifier import Notifier, NotifierConfig
+from .utils import now_s
+
+
+@dataclass
+class Position:
+    symbol: str
+    side: str
+    qty: float
+    entry: float
+    sl: float
+    tp1: float
+    tp2: float
+    leverage: int
+    layer: str
+    tp1_done: bool = False
+    trail: Optional[float] = None
+    opened_ts: float = field(default_factory=now_s)
+
+
+class TradingApp:
+
+    def _normalize_pos(self, pos):
+        if isinstance(pos, str):
+            s = pos.strip()
+            if s and s[0] in "{[":
+                try:
+                    pos = json.loads(s)
+                except Exception:
+                    return None
+            else:
+                return None
+        if not isinstance(pos, dict):
+            return None
+        for k in ("qty","entry","sl","tp1","tp2","realized_pnl","lev","entry_adx","leg"):
+            if k in pos and pos[k] is not None:
+                try:
+                    if k in ("lev","leg"):
+                        pos[k] = int(pos[k])
+                    else:
+                        pos[k] = float(pos[k])
+                except Exception:
+                    pass
+        if "side" in pos and not isinstance(pos["side"], str):
+            try:
+                pos["side"] = pos["side"].decode("utf-8","ignore")
+            except Exception:
+                pos["side"] = str(pos["side"])
+        return pos
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
+
+        # Persistencia
+        os.makedirs(cfg.persistence.dir, exist_ok=True)
+        self.persist = Persist(
+            Paths(
+                cfg.persistence.sqlite_file,
+                cfg.persistence.equity_csv,
+                cfg.persistence.trades_csv,
+                cfg.persistence.state_file,
+                cfg.persistence.logs_file,
+            )
+        )
+
+        # Estado
+        self.equity: float = float(cfg.risk.equity_usdt)
+        self.peak_equity: float = self.equity
+        self.positions: Dict[str, List[Position]] = {}
+        self.recientes: List[str] = []
+        self.trades: List[dict] = []
+
+        # Estrategia
+        self.regime = RegimeDetector(
+            adx_min=cfg.strategy.layers.get("regime", {}).get("trend_adx_min", 18.0),
+            fast=cfg.strategy.layers.get("regime", {}).get("fast_ma", 20),
+            slow=cfg.strategy.layers.get("regime", {}).get("slow_ma", 50),
+            rsi_period=cfg.strategy.layers.get("regime", {}).get("rsi_period", 14),
+            rsi_low=cfg.strategy.layers.get("regime", {}).get("rsi_range_low", 40),
+            rsi_high=cfg.strategy.layers.get("regime", {}).get("rsi_range_high", 60),
+        )
+        tcfg = cfg.strategy.trailing
+        self.trailing = Trailing(
+            tcfg.mode,
+            tcfg.atr_k,
+            tcfg.ema_period,
+            tcfg.percent,
+            tcfg.hysteresis_pct,
+            tcfg.min_step_pct,
+        )
+
+        # Exchange (paper/real)
+        if cfg.mode == "paper":
+            self.exchange = get_exchange(
+                "paper", fees={"taker": 0.0002}, slippage_bps=cfg.execution.slippage_bps
+            )
+        else:
+            self.exchange = get_exchange(
+                "real",
+                api_key=os.getenv("BINANCE_API_KEY", ""),
+                api_secret=os.getenv("BINANCE_API_SECRET", ""),
+                password=os.getenv("BINANCE_PASSWORD", ""),
+            )
+
+        # Telegram
+        self.app = None
+        self.notifier: Optional[Notifier] = None
+        self.running = False
+        self._runner_task = None
+
+        # RestauraciÃ³n de estado
+        st = self.persist.load_state()
+        if st:
+            self.equity = float(st.get("equity", self.equity))
+            self.peak_equity = float(st.get("peak_equity", self.equity))
+            for pos in st.get("positions", []):
+                norm = self._normalize_pos(pos)
+                if not norm:
+                    continue
+                p = Position(**norm)
+
+                self.positions.setdefault(p.symbol, []).append(p)
+
+    # ---------------------------
+    # Ciclo de vida
+    # ---------------------------
+    async def start(self):
+        token = os.getenv("TELEGRAM_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN")
+        chat = os.getenv("TELEGRAM_CHAT_ID")
+        if not token or not chat:
+            self._telegram_disabled = True  # seguir sin Telegram
+
+        self.app = ApplicationBuilder().token(token).build()
+        self.notifier = Notifier(
+            self.app,
+            chat,
+            NotifierConfig(
+                min_interval_s=float(self.cfg.telegram.anti_spam.get("min_interval_s", 1.0)),
+                dedup_window_s=float(self.cfg.telegram.dedup_window_s),
+            ),
+        )
+
+        self._register_handlers()
+
+        # Cargar mercados y aplicar leverage (si corresponde)
+        await self.exchange.load_markets()
+        if self.cfg.execution.set_leverage:
+            for sym in self.cfg.symbols.whitelist:
+                try:
+                    await self.exchange.set_leverage(sym, int(self.cfg.execution.leverage))
+                except Exception:
+                    pass
+
+        # Iniciar Telegram
+        asyncio.create_task(self.app.initialize())
+        asyncio.create_task(self.app.start())
+
+        # Iniciar runner de TP/SL/trailing
+        self._runner_task = asyncio.create_task(self._runner())
+
+        self.running = True
+
+    async def _runner(self):
+        while True:
+            try:
+                for sym in list(self.cfg.symbols.whitelist):
+                    await self.check_tp_sl_trailing(sym)
+            except Exception:
+                pass
+            await asyncio.sleep(1.0)
+
+    async def run(self):
+        try:
+            while self.running:
+                await asyncio.sleep(0.2)
+        finally:
+            await self.shutdown()
+
+    async def shutdown(self):
+        try:
+            await self.close_all()
+        except Exception:
+            pass
+
+        try:
+            if self._runner_task:
+                self._runner_task.cancel()
+        except Exception:
+            pass
+
+        try:
+            if self.app:
+                await self.app.stop()
+                await self.app.shutdown()
+        except Exception:
+            pass
+
+        try:
+            await self.exchange.close()
+        except Exception:
+            pass
+
+        self._save_state()
+
+    # ---------------------------
+    # Helpers internos
+    # ---------------------------
+    def _save_state(self):
+        data = {
+            "equity": self.equity,
+            "peak_equity": self.peak_equity,
+            "positions": [vars(p) for s in self.positions.values() for p in s],
+        }
+        self.persist.save_state(data)
+
+    def _add_recent(self, reason: str):
+        self.recientes.append(reason)
+        self.recientes = self.recientes[-10:]
+
+    def _open_count(self) -> int:
+        return sum(len(v) for v in self.positions.values())
+
+    def _open_count_sym(self, symbol: str) -> int:
+        return len(self.positions.get(symbol, []))
+
+    async def bot_on(self):
+        self.running = True
+        return True
+
+    async def bot_off(self):
+        self.running = False
+        return True
+
+    # ---------------------------
+    # GestiÃ³n de posiciones
+    # ---------------------------
+    async def close_all(self):
+        for sym, plist in list(self.positions.items()):
+            for p in list(plist):
+                await self._close_position(sym, p, reason="manual_close_all")
+        self.positions.clear()
+        self._save_state()
+        return True
+
+    async def open_position(self, symbol: str, side: str, layer: str = "trend"):
+        if symbol not in self.cfg.symbols.whitelist:
+            self._add_recent(f"{symbol}: fuera de whitelist")
+            return False, "fuera de whitelist"
+
+        if self._open_count() >= self.cfg.limits.max_open_total:
+            self._add_recent("LÃ­mite global de operaciones alcanzado")
+            return False, "limite total"
+
+        if self._open_count_sym(symbol) >= self.cfg.limits.max_open_per_symbol:
+            self._add_recent(f"{symbol}: lÃ­mite por sÃ­mbolo alcanzado")
+            return False, "limite por sÃ­mbolo"
+
+        if self.cfg.limits.no_hedge and any(p.side != side for p in self.positions.get(symbol, [])):
+            self._add_recent(f"{symbol}: no_hedge activado (lado opuesto abierto)")
+            return False, "no_hedge"
+
+        t = await self.exchange.fetch_ticker(symbol)
+        price = float(t["last"])
+
+        risk_usdt = self.equity * (self.cfg.risk.max_risk_per_trade_pct / 100.0)
+        stop_dist = price * 0.008
+        qty = max(0.0, (risk_usdt / max(1e-9, stop_dist)))
+        qty = round(qty, 6)
+
+        tp1_R = self.cfg.strategy.layers.get("entry", {}).get("tp1_R", 1.0)
+        tp2_R = self.cfg.strategy.layers.get("entry", {}).get("tp2_R", 2.0)
+
+        if side == "long":
+            sl = price - stop_dist
+            tp1 = price + stop_dist * tp1_R
+            tp2 = price + stop_dist * tp2_R
+        else:
+            sl = price + stop_dist
+            tp1 = price - stop_dist * tp1_R
+            tp2 = price - stop_dist * tp2_R
+
+        fill, _fee = await self.exchange.market_order(symbol, side, qty, price)
+        p = Position(
+            symbol=symbol,
+            side=side,
+            qty=float(fill["qty"]),
+            entry=float(fill["price"]),
+            sl=sl,
+            tp1=tp1,
+            tp2=tp2,
+            leverage=int(self.cfg.execution.leverage),
+            layer=layer,
+        )
+        self.positions.setdefault(symbol, []).append(p)
+        self._save_state()
+
+        arrow = "â†‘" if side == "long" else "â†“"
+        await self.notifier.send(
+            f"{arrow} {side.upper()} {symbol} x{p.leverage}  entrada={p.entry:.2f}  SL={p.sl:.2f}  TP1={p.tp1:.2f}  TP2={p.tp2:.2f}",
+            dedup_key=f"OPEN:{symbol}:{side}",
+        )
+        return True, "ok"
+
+    async def _close_position(self, symbol: str, p: Position, reason: str):
+        side_reduce = "short" if p.side == "long" else "long"
+        fill, _fee = await self.exchange.reduce_only(symbol, side_reduce, p.qty, p.entry)
+
+        pnl = (fill["price"] - p.entry) * (p.qty if p.side == "long" else -p.qty)
+        self.equity += pnl
+
+        trade = {
+            "ts": now_s(),
+            "symbol": symbol,
+            "side": p.side,
+            "layer": p.layer,
+            "entry": p.entry,
+            "exit": fill["price"],
+            "qty": p.qty,
+            "pnl": pnl,
+            "pnl_pct": pnl / max(1e-9, abs(p.entry * p.qty)) * 100.0,
+            "leverage": p.leverage,
+            "event": reason,
+            "dt": now_s() - p.opened_ts,
+        }
+        self.trades.append(trade)
+        self.persist.log_trade(
+            trade["ts"],
+            symbol,
+            p.side,
+            p.layer,
+            p.entry,
+            trade["exit"],
+            p.qty,
+            pnl,
+            trade["pnl_pct"],
+            p.leverage,
+            reason,
+            trade["dt"],
+        )
+        self.persist.log_equity(now_s(), self.equity)
+
+        self.positions[symbol].remove(p)
+        if not self.positions[symbol]:
+            del self.positions[symbol]
+
+    async def check_tp_sl_trailing(self, symbol: str):
+        symlist = self.positions.get(symbol, [])
+        if not symlist:
+            return
+
+        t = await self.exchange.fetch_ticker(symbol)
+        c = float(t["last"])
+
+        for p in list(symlist):
+            if not p.tp1_done:
+                hit_tp1 = (p.side == "long" and c >= p.tp1) or (p.side == "short" and c <= p.tp1)
+                if hit_tp1:
+                    qty_half = round(p.qty * 0.5, 6)
+                    side_reduce = "short" if p.side == "long" else "long"
+                    await self.exchange.reduce_only(symbol, side_reduce, qty_half, c)
+                    p.qty -= qty_half
+                    p.tp1_done = True
+                    await self.notifier.send(
+                        f"ðŸŸ¢ TP1 {symbol} {p.side} half qty={qty_half} @ {c:.2f}",
+                        dedup_key=f"TP1:{symbol}:{p.side}",
+                    )
+                    continue
+
+            hit_tp2 = (p.side == "long" and c >= p.tp2) or (p.side == "short" and c <= p.tp2)
+            hit_sl = (p.side == "long" and c <= p.sl) or (p.side == "short" and c >= p.sl)
+
+            trail = self.trailing.trail(
+                p.side,
+                [p.entry, c] if p.trail is None else [p.trail, c],
+                last_trail=p.trail,
+            )
+            if trail is not None:
+                p.sl = trail
+                p.trail = trail
+
+            if hit_tp2 or hit_sl:
+                reason = "TP2" if hit_tp2 else "SL"
+                await self._close_position(symbol, p, reason=reason)
+                icon = "âœ…" if reason == "TP2" else "âŒ"
+                await self.notifier.send(
+                    f"{icon} {reason} {symbol} {p.side} @ {c:.2f}",
+                    dedup_key=f"{reason}:{symbol}:{p.side}",
+                )
+
+    # ---------------------------
+    # Telegram
+    # ---------------------------
+    def _register_handlers(self):
+        self.app.add_handler(CommandHandler(["ayuda", "menu", "comandos"], self._h_help))
+        self.app.add_handler(CommandHandler("estado", self._h_estado))
+        self.app.add_handler(CommandHandler("saldo", self._h_saldo))
+        self.app.add_handler(CommandHandler(["posicion", "posiciones"], self._h_posiciones))
+        self.app.add_handler(CommandHandler("bot", self._h_bot_toggle))
+        self.app.add_handler(CommandHandler("cerrar", self._h_cerrar))
+        self.app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), self._handle_text))
+
+    async def _h_help(self, update, context):
+        txt = (
+            "Comandos:\n"
+            "â€¢ /estado â€“ saldo actual + posiciones abiertas por sÃ­mbolo\n"
+            "â€¢ /saldo â€“ equity, peak, DD\n"
+            "â€¢ /posiciones â€“ detalle por lote\n"
+            "â€¢ /bot on | /bot off â€“ kill switch\n"
+            "â€¢ /cerrar todo â€“ cierra todo y resume\n"
+            "â€¢ recientes â€“ Ãºltimas 10 oportunidades NO abiertas\n"
+            "â€¢ stats | stats semana â€“ mÃ©tricas por sÃ­mbolo y capa\n"
+        )
+        await update.message.reply_text(txt)
+
+    async def _h_estado(self, update, context):
+        dd = (self.peak_equity - self.equity)
+        lines = [f"Equity: {self.equity:.2f}  Peak: {self.peak_equity:.2f}  DD: {dd:.2f}"]
+        for sym, plist in self.positions.items():
+            lines.append(f"â€¢ {sym}: {len(plist)}")
+        await update.message.reply_text("\n".join(lines))
+
+    async def _h_saldo(self, update, context):
+        dd = self.peak_equity - self.equity
+        await update.message.reply_text(
+            f"Equity: {self.equity:.2f}\nPeak: {self.peak_equity:.2f}\nDD actual: {dd:.2f}"
+        )
+
+    async def _h_posiciones(self, update, context):
+        if not self.positions:
+            await update.message.reply_text("Sin posiciones abiertas.")
+            return
+
+        out = []
+        for sym, plist in self.positions.items():
+            for p in plist:
+                out.append(
+                    f"{sym} {p.side} x{p.leverage}\n"
+                    f"entrada: {p.entry:.2f}\n"
+                    f"sl: {p.sl:.2f}\n"
+                    f"tp: {p.tp1:.2f} / {p.tp2:.2f}\n"
+                    f"pnl: (en vivo)\n"
+                )
+        await update.message.reply_text("\n".join(out))
+
+    async def _h_bot_toggle(self, update, context):
+        args = (context.args or [])
+        if len(args) >= 1 and args[0].lower() == "on":
+            await self.bot_on()
+            await update.message.reply_text("Bot ON")
+            return
+        if len(args) >= 1 and args[0].lower() == "off":
+            await self.bot_off()
+            await update.message.reply_text("Bot OFF")
+            return
+        await update.message.reply_text("UsÃ¡: /bot on | /bot off")
+
+    async def _h_cerrar(self, update, context):
+        txt = (update.message.text or "").lower()
+        if "todo" in txt:
+            await self.close_all()
+            await update.message.reply_text("ðŸ”´ Cierre total ejecutado.")
+            return
+        await update.message.reply_text("ConfirmÃ¡ con: /cerrar todo")
+
+    async def _handle_text(self, update, context):
+        msg = (update.message.text or "").strip().lower()
+
+        async def reply(t: str):
+            try:
+                return await update.message.reply_text(t)
+            except Exception:
+                return None
+
+        if msg in ("recientes", "motivos"):
+            if not self.recientes:
+                await reply("Sin motivos recientes.")
+                return
+            await reply("Ãšltimas 10 oportunidades NO abiertas:\n- " + "\n- ".join(self.recientes[-10:]))
+            return
+
+        if msg.startswith("open "):
+            parts = msg.split()
+            if len(parts) >= 3:
+                ok, reason = await self.open_position(parts[1].upper(), parts[2].lower())
+                await reply("OK" if ok else f"Rechazado: {reason}")
+                return
+            await reply("UsÃ¡: open SYMBOL long|short")
+

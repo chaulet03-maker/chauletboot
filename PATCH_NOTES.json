@@ -1,0 +1,8 @@
+{
+  "modified": {
+    "config/config.yaml": "updated or created to requested keys/values",
+    "CLEANUP.md": "added"
+  },
+  "kept_intact": "tokens, chat IDs, rutas y demás archivos del repo",
+  "root": "BOT_BESTIA_ULTRA"
+}

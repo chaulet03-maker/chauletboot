@@ -1,0 +1,25 @@
+{
+  "base_zip": "bot_final_fixed (1).zip",
+  "generated_at": "2025-09-24T11:47:34.745526Z",
+  "project_root": ".",
+  "created": [
+    "pro_tools/strategy_cots.py",
+    "pro_tools/fee_aware.py",
+    "pro_tools/rounding.py",
+    "pro_tools/data_ccxt.py",
+    "pro_tools/walkforward.py",
+    "pro_tools/run_walkforward.py",
+    "pro_tools/PRO_README.md",
+    "pro_tools/leverage_policy.py",
+    "pro_tools/risk_sizer.py",
+    "pro_tools/paper_futures_engine.py",
+    "pro_tools/parity.py",
+    "pro_tools/autopatch.py",
+    "pro_tools/INTEGRATION_GUIDE.md",
+    "pro_defaults.py"
+  ],
+  "modified": [
+    "tradebot/engine.py"
+  ],
+  "deprecated": []
+}
