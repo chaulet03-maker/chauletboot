@@ -1,0 +1,70 @@
+mode: paper
+symbols:
+  whitelist: ["BTC/USDT:USDT", "ETH/USDT:USDT"]
+limits:
+  max_open_total: 6
+  max_open_per_symbol: 4
+  no_hedge: true
+risk:
+  size_pct_of_equity: 0.02
+  equity_usdt: 1000.0
+  max_risk_per_trade_pct: 0.5
+  max_cluster_side_exposure_pct: 60.0
+  clusters:
+    "BTC/USDT:USDT": "MAJORS"
+    "ETH/USDT:USDT": "MAJORS"
+strategy:
+  timeframe: "5m"
+  layers:
+    regime:
+      trend_adx_min: 18.0
+      fast_ma: 20
+      slow_ma: 50
+      rsi_period: 14
+      rsi_range_low: 40
+      rsi_range_high: 60
+    entry:
+      confirm_layers: ["ma","rsi","structure"]
+      tp1_R: 1.0
+      tp2_R: 2.0
+  trailing:
+    mode: "atr"
+    atr_k: 1.5
+    ema_period: 20
+    percent: 0.4
+    hysteresis_pct: 0.05
+    min_step_pct: 0.05
+funding:
+  use_bias: true
+  high_fr_threshold: 0.05
+  avoid_minutes_around: 10
+execution:
+  slippage_bps: 5
+  leverage: 10
+  set_leverage: true
+  retries: 3
+  retry_backoff_s: 1.0
+  time_sync: true
+persistence:
+  dir: "data"
+  sqlite_file: "data/trades.sqlite"
+  equity_csv: "data/equity.csv"
+  trades_csv: "data/trades.csv"
+  state_file: "data/state.json"
+  logs_file: "data/logs.csv"
+leverage:
+  min: 5
+  max: 15
+  default: 10
+
+order_sizing:
+  min_pct: 0.20
+  default_pct: 0.30
+  max_pct: 0.40
+  min_pct_dca: 0.10
+
+telegram:
+  anti_spam:
+    min_interval_s: 1.0
+  dedup_window_s: 60
+  language: "es"

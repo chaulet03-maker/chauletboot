@@ -1,0 +1,123 @@
+import asyncio, os, json
+from datetime import datetime, timedelta, timezone
+import pandas as pd
+from telegram import Update
+from telegram.ext import Application, MessageHandler, CommandHandler, filters, ContextTypes
+from bot.settings import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, TELEGRAM_CONF
+from bot.logger import BOT_LOGGER, log_exception
+from bot.state import enqueue_cmd
+
+MAX_TG=3900
+async def _chunk_and_send(bot, chat_id, text):
+    if not text:
+        return
+    for i in range(0, len(text), MAX_TG):
+        await bot.send_message(chat_id=int(chat_id), text=text[i:i+MAX_TG])
+
+
+DATA_DIR = "data"
+POS_SNAP = os.path.join(DATA_DIR, "positions.json")
+MKT_SNAP = os.path.join(DATA_DIR, "market_snapshot.json")
+DIAG = os.path.join(DATA_DIR, "diag.json")
+
+HELP_TEXT = (
+"Comandos:\n"
+"- precio: último BTC/ETH\n"
+"- estado: PnL neto día/semana/30d + equity\n"
+"- posiciones: abiertas (lado/qty/lev/entry/stop/TPs)\n"
+"- cerrar todo | cerra btc | cerra eth\n"
+"- bot on | bot off\n"
+"- diag: motivos recientes de porqué no abre\n"
+"- test: prueba conectividad\n"
+"- ayuda: este mensaje"
+)
+
+async def _send(app: Application, text: str):
+    if not TELEGRAM_CONF.get("enabled", True): return
+    cid = TELEGRAM_CHAT_ID
+    if not cid: return
+    try:
+        await app.bot.send_message(chat_id=int(cid), text=text[:4000])
+    except Exception as e:
+        log_exception(BOT_LOGGER, "Telegram send error", error=str(e))
+
+async def notify(app: Application, text: str):
+    await _send(app, text)
+
+def _read_json(path, default=None):
+    default = default if default is not None else {}
+    try:
+        if os.path.exists(path):
+            with open(path,"r",encoding="utf-8") as f: return json.load(f)
+    except Exception: pass
+    return default
+
+async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    txt = (update.message.text or "").strip().lower()
+    async def reply(t): await update.message.reply_text(t)
+
+    if txt in ("ayuda","help","/start","/help"):
+        return await reply(HELP_TEXT)
+
+    if txt in ("test",):
+        return await reply("OK " + datetime.now(timezone.utc).isoformat())
+
+    if txt in ("precio","precios","price","prices"):
+        snap = _read_json(MKT_SNAP,{})
+        if not snap: return await reply("Sin snapshot de precios aún.")
+        lines = [f"{k}: {v.get('last_close')} (ts {v.get('ts')})" for k,v in snap.items()]
+        return await reply("\n".join(lines))
+
+    if txt in ("estado",):
+        try:
+            df = pd.read_csv("data/equity.csv", parse_dates=["ts"])
+            now = datetime.now(timezone.utc)
+            total = df.iloc[-1]["equity"]
+            day = df[df["ts"] >= (now - timedelta(days=1))]["pnl"].sum()
+            week = df[df["ts"] >= (now - timedelta(days=7))]["pnl"].sum()
+            month = df[df["ts"] >= (now - timedelta(days=30))]["pnl"].sum()
+            return await reply(f"PnL neto — Día: {day:.2f} | Semana: {week:.2f} | 30d: {month:.2f}\nEquity: {total:.2f}")
+        except Exception:
+            return await reply("Sin equity aún.")
+
+    if txt in ("pos","posiciones","position","positions","status"):
+        pos = _read_json(POS_SNAP,[])
+        if not pos: return await reply("Sin posiciones abiertas.")
+        lines=[]
+        for p in pos:
+            lines.append(f"{p['symbol']} {p['side']} qty={p['qty']:.6f} lev={p.get('lev',0)} @ {p['entry_price']:.2f} | stop≈{p['stop_price']:.2f} | TP1 {p.get('tp1','?')} TP2 {p.get('tp2','?')}")
+        return await reply("\n".join(lines))
+
+    if txt in ("diag","diagnostico","diagnóstico","porque","por qué"):
+        d = _read_json(DIAG,{})
+        if not d: return await reply("Sin diagnóstico aún.")
+        lines=[]
+        for sym, reasons in d.items():
+            lines.append(f"{sym}: " + " | ".join(reasons[-5:]))
+        return await reply("\n".join(lines))
+
+    # Control (se encolan para que el engine las ejecute)
+    if txt in ("cerrar todo","cierra todo","cerra todo"):
+        enqueue_cmd({"type":"close_all","ts":datetime.now(timezone.utc).isoformat()})
+        return await reply("Cerrando todas las posiciones...")
+    if txt in ("cerra btc","cerrar btc","cierra btc"):
+        enqueue_cmd({"type":"close_symbol","symbol":"BTC/USDT","ts":datetime.now(timezone.utc).isoformat()})
+        return await reply("Cerrando BTC...")
+    if txt in ("cerra eth","cerrar eth","cierra eth"):
+        enqueue_cmd({"type":"close_symbol","symbol":"ETH/USDT","ts":datetime.now(timezone.utc).isoformat()})
+        return await reply("Cerrando ETH...")
+    if txt in ("bot on","on"):
+        enqueue_cmd({"type":"bot_on","ts":datetime.now(timezone.utc).isoformat()})
+        return await reply("✅ Bot ON — nuevas entradas habilitadas.")
+    if txt in ("bot off","off"):
+        enqueue_cmd({"type":"bot_off","ts":datetime.now(timezone.utc).isoformat()})
+        return await reply("⏸️ Bot OFF — nuevas entradas pausadas.")
+
+    await reply(HELP_TEXT)
+
+def build_app():
+    if not TELEGRAM_BOT_TOKEN:
+        BOT_LOGGER.error('TELEGRAM_BOT_TOKEN vacío; Telegram deshabilitado.'); return None
+    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), on_text))
+    return app
