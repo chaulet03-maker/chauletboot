@@ -3,243 +3,156 @@ import os
 import pandas as pd
 import numpy as np
 import logging
+from datetime import datetime, timezone
 
-# --- Indicadores (los que ya tenías) ---
-from ta.momentum import RSIIndicator
-from ta.trend import EMAIndicator, ADXIndicator
-from ta.volatility import BollingerBands, AverageTrueRange
+# --- Importa lógica del bot (paridad total) ---
+import sys
+sys.path.append(os.path.dirname(os.path.dirname(__file__)))
+from bot.core.indicators import compute_indicators
+from bot.core.strategy import generate_signal
+import yaml
 
-# --- Configuración del Logging ---
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+# --- Logging ---
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
-def compute_indicators_for_df(df: pd.DataFrame) -> pd.DataFrame:
-    """Calcula todos los indicadores necesarios para un DataFrame de velas."""
-    c = df['close']
-    h = df['high']
-    l = df['low']
-    
-    # Indicadores de Tendencia
-    df['ema_fast'] = EMAIndicator(c, window=10).ema_indicator()
-    df['ema_slow'] = EMAIndicator(c, window=30).ema_indicator()
-    df['adx'] = ADXIndicator(h, l, c, window=14).adx()
-
-    # Indicadores de Volatilidad y Momentum
-    bb = BollingerBands(c, window=20, window_dev=2)
-    df['bb_upper'] = bb.bollinger_hband()
-    df['bb_lower'] = bb.bollinger_lband()
-    df['bb_mid'] = bb.bollinger_mavg()
-    df['bb_width'] = (df['bb_upper'] - df['bb_lower']) / df['bb_mid']
-    df['rsi'] = RSIIndicator(c, window=14).rsi()
-    df['atr'] = AverageTrueRange(h, l, c, window=14).average_true_range()
-    
-    return df.dropna().reset_index(drop=True)
+def load_config(config_path="config/config.yaml"):
+    with open(config_path, "r") as f:
+        return yaml.safe_load(f)
 
 class Backtester:
-    def __init__(self, df_5m: pd.DataFrame, df_1h: pd.DataFrame, initial_balance: float, fee_pct: float):
-        self.df_5m = compute_indicators_for_df(df_5m)
-        self.df_1h = compute_indicators_for_df(df_1h)
-        self.balance = initial_balance
-        self.fee = fee_pct
+    def __init__(self, df: pd.DataFrame, symbol: str, config: dict):
+        self.df = compute_indicators(df, config["strategy"])
+        self.symbol = symbol
+        self.balance = config["risk"]["equity_usdt"]
+        self.risk_pct = config["risk"]["max_risk_per_trade_pct"]
+        self.fee = config["fees"]["taker"]
+        self.slippage_bps = config["execution"]["slippage_bps"]
         self.trades = []
         self.open_position = None
-        logging.info(f"Backtester inicializado. Balance inicial: ${initial_balance:.2f}, Fee: {fee_pct*100:.2f}%")
+        logging.info(f"Backtester {symbol} inicializado. Balance inicial: ${self.balance:.2f}")
 
-    def _detectar_regimen(self, current_timestamp):
-        """Analiza el mercado en 1h para decidir el régimen."""
-        df_1h_hist = self.df_1h[self.df_1h['timestamp'] <= current_timestamp]
-        if len(df_1h_hist) < 25:
-            return "RANGO" # Por defecto, si no hay suficientes datos
+    def _size_position(self, entry, stop):
+        risk_usd = self.balance * self.risk_pct
+        risk_per_unit = abs(entry - stop)
+        if risk_per_unit <= 0:
+            return 0
+        return risk_usd / risk_per_unit
 
-        last_1h_row = df_1h_hist.iloc[-1]
-        adx = last_1h_row['adx']
-        bb_width = last_1h_row['bb_width']
+    def _slip(self, price, side):
+        slip = price * self.slippage_bps / 10000
+        return price + slip if side == "LONG" else price - slip
 
-        if adx > 23:
-            return "TENDENCIA"
-        if adx < 19 and bb_width < 0.08:
-            return "RANGO"
-        return "RANGO" # Si es ambiguo, se queda en modo seguro
-
-    def _run_strategy_tendencia(self, r, p1):
-        """Lógica para la estrategia de Tendencia (2% riesgo, Multi-TP)."""
-        # (Esta es una señal de ejemplo, podés ajustarla a la tuya)
-        long_ok = r.ema_fast > r.ema_slow and r.adx > 25
-        short_ok = r.ema_fast < r.ema_slow and r.adx > 25
-        
-        if long_ok or short_ok:
-            side = "LONG" if long_ok else "SHORT"
-            entry_price = r.close
-            stop_dist = r.atr * 2.0 # Stop Loss a 2x ATR
-            
-            # --- GESTIÓN DE RIESGO: 2% ---
-            risk_usd = self.balance * 0.02
-            qty = risk_usd / stop_dist
-            
-            sl_price = entry_price - stop_dist if side == "LONG" else entry_price + stop_dist
-            tp1_price = entry_price + stop_dist * 1.0 # Ratio 1:1 para TP1
-            tp2_price = entry_price + stop_dist * 2.0 # Ratio 2:1 para TP2
-            
-            self.open_position = {
-                "side": side, "qty": qty, "entry_price": entry_price, 
-                "sl": sl_price, "tp1": tp1_price, "tp2": tp2_price,
-                "tp1_hit": False, "regime": "TENDENCIA"
-            }
-            logging.info(f"{r.timestamp} | TENDENCIA | OPEN {side} | Price: {entry_price:.2f} | Qty: {qty:.4f}")
-            self._log_trade(r.timestamp, "OPEN", side, entry_price, qty, "TENDENCIA")
-
-    def _run_strategy_rango(self, r, p1):
-        """Lógica para la estrategia de Rango (1% riesgo, Scalping)."""
-        long_ok = r.close <= r.bb_lower and r.rsi < 35
-        short_ok = r.close >= r.bb_upper and r.rsi > 65
-        
-        if long_ok or short_ok:
-            side = "LONG" if long_ok else "SHORT"
-            entry_price = r.close
-            stop_dist = r.atr * 1.5 # Stop Loss más ajustado a 1.5x ATR
-            
-            # --- GESTIÓN DE RIESGO: 1% ---
-            risk_usd = self.balance * 0.01
-            qty = risk_usd / stop_dist
-
-            sl_price = entry_price - stop_dist if side == "LONG" else entry_price + stop_dist
-            tp_price = r.bb_mid # TP único en la media móvil de las bandas
-            
-            self.open_position = {
-                "side": side, "qty": qty, "entry_price": entry_price,
-                "sl": sl_price, "tp1": tp_price, "tp2": None, # No hay TP2
-                "tp1_hit": False, "regime": "RANGO"
-            }
-            logging.info(f"{r.timestamp} | RANGO | OPEN {side} | Price: {entry_price:.2f} | Qty: {qty:.4f}")
-            self._log_trade(r.timestamp, "OPEN", side, entry_price, qty, "RANGO")
-
-    def _manage_open_position(self, r):
-        """Gestiona la posición abierta, verificando SL y TPs."""
-        if not self.open_position:
-            return
-
-        pos = self.open_position
-        price = r.close
-        pnl = 0.0
-        reason = ""
-
-        # --- Lógica de Múltiples TPs para TENDENCIA ---
-        if pos['regime'] == 'TENDENCIA' and not pos['tp1_hit']:
-            if (pos['side'] == 'LONG' and price >= pos['tp1']) or \
-               (pos['side'] == 'SHORT' and price <= pos['tp1']):
-                
-                half_qty = pos['qty'] / 2
-                pnl = (price - pos['entry_price']) * half_qty * (1 if pos['side'] == 'LONG' else -1)
-                self.balance += pnl - (half_qty * price * self.fee)
-                
-                pos['qty'] = half_qty # Reducimos la cantidad a la mitad
-                pos['sl'] = pos['entry_price'] # Movemos SL a Break-Even
-                pos['tp1_hit'] = True
-                logging.info(f"{r.timestamp} | TENDENCIA | TP1 HIT | PnL: ${pnl:.2f} | Moving SL to Break-Even")
-                self._log_trade(r.timestamp, "TP1", pos['side'], price, half_qty, pos['regime'], pnl)
-
-        # --- Lógica de Cierre Total (SL o TP final) ---
-        is_long = pos['side'] == 'LONG'
-        final_tp = pos['tp2'] if pos['regime'] == 'TENDENCIA' else pos['tp1']
-
-        if (is_long and price <= pos['sl']) or (not is_long and price >= pos['sl']):
-            reason = "STOP"
-        elif final_tp and ((is_long and price >= final_tp) or (not is_long and price <= final_tp)):
-            reason = "TAKE_PROFIT"
-
-        if reason:
-            pnl = (price - pos['entry_price']) * pos['qty'] * (1 if is_long else -1)
-            self.balance += pnl - (pos['qty'] * price * self.fee)
-            logging.info(f"{r.timestamp} | {pos['regime']} | CLOSE {reason} | PnL: ${pnl:.2f} | New Balance: ${self.balance:.2f}")
-            self._log_trade(r.timestamp, reason, pos['side'], price, pos['qty'], pos['regime'], pnl)
-            self.open_position = None
-
-    def _log_trade(self, ts, action, side, price, qty, regime, pnl=0.0):
+    def _log_trade(self, ts, action, side, price, qty, pnl=0.0):
         self.trades.append({
             "timestamp": ts,
+            "symbol": self.symbol,
             "action": action,
             "side": side,
             "price": price,
             "qty": qty,
-            "regime": regime,
             "pnl": pnl,
             "balance": self.balance
         })
 
     def run(self):
-        """Ejecuta el bucle principal de la simulación."""
-        for i in range(1, len(self.df_5m)):
-            current_row = self.df_5m.iloc[i]
-            prev_row = self.df_5m.iloc[i-1]
-            
-            self._manage_open_position(current_row)
+        for i in range(50, len(self.df)):  # arranca con historial suficiente
+            row = self.df.iloc[: i + 1]
+            last = row.iloc[-1]
 
+            # gestion de posicion abierta
+            if self.open_position:
+                self._manage(last)
+
+            # buscar señal nueva
             if not self.open_position:
-                regime = self._detectar_regimen(current_row.timestamp)
-                if regime == "TENDENCIA":
-                    self._run_strategy_tendencia(current_row, prev_row)
-                elif regime == "RANGO":
-                    self._run_strategy_rango(current_row, prev_row)
-        
-        return self._generate_report()
+                sig = generate_signal(row, {})
+                if sig.side in ["long", "short"]:
+                    entry = self._slip(last.close, "LONG" if sig.side == "long" else "SHORT")
+                    sl, tp1, tp2 = sig.sl, sig.tp1, sig.tp2
+                    qty = self._size_position(entry, sl)
+                    if qty > 0:
+                        self.open_position = {
+                            "side": sig.side.upper(),
+                            "qty": qty,
+                            "entry": entry,
+                            "sl": sl,
+                            "tp1": tp1,
+                            "tp2": tp2,
+                            "tp1_hit": False,
+                        }
+                        logging.info(f"{last.timestamp} | OPEN {sig.side.upper()} @ {entry:.2f}")
+                        self._log_trade(last.timestamp, "OPEN", sig.side.upper(), entry, qty)
 
-    def _generate_report(self):
-        """Genera y muestra un reporte final del backtest."""
-        df_trades = pd.DataFrame(self.trades)
-        if df_trades.empty:
-            print("\nNo se realizaron operaciones.")
+        return self._report()
+
+    def _manage(self, r):
+        pos = self.open_position
+        if not pos:
             return
+        price = r.close
+        is_long = pos["side"] == "LONG"
+        reason = None
 
-        logging.info("Generando reporte de backtest...")
-        df_trades['pnl'] = df_trades['pnl'].astype(float)
-        
-        total_pnl = df_trades['pnl'].sum()
-        total_trades = len(df_trades[df_trades['action'] != 'OPEN'])
-        wins = df_trades[df_trades['pnl'] > 0]
-        losses = df_trades[df_trades['pnl'] < 0]
-        win_rate = (len(wins) / total_trades) * 100 if total_trades > 0 else 0
-        
-        # Reporte por estrategia
-        tendencia_pnl = df_trades[df_trades['regime'] == 'TENDENCIA']['pnl'].sum()
-        rango_pnl = df_trades[df_trades['regime'] == 'RANGO']['pnl'].sum()
-        
-        print("\n" + "="*50)
-        print("          REPORTE FINAL DEL BACKTEST")
-        print("="*50)
-        print(f"Resultado Neto Final: ${total_pnl:,.2f}")
-        print(f"Balance Final: ${self.balance:,.2f}")
-        print(f"Operaciones Totales: {total_trades}")
-        print(f"Tasa de Acierto (Win Rate): {win_rate:.2f}%")
-        print(f"Ganancia Promedio: ${wins['pnl'].mean():,.2f}" if not wins.empty else "Ganancia Promedio: $0.00")
-        print(f"Pérdida Promedio: ${losses['pnl'].mean():,.2f}" if not losses.empty else "Pérdida Promedio: $0.00")
-        print("-"*50)
-        print("--- Rendimiento por Estrategia ---")
-        print(f"PnL Estrategia TENDENCIA: ${tendencia_pnl:,.2f}")
-        print(f"PnL Estrategia RANGO: ${rango_pnl:,.2f}")
-        print("="*50)
-        
-        out_path = f"data/backtests/mutante_results.csv"
-        df_trades.to_csv(out_path, index=False)
-        logging.info(f"Resultados detallados guardados en: {out_path}")
+        # TP1
+        if not pos["tp1_hit"] and ((is_long and price >= pos["tp1"]) or (not is_long and price <= pos["tp1"])):
+            half_qty = pos["qty"] / 2
+            pnl = (price - pos["entry"]) * half_qty * (1 if is_long else -1)
+            self.balance += pnl - (half_qty * price * self.fee)
+            pos["qty"] = half_qty
+            pos["tp1_hit"] = True
+            pos["sl"] = pos["entry"]  # break-even
+            self._log_trade(r.timestamp, "TP1", pos["side"], price, half_qty, pnl)
+
+        # TP2 o SL
+        if (is_long and price <= pos["sl"]) or (not is_long and price >= pos["sl"]):
+            reason = "STOP"
+        elif pos["tp2"] and ((is_long and price >= pos["tp2"]) or (not is_long and price <= pos["tp2"])):
+            reason = "TP2"
+
+        if reason:
+            pnl = (price - pos["entry"]) * pos["qty"] * (1 if is_long else -1)
+            self.balance += pnl - (pos["qty"] * price * self.fee)
+            self._log_trade(r.timestamp, reason, pos["side"], price, pos["qty"], pnl)
+            self.open_position = None
+
+    def _report(self):
+        df = pd.DataFrame(self.trades)
+        if df.empty:
+            print("No hubo trades.")
+            return df
+
+        total_pnl = df["pnl"].sum()
+        wins = df[df["pnl"] > 0]; losses = df[df["pnl"] < 0]
+        win_rate = len(wins) / len(df[df["action"] != "OPEN"]) * 100 if len(df) > 0 else 0
+        maxdd = (df["balance"].cummax() - df["balance"]).max()
+        sharpe = (df["pnl"].mean() / df["pnl"].std() * np.sqrt(252)) if df["pnl"].std() > 0 else 0
+
+        print("\n=== REPORTE FINAL ===")
+        print(f"Balance final: ${self.balance:.2f}")
+        print(f"PNL neto: ${total_pnl:.2f}")
+        print(f"Operaciones: {len(df[df['action'] != 'OPEN'])}")
+        print(f"Win rate: {win_rate:.2f}%")
+        print(f"Max Drawdown: ${maxdd:.2f}")
+        print(f"Sharpe: {sharpe:.2f}")
+
+        out_path = f"data/backtests/backtest_{self.symbol}.csv"
+        os.makedirs(os.path.dirname(out_path), exist_ok=True)
+        df.to_csv(out_path, index=False)
+        print(f"Resultados guardados en {out_path}")
+        return df
 
 def main():
-    parser = argparse.ArgumentParser(description="Backtester para bot de trading con doble estrategia.")
-    parser.add_argument("--csv5m", required=True, help="Ruta al archivo CSV con datos OHLCV de 5 minutos.")
-    parser.add_argument("--csv1h", required=True, help="Ruta al archivo CSV con datos OHLCV de 1 hora.")
-    parser.add_argument("--balance", type=float, default=1000.0, help="Balance inicial en USDT.")
-    parser.add_argument("--fee", type=float, default=0.0005, help="Comisión por operación (ej: 0.0005 para 0.05%).")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--csv", required=True, help="Ruta al CSV OHLCV (1 símbolo, timeframe config.yaml).")
+    parser.add_argument("--symbol", required=True, help="Símbolo (ej: BTC/USDT:USDT).")
+    parser.add_argument("--config", default="config/config.yaml", help="Config YAML.")
     args = parser.parse_args()
 
-    os.makedirs("data/backtests", exist_ok=True)
+    df = pd.read_csv(args.csv, parse_dates=["timestamp"])
+    config = load_config(args.config)
 
-    try:
-        df_5m = pd.read_csv(args.csv5m, parse_dates=["timestamp"])
-        df_1h = pd.read_csv(args.csv1h, parse_dates=["timestamp"])
-    except FileNotFoundError as e:
-        logging.error(f"Error: No se encontró el archivo de datos: {e}")
-        return
-
-    backtester = Backtester(df_5m=df_5m, df_1h=df_1h, initial_balance=args.balance, fee_pct=args.fee)
-    backtester.run()
+    bt = Backtester(df, args.symbol, config)
+    bt.run()
 
 if __name__ == "__main__":
     main()
