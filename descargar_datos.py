@@ -1,4 +1,4 @@
-# descargar_datos.py
+# descargar_datos.py (Versión Corregida y Final)
 import argparse
 import os
 import time
@@ -8,197 +8,130 @@ import ccxt
 
 DATA_FOLDER = "data"
 
-# ---------------- Utilidades ---------------- #
-def iso_utc(ms: int) -> str:
+# --- Utilidades ---
+def iso_utc(ms):
     return dt.datetime.utcfromtimestamp(ms/1000).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 def tf_ms(exchange, timeframe: str) -> int:
     return exchange.parse_timeframe(timeframe) * 1000
 
-def ensure_dir(path: str):
-    os.makedirs(path, exist_ok=True)
+def ensure_dir(p):
+    os.makedirs(p, exist_ok=True)
 
 def build_exchange(market: str):
     market = market.lower().strip()
+    config = {
+        "enableRateLimit": True,
+        "timeout": 30000,  # Timeout de 30 segundos
+    }
     if market == "usdm":
-        ex = ccxt.binanceusdm({"enableRateLimit": True})
+        ex = ccxt.binanceusdm(config)
     elif market == "spot":
-        ex = ccxt.binance({"enableRateLimit": True})
+        ex = ccxt.binance(config)
     else:
         raise ValueError("El mercado debe ser 'usdm' o 'spot'")
+    
+    print("Cargando mercados, puede tardar un momento...")
     ex.load_markets()
+    print("Mercados cargados.")
     return ex
+
+def symbol_ok(ex, sym):
+    # LA FORMA CORRECTA Y SIMPLE DE VERIFICAR
+    return sym in ex.symbols
 
 def normalize_df(ohlcv):
     df = pd.DataFrame(ohlcv, columns=["timestamp_ms","open","high","low","close","volume"])
-    df["timestamp"] = pd.to_datetime(df["timestamp_ms"], unit="ms", utc=True).dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+    df["timestamp"] = pd.to_datetime(df["timestamp_ms"], unit="ms", utc=True)
+    df["timestamp"] = df["timestamp"].dt.strftime("%Y-%m-%dT%H:%M:%SZ")
     df = df[["timestamp","open","high","low","close","volume"]]
     return df
 
-def read_last_timestamp(filepath: str, timeframe_ms: int):
-    if not os.path.exists(filepath):
+def read_last_timestamp(filepath):
+    if not os.path.exists(filepath) or os.path.getsize(filepath) < 50: # Si es muy chico, probablemente solo tiene header
         return None
     try:
-        tail = pd.read_csv(filepath, usecols=["timestamp"]).tail(1)
-        if tail.empty:
-            return None
-        last_iso = tail["timestamp"].iloc[0]
-        last_ms = int(pd.Timestamp(last_iso).timestamp() * 1000)
-        return last_ms + timeframe_ms
+        with open(filepath, 'rb') as f:
+            f.seek(-2, os.SEEK_END)
+            while f.read(1) != b'\n':
+                f.seek(-2, os.SEEK_CUR)
+            last_line = f.readline().decode()
+        
+        last_iso = last_line.split(',')[0]
+        last_ms = int(pd.Timestamp(last_iso).tz_localize("UTC").timestamp() * 1000)
+        return last_ms
     except Exception:
         return None
 
-def log_gap(prev_last_ms, new_first_ms, timeframe_ms, sym, tf):
-    if prev_last_ms is None:
-        return
-    if new_first_ms > prev_last_ms + timeframe_ms:
-        miss = (new_first_ms - prev_last_ms) // timeframe_ms
-        print(f"[AVISO DE GAP] {sym} {tf}: faltan ~{int(miss)} velas entre {iso_utc(prev_last_ms)} y {iso_utc(new_first_ms)}")
-
-# ---------------- Resolución de símbolos ---------------- #
-def resolve_symbol(ex, user_symbol: str, market: str):
-    user_symbol = user_symbol.upper().strip()
-    if user_symbol in ex.symbols:
-        base, quote = user_symbol.split("/", 1) if "/" in user_symbol else (None, None)
-    else:
-        base, quote = (None, None)
-        if "/" in user_symbol:
-            base, quote = user_symbol.split("/", 1)
-
-    target_types = {"spot"} if market == "spot" else {"swap", "future"}
-    candidates = []
-
-    for m in ex.markets.values():
-        try:
-            if base and quote:
-                if m.get("base") != base or m.get("quote") != quote:
-                    continue
-            if m.get("type") not in target_types:
-                continue
-
-            score = 0
-            if market == "usdm":
-                if m.get("type") == "swap": score += 50
-                if m.get("linear"): score += 10
-                ct = (m.get("info", {}) or {}).get("contractType") or (m.get("contractType"))
-                if ct == "PERPETUAL": score += 100
-                if ct in {"CURRENT_QUARTER", "NEXT_QUARTER"}:
-                    score -= 100
-            else:
-                if m.get("spot"): score += 50
-
-            candidates.append((score, m["symbol"]))
-        except Exception:
-            continue
-
-    if not candidates:
-        return None
-
-    candidates.sort(reverse=True)
-    best_symbol = candidates[0][1]
-
-    if best_symbol != user_symbol:
-        print(f"[MAPEO] {user_symbol} → {best_symbol}")
-    return best_symbol
-
-# ---------------- Descarga ---------------- #
+# --- Lógica de Descarga ---
 def descargar_symbol_tf(ex, symbol, timeframe, since_ms, until_ms, out_path, max_retries=6):
     print(f"\n==> {symbol} | {timeframe} | desde {iso_utc(since_ms)} hasta {iso_utc(until_ms)}")
     ensure_dir(os.path.dirname(out_path))
     tfms = tf_ms(ex, timeframe)
 
-    resume_ms = read_last_timestamp(out_path, tfms)
-    if resume_ms and resume_ms > since_ms:
-        since_ms = resume_ms
-        print(f"[REANUDANDO] Continuando en {iso_utc(since_ms)}")
+    last_ts_ms = read_last_timestamp(out_path)
+    if last_ts_ms and last_ts_ms > since_ms:
+        since_ms = last_ts_ms + tfms
+        print(f"[REANUDANDO] Continuando descarga en {iso_utc(since_ms)}")
 
-    all_chunks = []
-    last_chunk_last_ms = None
-
+    header_needed = not os.path.exists(out_path) or os.path.getsize(out_path) == 0
+    
     while since_ms < until_ms:
-        time.sleep(ex.rateLimit / 1000.0)
-
-        tries = 0
-        ohlcv = None
-        while tries < max_retries:
-            try:
-                ohlcv = ex.fetch_ohlcv(symbol, timeframe, since=since_ms, limit=1000)
-                break
-            except (ccxt.NetworkError, ccxt.ExchangeError, ccxt.RateLimitExceeded) as e:
-                tries += 1
-                wait = min(60, 2 ** tries)
-                print(f"[REINTENTO] {e} | Esperando {wait}s... ({tries}/{max_retries})")
-                time.sleep(wait)
-            except Exception as e:
-                print(f"[ERROR] {e}")
-                tries = max_retries
+        try:
+            time.sleep(ex.rateLimit / 1000.0) # Respetar rate limit
+            
+            ohlcv = ex.fetch_ohlcv(symbol, timeframe, since=since_ms, limit=1000)
+            if not ohlcv:
+                print("No hay más datos.")
                 break
 
-        if not ohlcv:
-            print("No hay más datos o se alcanzó el límite de reintentos.")
-            break
+            df_chunk = normalize_df(ohlcv)
+            
+            df_chunk.to_csv(out_path, mode='a', index=False, header=header_needed)
+            header_needed = False # Solo escribimos el encabezado una vez
+            
+            total_velas = len(df_chunk)
+            last_ms_in_chunk = ohlcv[-1][0]
+            print(f"  [+] Guardadas {total_velas} velas | hasta {iso_utc(last_ms_in_chunk)}")
+            
+            since_ms = last_ms_in_chunk + tfms
 
-        first_ms_raw = ohlcv[0][0]
-        last_ms_raw  = ohlcv[-1][0]
+        except Exception as e:
+            print(f"[ERROR] Ocurrió un error: {e}. Reintentando en 20 segundos...")
+            time.sleep(20)
 
-        df_chunk = normalize_df(ohlcv)
-        df_chunk = df_chunk.drop_duplicates(subset=["timestamp"]).sort_values("timestamp")
+    print(f"[OK] Descarga finalizada para {symbol} {timeframe}")
 
-        prev_last = last_chunk_last_ms if last_chunk_last_ms is not None else read_last_timestamp(out_path, tfms)
-        log_gap(prev_last, first_ms_raw, tfms, symbol, timeframe)
-        last_chunk_last_ms = last_ms_raw
-
-        all_chunks.append(df_chunk)
-        print(f"  [+] Chunk {len(df_chunk):4d} velas | hasta {iso_utc(last_ms_raw)}")
-
-        since_ms = last_ms_raw + tfms
-
-    if all_chunks:
-        df = pd.concat(all_chunks).drop_duplicates(subset=["timestamp"]).sort_values("timestamp")
-        df.to_csv(out_path, index=False)
-        print(f"[OK] {symbol} {timeframe}: {len(df)} velas guardadas en -> {out_path}")
-    else:
-        print(f"[AVISO] No se guardó nada para {symbol} {timeframe}")
-
-# ---------------- Main ---------------- #
+# --- Ejecución Principal ---
 def main():
     parser = argparse.ArgumentParser(description="Descarga OHLCV desde Binance (spot/usdm), reanudable y multi-activos.")
-    parser.add_argument("--symbols", type=str, default="BTC/USDT,ETH/USDT,BNB/USDT,XRP/USDT",
-                        help="Símbolos separados por coma (ej: BTC/USDT,ETH/USDT)")
-    parser.add_argument("--timeframes", type=str, default="5m,1h",
-                        help="Timeframes separados por coma (ej: 1h,15m)")
-    parser.add_argument("--since", type=str, default="2023-01-01T00:00:00Z",
-                        help="Fecha inicio ISO (UTC)")
-    parser.add_argument("--until", type=str, default="now",
-                        help="Fecha fin ISO (UTC) o 'now'")
-    parser.add_argument("--market", type=str, default="usdm", choices=["usdm","spot"],
-                        help="Mercado: usdm (futuros perpetuos) o spot")
-    parser.add_argument("--outdir", type=str, default=DATA_FOLDER,
-                        help="Carpeta destino de CSVs")
+    parser.add_argument("--symbols", type=str, default="BTC/USDT,ETH/USDT,XRP/USDT,BNB/USDT", help="Símbolos separados por coma")
+    parser.add_argument("--timeframes", type=str, default="1h,4h,5m", help="Timeframes separados por coma")
+    parser.add_argument("--since", type=str, default="2023-01-01T00:00:00Z", help="Fecha inicio ISO (UTC)")
+    parser.add_argument("--market", type=str, default="usdm", choices=["usdm","spot"], help="Mercado: usdm o spot")
     args = parser.parse_args()
 
     symbols = [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
-    tfs     = [t.strip() for t in args.timeframes.split(",") if t.strip()]
+    tfs = [t.strip() for t in args.timeframes.split(",") if t.strip()]
 
     ex = build_exchange(args.market)
     since_ms = ex.parse8601(args.since)
-    until_ms = ex.milliseconds() if args.until.lower() == "now" else ex.parse8601(args.until)
+    until_ms = ex.milliseconds()
 
-    ensure_dir(args.outdir)
+    ensure_dir(DATA_FOLDER)
 
-    for user_sym in symbols:
-        resolved = resolve_symbol(ex, user_sym, args.market)
-        if not resolved:
-            print(f"[AVISO] Símbolo no válido en {args.market}: {user_sym} (omitido)")
+    for sym in symbols:
+        if not symbol_ok(ex, sym):
+            print(f"[AVISO] Símbolo no válido en {args.market}: {sym} (será omitido)")
             continue
         for tf in tfs:
             if tf not in ex.timeframes:
-                print(f"[AVISO] Timeframe no soportado por exchange: {tf} (omitido)")
+                print(f"[AVISO] Timeframe no soportado por exchange: {tf} (será omitido)")
                 continue
-            filename = f"{resolved.replace('/','')}_{tf}_{args.market}.csv"
-            out_path = os.path.join(args.outdir, filename)
-            descargar_symbol_tf(ex, resolved, tf, since_ms, until_ms, out_path)
+            
+            filename = f"{sym.replace('/','')}_{tf}_{args.market}.csv"
+            out_path = os.path.join(DATA_FOLDER, filename)
+            descargar_symbol_tf(ex, sym, tf, since_ms, until_ms, out_path)
 
 if __name__ == "__main__":
     main()
-
