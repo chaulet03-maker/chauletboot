@@ -163,7 +163,7 @@ def descargar_symbol_tf(ex, symbol, timeframe, since_ms, until_ms, out_path, max
 # ---------------- Main ---------------- #
 def main():
     parser = argparse.ArgumentParser(description="Descarga OHLCV desde Binance (spot/usdm), reanudable y multi-activos.")
-    parser.add_argument("--symbols", type=str, default="BTC/USDT,ETH/USDT,BNB/USDT,XRP/USDT,TRX/USDT",
+    parser.add_argument("--symbols", type=str, default="BTC/USDT,ETH/USDT,BNB/USDT,XRP/USDT",
                         help="Símbolos separados por coma (ej: BTC/USDT,ETH/USDT)")
     parser.add_argument("--timeframes", type=str, default="5m,1h",
                         help="Timeframes separados por coma (ej: 1h,15m)")
@@ -201,3 +201,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
