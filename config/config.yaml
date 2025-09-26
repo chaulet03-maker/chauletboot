@@ -1,6 +1,7 @@
 mode: paper
+
 symbols:
-  whitelist: ["BTC/USDT:USDT", "ETH/USDT:USDT"]
+  whitelist: ["BTC/USDT:USDT", "ETH/USDT:USDT", "BNB/USDT:USDT", "XRP/USDT:USDT", "TRX/USDT:USDT"]
 
 limits:
   max_open_total: 6
@@ -10,16 +11,19 @@ limits:
 risk:
   size_pct_of_equity: 0.02
   equity_usdt: 1000.0
-  max_risk_per_trade_pct: 0.5   # ⚠️ 0.5 = 50%. Para 0,5% usar 0.005
+  max_risk_per_trade_pct: 0.005       # 0,5% (antes 0.5 = 50%)
   max_cluster_side_exposure_pct: 60.0
   clusters:
     "BTC/USDT:USDT": "MAJORS"
     "ETH/USDT:USDT": "MAJORS"
+    "BNB/USDT:USDT": "MAJORS"
+    "XRP/USDT:USDT": "MAJORS"
+    "TRX/USDT:USDT": "MAJORS"
 
 strategy:
   timeframe: "5m"
 
-  # Bloque mínimo válido sugerido
+  # Umbrales base
   adx_min: 18
   bbwidth_min: 10
   atr_len: 14
@@ -46,9 +50,9 @@ strategy:
     atr_k: 1.5
     hysteresis_pct: 0.05
     min_step_pct: 0.05
-    # Los siguientes campos se usan sólo si cambiás de modo:
-    # ema_period: 20      # ← si mode: "ema"
-    # percent: 0.4        # ← si mode: "percent"
+    # Si usás otros modos:
+    # ema_period: 20
+    # percent: 0.4
 
 funding:
   use_bias: true
@@ -62,6 +66,12 @@ execution:
   retries: 3
   retry_backoff_s: 1.0
   time_sync: true
+
+telegram:
+  anti_spam:
+    min_interval_s: 1.0
+  dedup_window_s: 60
+  language: "es"
 
 persistence:
   dir: "data"
@@ -81,9 +91,3 @@ order_sizing:
   default_pct: 0.30
   max_pct: 0.40
   min_pct_dca: 0.10
-
-telegram:
-  anti_spam:
-    min_interval_s: 1.0
-  dedup_window_s: 60
-  language: "es"
