@@ -8,7 +8,7 @@ symbols:
 
 limits:
   max_open_total: 6
-  max_open_per_symbol: 4
+  max_open_per_symbol: 4       # ← si querés evitar stacking por símbolo entre 1h/4h, ponelo en 1
   no_hedge: true
   # cooldown_seconds: 90  # (opcional) si querés explicitarlo
 
@@ -28,6 +28,7 @@ portfolio_caps:
   max_portfolio_leverage: 8.0
   max_portfolio_margin_pct: 1.0
 
+# === DEFAULT (compatibilidad): se usa si tu engine no soporta 'strategies:' ===
 strategy:
   timeframe: "1h"
   adx_min: 18
@@ -53,6 +54,82 @@ strategy:
     min_step_pct: 0.05
     # ema_period: 20   # si usás mode: ema
     # percent: 0.4     # si usás mode: percent
+
+# === MULTI-TF (recomendado): 1h + 4h en paralelo ===
+strategies:
+  # 1H (las que validamos)
+  - name: BTC_1h_BB_reversion
+    symbol: BTC/USDT:USDT
+    timeframe: 1h
+    kind: BB_reversion
+    params:
+      z_threshold: 2.5          # z20 < -2.5
+      ema200_filter: true       # exige close > EMA200
+      hold_bars: 30             # salida por tiempo
+      atr_len: 14
+      adx_len: 14
+      adx_min: 18
+      bbwidth_min_bps: 10
+      trail:
+        mode: atr
+        atr_k: 1.5
+        hysteresis_pct: 0.05
+        min_step_pct: 0.05
+
+  - name: BNB_1h_Trend_pullback
+    symbol: BNB/USDT:USDT
+    timeframe: 1h
+    kind: Trend_pullback
+    params:
+      ema_stack: [20, 50, 200]  # ema20>ema50>ema200
+      pullback_pct: 0.01        # 1% bajo EMA20
+      hold_bars: 30
+      atr_len: 14
+      adx_len: 14
+      adx_min: 18
+      bbwidth_min_bps: 10
+      trail:
+        mode: atr
+        atr_k: 1.5
+        hysteresis_pct: 0.05
+        min_step_pct: 0.05
+
+  # 4H (nuevas)
+  - name: BTC_4h_BB_reversion
+    symbol: BTC/USDT:USDT
+    timeframe: 4h
+    kind: BB_reversion
+    params:
+      z_threshold: 2.0          # más laxo en 4h
+      ema200_filter: true
+      hold_bars: 12             # ~2 días
+      atr_len: 14
+      adx_len: 14
+      adx_min: 18
+      bbwidth_min_bps: 6        # 4h suele tener bandas más “finas”
+      trail:
+        mode: atr
+        atr_k: 1.5
+        hysteresis_pct: 0.05
+        min_step_pct: 0.05
+
+  - name: BNB_4h_Trend_pullback
+    symbol: BNB/USDT:USDT
+    timeframe: 4h
+    kind: Trend_pullback
+    params:
+      ema_stack: [20, 50, 200]
+      pullback_pct: 0.008       # 0.8% en 4h
+      hold_bars: 12
+      atr_len: 14
+      adx_len: 14
+      adx_min: 18
+      bbwidth_min_bps: 6
+      trail:
+        mode: atr
+        atr_k: 1.5
+        hysteresis_pct: 0.05
+        min_step_pct: 0.05
 
 # Sesgo por funding (lo usan otros módulos; no molesta)
 funding:
