@@ -1,10 +1,11 @@
 import asyncio, logging, time, datetime as dt, math, random, json, os
 import pandas as pd
 import ccxt.async_support as ccxt
+
 from bot.core.indicators import compute_indicators
 from bot.core.strategy import generate_signal
 from bot.risk.trailing import compute_trailing_stop
-from bot.risk.guards import Limits, can_open, portfolio_caps_ok
+from bot.risk.guards import Limits, can_open, portfolio_caps_ok, Caps  # <- Caps incluido
 from bot.exchanges.paper import PaperExchange
 from bot.exchanges.real import RealExchange
 from bot.storage.csv_store import append_trade_csv, append_equity_csv
@@ -50,8 +51,7 @@ def _normalize_position_like(pos):
     return pos
 
 
-
-import os
+# Telegram disponibilidad opcional
 try:
     import telegram
     import telegram.ext
@@ -62,8 +62,6 @@ except Exception:
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-
-
 
 try:
     from bot.state import load_state as ext_load_state, save_state as ext_save_state
@@ -129,7 +127,7 @@ class TradingApp:
 
     def available_margin_usd(self, equity, price_by_symbol):
         used = self.total_margin_used(price_by_symbol)
-        cap_pct = float(self.portfolio_caps.get("max_portfolio_margin_pct", 1.0))
+        cap_pct = float(self.portfolio_caps.max_portfolio_margin_pct)
         max_allowed = max(0.0, equity * cap_pct)
         return max(0.0, max_allowed - used)
 
@@ -168,39 +166,62 @@ class TradingApp:
         self.sqlite_path = config.get("storage", {}).get("sqlite_path", "data/bot.sqlite")
         ensure_db(self.sqlite_path)
 
-        lim = config.get("limits", {})
+        # Límites básicos
+        lim = config.get("limits", {}) or {}
         self.limits = Limits(max_total_positions=int(lim.get("max_total_positions", 6)),
                              max_per_symbol=int(lim.get("max_per_symbol", 4)),
                              no_hedge=bool(lim.get("no_hedge", True)))
         self.cooldown = int(lim.get("cooldown_seconds", 90))
 
-        self.order_sizes = config.get("order_sizing", {})
+        self.order_sizes   = config.get("order_sizing", {})
         self.leverage_conf = config.get("leverage", {"min": 1, "max": 15, "default": 5})
-        self.filters = config.get("filters", {})
+        self.filters       = config.get("filters", {})
         self.strategy_conf = config.get("strategy", {})
-        self.portfolio_caps = config.get("portfolio_caps", {})
-        self.funding_guard = config.get("funding_guard", {"enabled": True, "annualized_bps_limit": 5000})
+        self.mode          = config.get("mode", "paper").lower()
+
+        # === Caps de cartera (DATACLASS) ===
+        risk_cfg = config.get("risk", {}) or {}
+        pc_cfg   = config.get("portfolio_caps", {}) or {}
+        self.portfolio_caps = Caps(
+            max_portfolio_leverage         = float(pc_cfg.get("max_portfolio_leverage", 8.0)),
+            max_portfolio_margin_pct       = float(pc_cfg.get("max_portfolio_margin_pct", 1.0)),
+            max_cluster_side_exposure_pct  = float(risk_cfg.get("max_cluster_side_exposure_pct", 60.0)),
+            clusters                       = risk_cfg.get("clusters")
+        )
+
+        # Guardas varias
+        self.funding_guard    = config.get("funding_guard", {"enabled": True, "annualized_bps_limit": 5000})
         self.circuit_breakers = config.get("circuit_breakers", {})
-        self.mode = config.get("mode", "paper").lower()
+
         self.price_cache = {}
         self.allow_new_entries = True
         self.notifier = Notifier()
         self._loaded_state = False
 
         self.exchange = self.paper if self.mode == 'paper' else RealExchange(self.ccxt, self.fees)
-        self.trailing_conf = self.cfg.get('trailing', {'enabled': True, 'mode': 'atr', 'atr_k': 2.0, 'ema_key': 'ema_fast', 'ema_k': 1.0, 'percent': 0.6, 'min_step_atr': 0.5})
+
+        # === Trailing config (lee strategy.trailing o top-level trailing) + defaults ===
+        self.trailing_conf = (
+            (self.cfg.get('strategy', {}) or {}).get('trailing')
+            or self.cfg.get('trailing')
+            or {'enabled': True, 'mode': 'atr', 'atr_k': 2.0, 'ema_key': 'ema_fast', 'ema_k': 1.0, 'percent': 0.6, 'min_step_atr': 0.5}
+        )
 
         # --- Risk throttle & learning ---
-        self.base_limits = Limits(self.limits.max_total_positions, self.limits.max_per_symbol, self.limits.no_hedge)
+        self.base_limits   = Limits(self.limits.max_total_positions, self.limits.max_per_symbol, self.limits.no_hedge)
         self.base_cooldown = self.cooldown
         self.base_stop_mult = float(self.strategy_conf.get('stop_mult', 1.5))
         self.equity_peak = float(self.trader.equity())
         self.dd_band = 'none'
         self.layer_pauses = {}
         self._last_learning_update = 0.0
+
         self.alerts_conf = self.cfg.get('alerts', {'enabled': True})
         self._last_alert_check = 0.0
         self._alert_sent = {}
+
+        # Notifier legacy ON/OFF para evitar duplicados
+        self.send_legacy = bool((self.cfg.get('telegram') or {}).get('send_legacy', False))
 
     # === Notificaciones Telegram (formato PRO) ===
     def _tg_open(self, sym, sig, fill, qty, lev, usd):
@@ -229,14 +250,13 @@ class TradingApp:
             )
 
     def _tg_trailing(self, sym, L, price, new_sl):
+        # Ajustado a la firma esperada por el bot de Telegram (sin args extra)
         if hasattr(self, "telegram") and self.telegram:
             self.telegram.trailing(
                 symbol=sym,
                 side=L['side'].upper(),
-                price=float(price),
                 new_sl=float(new_sl),
-                entry=float(L['entry']),
-                anchor=float(L.get('trailing_anchor', price))
+                entry=float(L['entry'])
             )
 
     def _tg_close(self, kind, sym, L, price, pnl):
@@ -787,26 +807,30 @@ class TradingApp:
             return
 
         price_by_symbol = {}
+        # Precalcular si necesitamos funding para *algo*
+        need_funding = bool((self.cfg.get('funding_window', {}) or {}).get('enabled', False) or
+                            (self.funding_guard or {}).get('enabled', False))
+
         for sym in self.symbols:
             df = await self.fetch_ohlcv_2m(sym)
             ind = compute_indicators(df, {**self.filters, **self.strategy_conf, **self.cfg.get("indicators", {})})
             sig = generate_signal(ind, {**self.filters, **self.strategy_conf})
 
+            # Cache ATR para trailing
             try:
                 self.price_cache[f"ATR:{sym}"] = float(ind.iloc[-1].get('atr', 0.0))
             except Exception:
                 pass
 
-            # cache funding si corresponde
-            try:
-                fw = self.cfg.get('funding_window', {})
-                if fw.get('enabled', True):
+            # Funding (1 sola vez si hace falta)
+            if need_funding:
+                try:
                     fr_bps = await self.funding_rate_bps_annualized(sym)
                     self.price_cache[f"FUNDING_BPS:{sym}"] = fr_bps
-            except Exception:
-                pass
+                except Exception:
+                    self.price_cache[f"FUNDING_BPS:{sym}"] = 0.0
 
-            # pausa por aprendizaje
+            # pausas por capa (learning)
             layer = 'trend' if ('trend' in str(getattr(sig, 'regime', ''))) else ('range' if str(getattr(sig, 'regime', '')) in ('range', 'chop') else 'other')
             if layer != 'other':
                 until = self.layer_pauses.get((sym, layer), 0)
@@ -822,9 +846,9 @@ class TradingApp:
                 self.log_decision(sym, 'killswitch' if self.trader.state.killswitch else 'entries_disabled')
                 continue
 
+            # funding guard (usa cache ya calculado)
             if bool(self.funding_guard.get("enabled", False)):
-                fr_bps = await self.funding_rate_bps_annualized(sym)
-                self.price_cache[f"FUNDING_BPS:{sym}"] = fr_bps
+                pass  # sólo aseguramos que FUNDING_BPS esté en cache; chequeo fino lo hace _funding_window_ok
 
             now = time.time()
             last_t = self.trader.state.last_entry_ts_by_symbol.get(sym, 0)
@@ -869,13 +893,14 @@ class TradingApp:
                 # === Telegram PRO: Apertura ===
                 self._tg_open(sym, sig, fill, qty, lev, usd)
 
-                # --- AVISO OPEN con saldo (Notifier clásico) ---
-                try:
-                    await self.notifier.send(
-                        f"🟢 OPEN {sym} {sig.side} qty={qty:.6f} @ {fill.price:.2f} lev={lev} usd={usd:.2f} saldo={self.trader.equity():.2f}"
-                    )
-                except Exception:
-                    pass
+                # Notifier clásico (opcional) para no duplicar
+                if self.send_legacy:
+                    try:
+                        await self.notifier.send(
+                            f"🟢 OPEN {sym} {sig.side} qty={qty:.6f} @ {fill.price:.2f} lev={lev} usd={usd:.2f} saldo={self.trader.equity():.2f}"
+                        )
+                    except Exception:
+                        pass
 
                 if self.mode == 'real':
                     try:
@@ -919,8 +944,8 @@ class TradingApp:
 
                                 # === Telegram PRO: DCA como nueva apertura ===
                                 self._tg_open(sym, sig, fill2, qty_add, lev, usd_add)
-            await self.manage_positions(price_by_symbol)
 
+        await self.manage_positions(price_by_symbol)
         self.persist_equity(0.0)
 
     def persist_equity(self, pnl=0.0):
@@ -947,12 +972,28 @@ class TradingApp:
             while idx < len(lots):
                 L = lots[idx]
                 fee_unit = abs(price * L['qty']) * self.fees['taker']
-                # trailing dinámico
+
+                # trailing dinámico (con compatibilidad min_step_pct -> min_step_atr)
                 try:
                     if self.trailing_conf.get('enabled', True) and ('trailing_anchor' in L):
-                        ind_row = {'atr': float(self.price_cache.get(f'ATR:{sym}', 0.0))}
+                        atr_val = float(self.price_cache.get(f'ATR:{sym}', 0.0))
+                        ind_row = {'atr': atr_val}
+
+                        # Construir params por tick con conversión (si config trajo min_step_pct)
+                        tparams = dict(self.trailing_conf)
+                        if 'min_step_atr' not in tparams and 'min_step_pct' in tparams:
+                            try:
+                                pct = float(tparams.get('min_step_pct', 0.0)) / 100.0
+                                if atr_val > 0 and price > 0:
+                                    # paso_equivalente_en_atr = (pct * price) / atr
+                                    tparams['min_step_atr'] = (pct * price) / atr_val
+                            except Exception:
+                                pass
+
                         prev_sl = L['sl']
-                        new_sl = compute_trailing_stop(L['side'], price, L['sl'], L.get('trailing_anchor', price), ind_row, self.trailing_conf)
+                        new_sl = compute_trailing_stop(
+                            L['side'], price, L['sl'], L.get('trailing_anchor', price), ind_row, tparams
+                        )
                         updated = False
                         if L['side'] == 'long' and new_sl > L['sl']:
                             L['sl'] = new_sl
@@ -972,38 +1013,39 @@ class TradingApp:
                         self.log_trade(sym, L['side'], L['qty'], price, L['lev'], fee_unit, pnl, note="CLOSE_SL")
                         self.save_state()
 
-                        # === Telegram PRO: Cierre por SL ===
                         self._tg_close("SL", sym, L, price, pnl)
 
-                        try:
-                            await self.notifier.send(f"❌ SL {sym} long qty={L['qty']:.6f} @ {price:.2f} pnl={pnl:.2f} saldo={self.trader.equity():.2f}")
-                        except Exception:
-                            pass
+                        if self.send_legacy:
+                            try:
+                                await self.notifier.send(f"❌ SL {sym} long qty={L['qty']:.6f} @ {price:.2f} pnl={pnl:.2f} saldo={self.trader.equity():.2f}")
+                            except Exception:
+                                pass
                         continue
                     if price >= L['tp2']:
                         pnl = self.trader.close_lot(sym, idx, price, fee=fee_unit, note="TP2")
                         self.log_trade(sym, L['side'], L['qty'], price, L['lev'], fee_unit, pnl, note="CLOSE_TP2")
                         self.save_state()
 
-                        # === Telegram PRO: Cierre por TP final ===
                         self._tg_close("TP", sym, L, price, pnl)
 
-                        try:
-                            await self.notifier.send(f"✅ TP2 {sym} long qty={L['qty']:.6f} @ {price:.2f} pnl={pnl:.2f} saldo={self.trader.equity():.2f}")
-                        except Exception:
-                            pass
+                        if self.send_legacy:
+                            try:
+                                await self.notifier.send(f"✅ TP2 {sym} long qty={L['qty']:.6f} @ {price:.2f} pnl={pnl:.2f} saldo={self.trader.equity():.2f}")
+                            except Exception:
+                                pass
                         continue
                     if price >= L['tp1']:
                         half = L['qty'] * 0.5
                         pnl = self.trader.close_lot(sym, idx, price, fee=abs(price * half) * self.fees['taker'], note="TP1_HALF")
                         self.log_trade(sym, L['side'], half, price, L['lev'], abs(price * half) * self.fees['taker'], pnl, note="CLOSE_TP1_HALF")
                         self.save_state()
-                        try:
-                            await self.notifier.send(f"🟢 TP1 {sym} long half qty={half:.6f} @ {price:.2f} pnl={pnl:.2f} saldo={self.trader.equity():.2f}")
-                        except Exception:
-                            pass
 
-                        # === Telegram PRO: TP1 parcial ===
+                        if self.send_legacy:
+                            try:
+                                await self.notifier.send(f"🟢 TP1 {sym} long half qty={half:.6f} @ {price:.2f} pnl={pnl:.2f} saldo={self.trader.equity():.2f}")
+                            except Exception:
+                                pass
+
                         self._tg_tp1(sym, L, price, pnl, half)
 
                         rem = {"side": L['side'], "qty": L['qty'] - half, "entry": price, "lev": L['lev'], "ts": time.time(),
@@ -1016,38 +1058,39 @@ class TradingApp:
                         self.log_trade(sym, L['side'], L['qty'], price, L['lev'], fee_unit, pnl, note="CLOSE_SL")
                         self.save_state()
 
-                        # === Telegram PRO: Cierre por SL ===
                         self._tg_close("SL", sym, L, price, pnl)
 
-                        try:
-                            await self.notifier.send(f"❌ SL {sym} short qty={L['qty']:.6f} @ {price:.2f} pnl={pnl:.2f} saldo={self.trader.equity():.2f}")
-                        except Exception:
-                            pass
+                        if self.send_legacy:
+                            try:
+                                await self.notifier.send(f"❌ SL {sym} short qty={L['qty']:.6f} @ {price:.2f} pnl={pnl:.2f} saldo={self.trader.equity():.2f}")
+                            except Exception:
+                                pass
                         continue
                     if price <= L['tp2']:
                         pnl = self.trader.close_lot(sym, idx, price, fee=fee_unit, note="TP2")
                         self.log_trade(sym, L['side'], L['qty'], price, L['lev'], fee_unit, pnl, note="CLOSE_TP2")
                         self.save_state()
 
-                        # === Telegram PRO: Cierre por TP final ===
                         self._tg_close("TP", sym, L, price, pnl)
 
-                        try:
-                            await self.notifier.send(f"✅ TP2 {sym} short qty={L['qty']:.6f} @ {price:.2f} pnl={pnl:.2f} saldo={self.trader.equity():.2f}")
-                        except Exception:
-                            pass
+                        if self.send_legacy:
+                            try:
+                                await self.notifier.send(f"✅ TP2 {sym} short qty={L['qty']:.6f} @ {price:.2f} pnl={pnl:.2f} saldo={self.trader.equity():.2f}")
+                            except Exception:
+                                pass
                         continue
                     if price <= L['tp1']:
                         half = L['qty'] * 0.5
                         pnl = self.trader.close_lot(sym, idx, price, fee=abs(price * half) * self.fees['taker'], note="TP1_HALF")
                         self.log_trade(sym, L['side'], half, price, L['lev'], abs(price * half) * self.fees['taker'], pnl, note="CLOSE_TP1_HALF")
                         self.save_state()
-                        try:
-                            await self.notifier.send(f"🟢 TP1 {sym} short half qty={half:.6f} @ {price:.2f} pnl={pnl:.2f} saldo={self.trader.equity():.2f}")
-                        except Exception:
-                            pass
 
-                        # === Telegram PRO: TP1 parcial ===
+                        if self.send_legacy:
+                            try:
+                                await self.notifier.send(f"🟢 TP1 {sym} short half qty={half:.6f} @ {price:.2f} pnl={pnl:.2f} saldo={self.trader.equity():.2f}")
+                            except Exception:
+                                pass
+
                         self._tg_tp1(sym, L, price, pnl, half)
 
                         rem = {"side": L['side'], "qty": L['qty'] - half, "entry": price, "lev": L['lev'], "ts": time.time(),
@@ -1120,7 +1163,6 @@ class TradingApp:
                 out = [r for r in rows if (r.get("reason") != "opened")][-n:]
         return out
 
-    # --- estos dos debían estar dentro de la clase ---
     def toggle_killswitch(self):
         self.trader.state.killswitch = not self.trader.state.killswitch
         return self.trader.state.killswitch
@@ -1133,9 +1175,6 @@ class TradingApp:
                 fee_unit = abs(price * L['qty']) * self.fees['taker']
                 pnl = self.trader.close_lot(sym, 0, price, fee=fee_unit, note="FORCE_CLOSE")
                 self.log_trade(sym, L['side'], L['qty'], price, L['lev'], fee_unit, pnl, note="FORCE_CLOSE")
-
-                # === Telegram PRO: Cierre manual ===
                 self._tg_close("MANUAL", sym, L, price, pnl)
-
         self.save_state()
         return True
