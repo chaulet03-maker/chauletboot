@@ -1,5 +1,8 @@
 mode: paper
 
+# Si usás tu start.py (que normaliza), podés dejar 'whitelist'.
+# Si corrés el engine directo, cambiá esto por una lista simple:
+# symbols: ["BTC/USDT:USDT", "ETH/USDT:USDT", "BNB/USDT:USDT", "XRP/USDT:USDT"]
 symbols:
   whitelist: ["BTC/USDT:USDT", "ETH/USDT:USDT", "BNB/USDT:USDT", "XRP/USDT:USDT"]
 
@@ -7,6 +10,7 @@ limits:
   max_open_total: 6
   max_open_per_symbol: 4
   no_hedge: true
+  # cooldown_seconds: 90  # (opcional) si querés explicitarlo
 
 risk:
   size_pct_of_equity: 0.02
@@ -19,10 +23,15 @@ risk:
     "BNB/USDT:USDT": "MAJORS"
     "XRP/USDT:USDT": "MAJORS"
 
+# Caps de cartera que el engine usa (dataclass Caps)
+portfolio_caps:
+  max_portfolio_leverage: 8.0
+  max_portfolio_margin_pct: 1.0
+
 strategy:
   timeframe: "5m"
   adx_min: 18
-  bbwidth_min: 10         # ojo: 10 bps = 0.10%. Si querés 1%, poné 100.
+  bbwidth_min: 10         # 10 bps = 0.10%. Si querés 1%, poné 100.
   atr_len: 14
   adx_len: 14
   layers:
@@ -31,26 +40,31 @@ strategy:
     structure: { enabled: true }
   entry:
     confirm_layers: ["ma", "rsi", "structure"]
-    tp1_r: 1.0            # ← minúsculas para alinear con strategy.py
+    tp1_r: 1.0
     tp2_r: 2.0
   trailing:
     mode: "atr"
     atr_k: 1.5
     hysteresis_pct: 0.05
+    # Podés usar uno u otro:
+    # a) paso en ATR directamente:
+    # min_step_atr: 0.5
+    # b) paso en % del precio (el engine lo convierte a ATR en runtime):
     min_step_pct: 0.05
-    # ema_period: 20   # si cambiás a mode: ema
-    # percent: 0.4     # si cambiás a mode: percent
+    # ema_period: 20   # si usás mode: ema
+    # percent: 0.4     # si usás mode: percent
 
-# Sesgo por funding (opcional); algunos módulos lo usan
+# Sesgo por funding (lo usan otros módulos; no molesta)
 funding:
   use_bias: true
   high_fr_threshold: 0.05
   avoid_minutes_around: 10
 
-# ★ Ventana de funding que el engine sí consulta
+# ★ Ventana de funding: tu engine espera estas claves
 funding_window:
   enabled: true
-  avoid_minutes_around: 10
+  minutes: 10           # ← antes tenías 'avoid_minutes_around'
+  fr_abs_bps_min: 300   # ← umbral de |funding| anualizado (en bps) para activar la guarda
 
 execution:
   slippage_bps: 5
@@ -65,13 +79,13 @@ fees:
   maker: 0.0002
 
 telegram:
-  send_legacy: false
+  send_legacy: false      # evita duplicar mensajes con Notifier clásico
   enabled: true
   anti_spam: { min_interval_s: 1.0 }
   dedup_window_s: 60
   language: "es"
-  inline_commands: false     # usamos telegram_commands.py
-  reports_in_bot: false      # usamos ReportingScheduler
+  inline_commands: false  # usamos telegram_commands.py
+  reports_in_bot: false   # usamos ReportingScheduler
 
 persistence:
   dir: "data"
@@ -89,9 +103,9 @@ order_sizing:
   max_pct: 0.40
   min_pct_dca: 0.10
 
-# ★ Guard de correlación que el engine sí consulta
+# ★ Guard de correlación: el engine lo usa
 correlation_guard:
   enabled: true
-  same_side_max_exposure_ratio: 0.60   # 60% máx. del equity por lado dentro del clúster
+  same_side_max_exposure_ratio: 0.60
   clusters:
     - ["BTC/USDT:USDT", "ETH/USDT:USDT", "BNB/USDT:USDT", "XRP/USDT:USDT"]
