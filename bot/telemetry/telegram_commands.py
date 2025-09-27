@@ -1,18 +1,60 @@
-import asyncio, logging, os, re, datetime as dt, csv
+import asyncio, logging, os, re, datetime as dt, csv, math
+from typing import Dict, Tuple, List, Optional
+from telegram.ext import Application, MessageHandler, filters
+import unicodedata
+
+log = logging.getLogger("tg")
+
+# ========= Helpers de texto / formato =========
+
+def _normalize_text(s: str) -> str:
+    if not s:
+        return ""
+    s = s.strip().lower()
+    s = re.sub(r"[*_`~]+", "", s)                              # quitar markdown simple
+    s = re.sub(r"[,.;:!?()\[\]{}<>\\|/]+", " ", s)             # quitar signos
+    s = re.sub(r"\s+", " ", s).strip()                         # colapsar espacios
+    s = unicodedata.normalize("NFD", s)                        # quitar acentos
+    s = "".join(ch for ch in s if unicodedata.category(ch) != "Mn")
+    return s
+
+def _fmt_money(x):
+    try:
+        return f"${float(x):,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+    except Exception:
+        return str(x)
+
+def _fmt_num(x, nd=2):
+    try:
+        return f"{float(x):.{nd}f}"
+    except Exception:
+        return str(x)
+
+def _csv_dir(engine) -> str:
+    return getattr(engine, "csv_dir", "data")
+
+def _parse_iso(s: str) -> Optional[dt.datetime]:
+    try:
+        return dt.datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+# ========= Bloques de ayuda / posiciones =========
 
 async def _cmd_help(reply):
     texto = (
         "📖 *Ayuda*\n"
         "• *ayuda*: muestra esta ayuda.\n"
-        "• *estado*: saldo, operaciones abiertas y últimos saldos.\n"
-        "• *saldo* / *saldo=NUM*: consulta / fija saldo inicial (paper).\n"
+        "• *estado*: saldo, abiertas y últimos saldos.\n"
+        "• *saldo* / *saldo=NUM*: consulta / fija saldo inicial (paper, si el engine lo soporta).\n"
         "• *posicion* / *posiciones*: detalle de posiciones abiertas.\n"
-        "• *precio [SIMBOLO]*: precio actual.\n"
+        "• *precio [SIMBOLO]*: precio actual o todos.\n"
         "• *bot on* / *bot off*: habilita/deshabilita nuevas entradas.\n"
-        "• *kill* / *killswitch*: cierra todas y bloquea nuevas entradas.\n"
-        "• *cerrar todo*: cierra todas las posiciones.\n"
-        "• *recientes* / *motivos*: últimos motivos de NO-entrada.\n"
+        "• *kill* / *killswitch*: alterna bloqueo de entradas.\n"
+        "• *cerrar todo* / *sos*: cierra todas (sos = apaga y cierra).\n"
+        "• *recientes* / *motivos*: últimos 10 motivos de NO-entrada.\n"
         "• *stats* / *stats semana*: PF, winrate, expectancy por símbolo/capa.\n"
+        "• *report hoy* / *report semana*: reporte diario/semanal.\n"
         "• *diag on* / *diag off*: activa/desactiva diagnóstico.\n"
     )
     return await reply(texto)
@@ -47,49 +89,201 @@ async def _cmd_positions_detail(engine, reply):
                 else:
                     pnl_abs = (entry - px_now) * qty * max(1, lev)
                     pnl_pct = (entry / px_now - 1.0) * 100.0 * max(1, lev)
-            lines.append(f"{sym} {s_side} x{lev}\nentrada: {entry:.2f}\npnl: {pnl_abs:+.2f} ({pnl_pct:+.2f}%)\nsl: {sl:.2f}\ntp: {tp:.2f}")
+            lines.append(
+                f"{sym} {s_side} x{lev}\n"
+                f"entrada: {entry:.2f}\n"
+                f"pnl: {pnl_abs:+.2f} ({pnl_pct:+.2f}%)\n"
+                f"sl: {sl:.2f}\n"
+                f"tp: {tp:.2f}"
+            )
             lines.append("")
     return await reply("\n".join(lines).strip())
-from telegram.ext import Application, MessageHandler, filters
-import unicodedata
 
-log = logging.getLogger("tg")
+# ========= Stats / Reportes =========
 
-def _normalize_text(s: str) -> str:
-    if not s:
-        return ""
-    s = s.strip().lower()
-    # quitar markdown simple y signos
-    s = re.sub(r"[*_`~]+", "", s)
-    # colapsar espacios y signos
-    s = re.sub(r"[,.;:!?()\[\]{}<>\\|/]+", " ", s)
-    s = re.sub(r"\s+", " ", s).strip()
-    # quitar acentos
-    s = unicodedata.normalize("NFD", s)
-    s = "".join(ch for ch in s if unicodedata.category(ch) != "Mn")
-    return s
+def _read_csv(path: str) -> Tuple[List[Dict], List[str]]:
+    rows, hdr = [], []
+    if not os.path.exists(path):
+        return rows, hdr
+    with open(path, newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        hdr = reader.fieldnames or []
+        for r in reader:
+            rows.append(r)
+    return rows, hdr
 
+def _filter_rows_last_days(rows: List[Dict], days: int, ts_key="ts") -> List[Dict]:
+    if not rows:
+        return []
+    now = dt.datetime.utcnow().replace(tzinfo=dt.timezone.utc)
+    since = now - dt.timedelta(days=days)
+    out = []
+    for r in rows:
+        ts = r.get(ts_key) or r.get("timestamp") or r.get("time")
+        dtp = _parse_iso(ts) if isinstance(ts, str) else None
+        if dtp and dtp.tzinfo is None:
+            dtp = dtp.replace(tzinfo=dt.timezone.utc)
+        if dtp and dtp >= since:
+            out.append(r)
+    return out
 
-def _fmt_money(x):
+def _safe_float(r: Dict, key: str, default: float=0.0) -> float:
     try:
-        return f"${float(x):,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+        return float(r.get(key, default) or default)
     except Exception:
-        return str(x)
+        return default
+
+def _compute_stats(days: int, csv_dir: str):
+    """
+    Devuelve:
+      closes, by_sym, by_layer, pf_total, winrate(0..1), expectancy, dur_avg_min, dd_max_frac
+    No exige columnas estrictas; usa lo que haya.
+    """
+    trades_path = os.path.join(csv_dir, "trades.csv")
+    eq_path     = os.path.join(csv_dir, "equity.csv")
+
+    # --- Trades
+    trs, _ = _read_csv(trades_path)
+    trs = _filter_rows_last_days(trs, days, ts_key="ts")
+    n = len(trs)
+
+    wins = sum(1 for r in trs if _safe_float(r, "pnl") > 0)
+    losses = sum(1 for r in trs if _safe_float(r, "pnl") < 0)
+    pnl_total = sum(_safe_float(r, "pnl") for r in trs)
+    fees_total = sum(_safe_float(r, "fees") for r in trs)
+    winrate = (wins / n) if n else 0.0
+    expectancy = (pnl_total / n) if n else 0.0
+
+    # por símbolo
+    by_sym: Dict[str, Dict] = {}
+    for r in trs:
+        sym = (r.get("symbol") or "").upper()
+        if not sym:
+            continue
+        d = by_sym.setdefault(sym, {"n":0,"g":0.0,"l":0.0})
+        d["n"] += 1
+        pnl = _safe_float(r, "pnl")
+        if pnl >= 0:
+            d["g"] += pnl
+        else:
+            d["l"] += pnl
+
+    # por “layer” si existiera columna layer/capa/strategy
+    by_layer: Dict[str, Dict] = {}
+    layer_key = None
+    for cand in ("layer","capa","strategy","estrategia"):
+        if trs and cand in trs[0]:
+            layer_key = cand
+            break
+    if layer_key:
+        for r in trs:
+            lay = (r.get(layer_key) or "").upper() or "GEN"
+            d = by_layer.setdefault(lay, {"n":0,"g":0.0,"l":0.0})
+            d["n"] += 1
+            pnl = _safe_float(r, "pnl")
+            if pnl >= 0:
+                d["g"] += pnl
+            else:
+                d["l"] += pnl
+
+    # duraciones si hay duration_min
+    durations = [_safe_float(r, "duration_min", math.nan) for r in trs]
+    durations = [d for d in durations if not math.isnan(d)]
+    dur_avg_min = (sum(durations)/len(durations)) if durations else None
+
+    # Profit factor total
+    gains = sum(_safe_float(r, "pnl") for r in trs if _safe_float(r, "pnl") > 0)
+    losses_abs = abs(sum(_safe_float(r, "pnl") for r in trs if _safe_float(r, "pnl") < 0))
+    pf_total = (gains / losses_abs) if losses_abs > 0 else (gains if gains>0 else 0.0)
+
+    # --- DD máximo del período (si hay equity.csv es mejor)
+    dd_max_frac = 0.0
+    eq_rows, _ = _read_csv(eq_path)
+    eq_rows = _filter_rows_last_days(eq_rows, days, ts_key="ts")
+    if eq_rows and "equity" in eq_rows[0]:
+        highs = -1e30
+        for r in eq_rows:
+            eq = _safe_float(r, "equity")
+            if eq > highs:
+                highs = eq
+            if highs > 0:
+                dd = (eq / highs) - 1.0
+                dd_max_frac = min(dd_max_frac, dd)
+    else:
+        # fallback: curva con cumul de pnl (aprox)
+        cum = 0.0
+        highs = 0.0
+        for r in trs:
+            cum += _safe_float(r, "pnl")
+            highs = max(highs, cum)
+            if highs > 0:
+                dd = (cum / highs) - 1.0
+                dd_max_frac = min(dd_max_frac, dd)
+
+    # “closes” es la cantidad de trades cerrados
+    closes = n
+    return closes, by_sym, by_layer, pf_total, winrate, expectancy, dur_avg_min, dd_max_frac, pnl_total, fees_total
+
+def _build_report(days: int, csv_dir: str) -> str:
+    closes, by_sym, by_layer, pf_total, wr, exp, dur_avg_min, dd, pnl_total, fees_total = _compute_stats(days, csv_dir)
+
+    # equity cambio si hay equity.csv
+    eq_path = os.path.join(csv_dir, "equity.csv")
+    eq_rows, _ = _read_csv(eq_path)
+    eq_rows = _filter_rows_last_days(eq_rows, days, ts_key="ts")
+    eq_ini = eq_rows[0]["equity"] if eq_rows else None
+    eq_fin = eq_rows[-1]["equity"] if eq_rows else None
+
+    head = "📊 REPORTE DIARIO" if days == 1 else "📈 REPORTE SEMANAL"
+    lines = [head]
+    if eq_ini is not None and eq_fin is not None:
+        try:
+            delta = float(eq_fin) - float(eq_ini)
+        except Exception:
+            delta = 0.0
+        lines.append(f"Equity inicial: {_fmt_money(eq_ini)}   Equity final: {_fmt_money(eq_fin)}   Δ: {_fmt_money(delta)}")
+    lines.append(f"PnL neto: {_fmt_money(pnl_total)}   Fees: {_fmt_money(fees_total)}")
+    lines.append(f"Trades cerrados: {closes}   Win rate: {wr*100:.2f}%   Expectancy: {_fmt_money(exp)}")
+    if dur_avg_min is not None:
+        lines.append(f"Tiempo promedio en trade: {dur_avg_min:.1f} min")
+    lines.append(f"DD máx período: {dd*100:.2f}%")
+
+    if by_sym:
+        lines.append("Top símbolos:")
+        # ordenar por pnl total
+        ranking = []
+        for sym, d in by_sym.items():
+            pnl_sym = d["g"] + d["l"]
+            ranking.append((pnl_sym, sym))
+        ranking.sort(reverse=True)
+        for pnl_sym, sym in ranking[:3]:
+            lines.append(f"• {sym}: {_fmt_money(pnl_sym)}")
+
+    if by_layer:
+        lines.append("Por capa/estrategia:")
+        for lay, d in by_layer.items():
+            pnl_lay = d["g"] + d["l"]
+            lines.append(f"• {lay}: {_fmt_money(pnl_lay)} (n={d['n']})")
+
+    return "\n".join(lines)
+
+# ========= Texto de estado =========
 
 def _status_text(engine):
-    # Construir estado en español
+    # Saldo actual
     try:
         eq = float(engine.trader.equity())
     except Exception:
         eq = 0.0
-    # posiciones abiertas desde el estado vivo
+
+    # posiciones abiertas en memoria
     per_symbol = {s: len(v) for s, v in getattr(engine.trader.state, "positions", {}).items()} if getattr(engine, "trader", None) else {}
     open_cnt = sum(per_symbol.values()) if per_symbol else 0
 
-    # fallback: si no hay nada en memoria, mirar CSV de trades
+    # fallback: contar en CSV si no hay memoria
     try:
         if open_cnt == 0:
-            csv_dir = getattr(engine, "csv_dir", "data")
+            csv_dir = _csv_dir(engine)
             path = os.path.join(csv_dir, "trades.csv")
             if os.path.exists(path):
                 abiertos = {}
@@ -111,10 +305,10 @@ def _status_text(engine):
     except Exception as e:
         log.warning("No pude leer trades.csv para estado: %s", e)
 
-    # últimos saldos (equity.csv)
+    # Últimos saldos (equity.csv)
     recientes_txt = ""
     try:
-        csv_dir = getattr(engine, "csv_dir", "data")
+        csv_dir = _csv_dir(engine)
         eq_path = os.path.join(csv_dir, "equity.csv")
         if os.path.exists(eq_path):
             rows = []
@@ -126,7 +320,7 @@ def _status_text(engine):
             if ult:
                 saldos = " → ".join(_fmt_money(r.get("equity", "0")) for r in ult)
                 recientes_txt = f"\nSaldos recientes: {saldos}"
-    except Exception as e:
+    except Exception:
         pass
 
     partes = [f"📊 Estado",
@@ -140,6 +334,8 @@ def _status_text(engine):
 
     return "\n".join(partes)
 
+# ========= Bot de comandos =========
+
 class CommandBot:
     def __init__(self, app_engine):
         self.engine = app_engine
@@ -151,14 +347,12 @@ class CommandBot:
         msg_raw = (update.message.text or "")
         msg = msg_raw.strip().lower()
         norm_all = _normalize_text(msg_raw)
+        norm = re.sub(r"[,.;:!?\s]+", " ", msg).strip()
 
         def reply(text):
             return update.message.reply_text(text)
 
-        # Normalizar para comandos tipo "Bot, on" / "Bot off"
-        norm = re.sub(r"[,.;:!?\s]+", " ", msg).strip()
-
-        # --- BOT ON / OFF (alias killswitch inverso) ---
+        # --- BOT ON / OFF (killswitch inverso) ---
         if norm in ("bot on", "prender bot", "activar bot", "bot prender"):
             try:
                 ks = getattr(self.engine.trader.state, "killswitch", False)
@@ -191,20 +385,48 @@ class CommandBot:
         if msg in ("estado", "status"):
             return await reply(_status_text(self.engine))
 
-        # --- SALDO ---
+        # --- SALDO / SALDO=NUM (best effort) ---
         if msg in ("equity", "saldo"):
             try:
                 eq = self.engine.trader.equity()
             except Exception:
                 eq = 0.0
             return await reply(f"Saldo: {_fmt_money(eq)}")
+        m = re.match(r"saldo\s*=\s*([\d\.,]+)", norm_all)
+        if m:
+            val_txt = m.group(1).replace(".", "").replace(",", ".")
+            try:
+                new_eq = float(val_txt)
+                # intentar setear si el engine lo permite
+                applied = False
+                for meth in ("set_paper_equity", "set_equity", "set_equity_init"):
+                    fn = getattr(self.engine, meth, None)
+                    if callable(fn):
+                        try:
+                            fn(new_eq)
+                            applied = True
+                            break
+                        except Exception:
+                            pass
+                if not applied:
+                    # persistir para que otro componente lo lea si corresponde
+                    try:
+                        os.makedirs(_csv_dir(self.engine), exist_ok=True)
+                        with open(os.path.join(_csv_dir(self.engine), "equity_init.txt"), "w", encoding="utf-8") as f:
+                            f.write(str(new_eq))
+                        applied = True
+                    except Exception:
+                        applied = False
+                return await reply("Saldo inicial actualizado." if applied else "Guardé el valor, pero el engine no expone setter.")
+            except Exception:
+                return await reply("Formato no válido. Ej: saldo=1000")
 
-        # --- POSICIONES ---
+        # --- POSICIONES (por símbolo) ---
         if msg in ("posicion", "posición", "posiciones"):
             st = getattr(self.engine.trader.state, "positions", {}) if getattr(self.engine, "trader", None) else {}
             if not st:
                 # fallback CSV
-                csv_dir = getattr(self.engine, "csv_dir", "data")
+                csv_dir = _csv_dir(self.engine)
                 path = os.path.join(csv_dir, "trades.csv")
                 abiertos = {}
                 if os.path.exists(path):
@@ -225,7 +447,7 @@ class CommandBot:
                         if abiertos:
                             listado = "\n".join(f"• {k}: {v}" for k, v in abiertos.items())
                             return await reply(f"Posiciones abiertas (por símbolo):\n{listado}")
-                    except Exception as e:
+                    except Exception:
                         pass
                 return await reply("No hay posiciones abiertas.")
 
@@ -240,11 +462,11 @@ class CommandBot:
             parts = msg.split()
             if len(parts) >= 2:
                 sym = parts[1].upper()
-                p = self.engine.price_cache.get(sym)
+                p = getattr(self.engine, "price_cache", {}).get(sym)
                 if p is not None:
                     return await reply(f"{sym}: {_fmt_money(p)}")
                 return await reply(f"No tengo precio de {sym} todavía.")
-            # Sin símbolo: listar todos los que conocemos
+            # Sin símbolo: listar todos
             cache = getattr(self.engine, "price_cache", {}) or {}
             if not cache:
                 return await reply("Todavía no tengo precios en caché.")
@@ -264,17 +486,18 @@ class CommandBot:
             ks = self.engine.toggle_killswitch()
             return await reply(f"Killswitch: {'ACTIVADO' if ks else 'desactivado'}")
 
-        # --- STATS ---
+        # --- STATS (24h / 7d) ---
         if norm_all in ('stats', 'estadisticas', 'estadísticas'):
-            csv_dir = getattr(self.engine, 'csv_dir', 'data')
-            closes, by_sym, by_layer, pf_total, wr, exp, dur_avg_min, dd = _compute_stats(1, csv_dir)
+            csv_dir = _csv_dir(self.engine)
+            closes, by_sym, by_layer, pf_total, wr, exp, dur_avg_min, dd, pnl_total, fees_total = _compute_stats(1, csv_dir)
             partes = [
-                f'Estadísticas (24h):',
-                f'PF total: {pf_total:.2f}',
-                f'Winrate: {wr*100:.1f}%',
-                f'Expectancy: {exp:.2f}',
-                ('Tiempo promedio en trade: ' + (f'{dur_avg_min:.1f} min' if dur_avg_min is not None else 'N/A')),
-                f'DD máx período: {dd*100:.2f}%',
+                f"📈 Estadísticas (24h):",
+                f"PF total: {pf_total:.2f}",
+                f"Winrate: {wr*100:.1f}%",
+                f"Expectancy: {_fmt_money(exp)}",
+                (f"Tiempo promedio en trade: {dur_avg_min:.1f} min" if dur_avg_min is not None else "Tiempo promedio en trade: N/A"),
+                f"DD máx período: {dd*100:.2f}%",
+                f"PnL neto: {_fmt_money(pnl_total)}   Fees: {_fmt_money(fees_total)}",
             ]
             if by_layer:
                 for lay, d in by_layer.items():
@@ -287,15 +510,16 @@ class CommandBot:
             return await reply('\n'.join(partes))
 
         if norm_all in ('stats semana', 'estadisticas semana', 'estadísticas semana'):
-            csv_dir = getattr(self.engine, 'csv_dir', 'data')
-            closes, by_sym, by_layer, pf_total, wr, exp, dur_avg_min, dd = _compute_stats(7, csv_dir)
+            csv_dir = _csv_dir(self.engine)
+            closes, by_sym, by_layer, pf_total, wr, exp, dur_avg_min, dd, pnl_total, fees_total = _compute_stats(7, csv_dir)
             partes = [
-                f'Estadísticas (7 días):',
-                f'PF total: {pf_total:.2f}',
-                f'Winrate: {wr*100:.1f}%',
-                f'Expectancy: {exp:.2f}',
-                ('Tiempo promedio en trade: ' + (f'{dur_avg_min:.1f} min' if dur_avg_min is not None else 'N/A')),
-                f'DD máx período: {dd*100:.2f}%',
+                f"📈 Estadísticas (7 días):",
+                f"PF total: {pf_total:.2f}",
+                f"Winrate: {wr*100:.1f}%",
+                f"Expectancy: {_fmt_money(exp)}",
+                (f"Tiempo promedio en trade: {dur_avg_min:.1f} min" if dur_avg_min is not None else "Tiempo promedio en trade: N/A"),
+                f"DD máx período: {dd*100:.2f}%",
+                f"PnL neto: {_fmt_money(pnl_total)}   Fees: {_fmt_money(fees_total)}",
             ]
             if by_layer:
                 for lay, d in by_layer.items():
@@ -307,20 +531,49 @@ class CommandBot:
                     partes.append(f'• {sym}: PF {pf:.2f} (n={d["n"]})')
             return await reply('\n'.join(partes))
 
+        # --- REPORTES (hoy / semana) ---
+        if norm_all in ("report hoy","reporte hoy","report diario","reporte diario"):
+            txt = _build_report(1, _csv_dir(self.engine))
+            return await reply(txt)
+
+        if norm_all in ("report semana","reporte semana","report semanal","reporte semanal"):
+            txt = _build_report(7, _csv_dir(self.engine))
+            return await reply(txt)
+
         # --- CERRAR TODO ---
-        if msg in ("cerrar todo", "close all", "close_all", "cerrar"):
+        if msg in ("cerrar todo", "close all", "close_all", "cerrar", "cerrar de todo"):
             ok = await self.engine.close_all()
             if ok:
                 return await reply("Cerré todas las posiciones.")
             return await reply("No pude cerrar todo.")
 
+        # --- SOS: apaga y cierra todo ---
+        if norm_all in ("sos","stop and close all","stop close all","stop_close_all"):
+            await self.engine.close_all()
+            try:
+                ks = getattr(self.engine.trader.state, "killswitch", False)
+            except Exception:
+                ks = False
+            if not ks:
+                self.engine.toggle_killswitch()
+            return await reply("🔒 Cerré todo y killswitch ACTIVADO.")
 
         # --- RECIENTES / MOTIVOS ---
         if norm_all in ("recientes", "motivos"):
+            rej = []
+            # 1) API del engine, si existe
             try:
                 rej = self.engine.recent_rejections(n=10)
-            except Exception as e:
+            except Exception:
                 rej = []
+            # 2) Fallback al notificador de Telegram (ring buffer)
+            if not rej:
+                tg = getattr(self.engine, "telegram", None)
+                if tg is not None:
+                    try:
+                        rej = list(getattr(tg, "_rejections", []))[:10]
+                    except Exception:
+                        rej = []
             if not rej:
                 return await reply(
                     "No tengo motivos registrados aún.\n"
@@ -328,15 +581,17 @@ class CommandBot:
                 )
             lines = []
             for r in rej:
-                iso = r.get("iso") or ""
+                iso = r.get("iso") or r.get("ts") or ""
                 sym = r.get("symbol") or ""
-                reason = r.get("reason") or ""
+                reason = r.get("code") or r.get("reason") or ""
                 det = r.get("detail") or ""
                 # Traducciones simples de razones
                 if reason == "killswitch":
                     reason_es = "Bot OFF (killswitch activado)"
                 elif reason == "entries_disabled":
                     reason_es = "Entradas deshabilitadas por configuración"
+                elif reason.startswith("REJECT_CLUSTER_SIDE_EXPOSURE"):
+                    reason_es = reason.replace("REJECT_CLUSTER_SIDE_EXPOSURE", "Límite de exposición por clúster")
                 elif reason == "funding_guard":
                     reason_es = "Funding anualizado por encima del límite"
                 elif reason == "cooldown":
@@ -354,7 +609,8 @@ class CommandBot:
                 line = f"• {iso} — {sym}: {reason_es}" + (f" ({det})" if det else "") + extra_txt
                 lines.append(line)
             return await reply("🕒 Motivos recientes (últimas 10 oportunidades NO abiertas):\n" + "\n".join(lines))
-        # Si no entendí, mostrar ayuda breve
+
+        # Sin match → ayuda breve
         return await reply("No entendí. Escribí *ayuda* para ver comandos.")
 
     async def run(self):
@@ -363,9 +619,7 @@ class CommandBot:
             return
         app = Application.builder().token(self.token).build()
         app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self._handle_text))
-        # PTB v20+ necesita iniciar explícitamente
         await app.initialize()
-        # Desactivar webhook previo y empezar polling
         try:
             await app.bot.delete_webhook(drop_pending_updates=True)
         except Exception:
