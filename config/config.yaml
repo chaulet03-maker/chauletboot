@@ -65,6 +65,7 @@ fees:
   maker: 0.0002
 
 telegram:
+  send_legacy: false
   enabled: true
   anti_spam: { min_interval_s: 1.0 }
   dedup_window_s: 60
