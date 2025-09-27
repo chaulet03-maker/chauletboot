@@ -65,9 +65,12 @@ fees:
   maker: 0.0002
 
 telegram:
+  enabled: true
   anti_spam: { min_interval_s: 1.0 }
   dedup_window_s: 60
   language: "es"
+  inline_commands: false     # usamos telegram_commands.py
+  reports_in_bot: false      # usamos ReportingScheduler
 
 persistence:
   dir: "data"
