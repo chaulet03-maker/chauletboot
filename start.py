@@ -34,6 +34,9 @@ sys.path.insert(0, str(BASE))
 from bot.settings import load_config
 from bot.engine import TradingApp
 from bot.telemetry.telegram_bot import start_telegram_bot
+# ⬇️ IMPORTANTE: comandos de Telegram
+from bot.telemetry.telegram_commands import CommandBot
+
 try:
     from bot.telemetry.reporting import ReportingScheduler
 except Exception:
@@ -117,11 +120,17 @@ async def main():
     app = TradingApp(cfg)
     await app.start()
 
-    # 🚀 Iniciar bot de Telegram (si está disponible)
+    # 🚀 Iniciar bot de Telegram (alertas + reportes)
     try:
         asyncio.create_task(start_telegram_bot(app, cfg))
     except Exception as e:
         logging.getLogger(__name__).warning("telegram bot not started: %s", e)
+
+    # 🚀 Iniciar listener de comandos (texto plano)
+    try:
+        asyncio.create_task(CommandBot(app).run())
+    except Exception as e:
+        logging.getLogger(__name__).warning("telegram commands not started: %s", e)
 
     # (Opcional) Reporting programado, si está disponible
     if ReportingScheduler is not None:
