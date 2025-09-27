@@ -2,7 +2,7 @@ from dataclasses import dataclass
 from typing import Dict, Iterable
 import math
 import pandas as pd
-from .market_regime import infer_regime  # <- esta función debe aceptar el DF completo
+from .market_regime import infer_regime  # acepta DF completo o una fila
 
 @dataclass
 class Signal:
@@ -43,7 +43,6 @@ def generate_signal(df: pd.DataFrame, conf: Dict) -> Signal:
     try:
         regime = infer_regime(df)
     except Exception:
-        # fallback seguro si infer_regime fallara
         regime = "UNKNOWN"
 
     # 2) Tomar última vela y campos
