@@ -1,7 +1,7 @@
 # bot/core/market_regime.py
 from __future__ import annotations
 import pandas as pd
-from typing import Dict, Optional, Union
+from typing import Dict, Optional, Union, Literal
 
 # Regímenes estandarizados (en MAYÚSCULAS para evitar ambigüedades aguas arriba)
 TREND_UP   = "TREND_UP"
@@ -9,6 +9,47 @@ TREND_DOWN = "TREND_DOWN"
 RANGE      = "RANGE"
 CHOP       = "CHOP"
 UNKNOWN    = "UNKNOWN"
+
+Timeframe = Optional[Literal["1h", "4h"]]
+
+# ---------- Defaults por timeframe ----------
+_DEFAULTS_1H = dict(
+    lookback=30,
+    adx_chop_max=12.0,
+    bb_chop_max_bps=6.0,    # 0.06%
+    adx_range_max=18.0,
+    bb_range_max_bps=12.0,  # 0.12%
+    adx_trend_min=18.0,
+    bb_trend_min_bps=8.0,   # 0.08%
+)
+
+_DEFAULTS_4H = dict(
+    lookback=30,
+    # 4h suele mostrar bb_width más chico: bajamos ligeramente umbrales de ancho
+    adx_chop_max=12.0,
+    bb_chop_max_bps=5.0,    # 0.05%
+    adx_range_max=18.0,
+    bb_range_max_bps=10.0,  # 0.10%
+    adx_trend_min=18.0,
+    bb_trend_min_bps=6.0,   # 0.06%
+)
+
+def _merge_cfg(
+    base: Dict[str, float],
+    override: Optional[Dict[str, float]] = None,
+    tf: Timeframe = None,
+    regime_cfg: Optional[Dict[str, Dict[str, float]]] = None,
+) -> Dict[str, float]:
+    """
+    Combina defaults + cfg explícito + overrides por timeframe (si se proveen).
+    Prioridad: regime_cfg[tf] > override > base.
+    """
+    cfg = dict(base)
+    if override:
+        cfg.update(override)
+    if regime_cfg and tf and tf in regime_cfg:
+        cfg.update(regime_cfg[tf])
+    return cfg
 
 def _median_last(df: pd.DataFrame, col: str, lookback: int) -> float:
     """
@@ -24,7 +65,7 @@ def _trend_bias(df: pd.DataFrame) -> int:
     +1 sesgo alcista, -1 bajista, 0 neutral.
     Usa EMA fast/slow (si existen) y close vs slow como confirmación.
     """
-    if df.empty:
+    if df is None or df.empty:
         return 0
     last = df.iloc[-1]
     close    = float(last.get("close", float("nan")))
@@ -40,37 +81,29 @@ def _trend_bias(df: pd.DataFrame) -> int:
         return -1
     return 0
 
-def _infer_from_df(df: pd.DataFrame, cfg: Optional[Dict] = None) -> str:
+def _infer_from_df(
+    df: pd.DataFrame,
+    cfg: Dict,
+) -> str:
     """
     Clasifica con robustez usando la ventana reciente (medianas):
       - CHOP: ADX muy bajo o BB_WIDTH muy angosto.
       - RANGE: ancho bajo y fuerza (ADX) baja.
       - TREND_*: sesgo EMA + umbrales mínimos de ADX/BB_WIDTH.
 
-    Notas:
-      - `bb_width` se espera en bps (x10000) como sale de tus `indicators`.
-      - Umbrales **pensados para 1h** por defecto; afiná vía `cfg` si querés.
-
-    cfg keys (opcionales):
-      lookback: int = 30
-      adx_chop_max: float = 12.0
-      bb_chop_max_bps: float = 6.0
-      adx_range_max: float = 18.0
-      bb_range_max_bps: float = 12.0
-      adx_trend_min: float = 18.0
-      bb_trend_min_bps: float = 8.0
+    Espera columnas: close, adx, bb_width, ema_fast, ema_slow (estas dos últimas opcionales).
+    `bb_width` esperado en bps (x10000) como lo emiten tus indicadores.
     """
-    if df is None or len(df) < 30:
+    if df is None or len(df) < max(30, int(cfg.get("lookback", 30))):
         return UNKNOWN
 
-    cfg = cfg or {}
-    lb            = int(cfg.get("lookback", 30))
-    adx_chop_max  = float(cfg.get("adx_chop_max", 12.0))
-    bb_chop_max   = float(cfg.get("bb_chop_max_bps", 6.0))     # 6 bps = 0.06%
-    adx_range_max = float(cfg.get("adx_range_max", 18.0))
-    bb_range_max  = float(cfg.get("bb_range_max_bps", 12.0))   # 12 bps = 0.12%
-    adx_trend_min = float(cfg.get("adx_trend_min", 18.0))
-    bb_trend_min  = float(cfg.get("bb_trend_min_bps", 8.0))    # 8 bps = 0.08%
+    lb            = int(cfg["lookback"])
+    adx_chop_max  = float(cfg["adx_chop_max"])
+    bb_chop_max   = float(cfg["bb_chop_max_bps"])
+    adx_range_max = float(cfg["adx_range_max"])
+    bb_range_max  = float(cfg["bb_range_max_bps"])
+    adx_trend_min = float(cfg["adx_trend_min"])
+    bb_trend_min  = float(cfg["bb_trend_min_bps"])
 
     adx_med = _median_last(df, "adx", lb)
     bbw_med = _median_last(df, "bb_width", lb)
@@ -97,18 +130,17 @@ def _infer_from_df(df: pd.DataFrame, cfg: Optional[Dict] = None) -> str:
     # 4) Si no cumple thresholds de tendencia pero tampoco es CHOP claro, asumimos RANGE
     return RANGE
 
-def _infer_from_row(row: pd.Series, cfg: Optional[Dict] = None) -> str:
+def _infer_from_row(row: pd.Series, cfg: Dict) -> str:
     """
     Compatibilidad si te pasan una sola fila (última vela).
     Usa los mismos thresholds que el modo DataFrame pero evaluando un punto.
     """
-    cfg = cfg or {}
-    adx_chop_max  = float(cfg.get("adx_chop_max", 12.0))
-    bb_chop_max   = float(cfg.get("bb_chop_max_bps", 6.0))
-    adx_range_max = float(cfg.get("adx_range_max", 18.0))
-    bb_range_max  = float(cfg.get("bb_range_max_bps", 12.0))
-    adx_trend_min = float(cfg.get("adx_trend_min", 18.0))
-    bb_trend_min  = float(cfg.get("bb_trend_min_bps", 8.0))
+    adx_chop_max  = float(cfg["adx_chop_max"])
+    bb_chop_max   = float(cfg["bb_chop_max_bps"])
+    adx_range_max = float(cfg["adx_range_max"])
+    bb_range_max  = float(cfg["bb_range_max_bps"])
+    adx_trend_min = float(cfg["adx_trend_min"])
+    bb_trend_min  = float(cfg["bb_trend_min_bps"])
 
     adx = float(row.get("adx", float("nan")))
     bb  = float(row.get("bb_width", float("nan")))
@@ -129,12 +161,32 @@ def _infer_from_row(row: pd.Series, cfg: Optional[Dict] = None) -> str:
         return TREND_DOWN
     return RANGE
 
-def infer_regime(obj: Union[pd.DataFrame, pd.Series], cfg: Optional[Dict] = None) -> str:
+def infer_regime(
+    obj: Union[pd.DataFrame, pd.Series],
+    cfg: Optional[Dict] = None,
+    tf: Timeframe = None,
+    regime_cfg: Optional[Dict[str, Dict[str, float]]] = None,
+) -> str:
     """
     API unificada:
       - Si recibe DataFrame -> usa ventana (recomendado).
       - Si recibe Series/fila -> usa la lógica de una vela (compatibilidad).
+
+    Parámetros:
+      cfg: overrides globales de thresholds.
+      tf: "1h" | "4h" para elegir defaults por timeframe (si no pasás regime_cfg).
+      regime_cfg: mapa opcional por timeframe (e.g., {"1h": {...}, "4h": {...}}).
+                  Si existe y coincide con `tf`, tiene prioridad.
     """
+    # Elegir base por timeframe
+    if tf == "4h":
+        base = _DEFAULTS_4H
+    else:
+        # default 1h si no se especifica tf
+        base = _DEFAULTS_1H
+
+    merged_cfg = _merge_cfg(base=base, override=cfg, tf=tf, regime_cfg=regime_cfg)
+
     if isinstance(obj, pd.DataFrame):
-        return _infer_from_df(obj, cfg)
-    return _infer_from_row(obj, cfg)
+        return _infer_from_df(obj, merged_cfg)
+    return _infer_from_row(obj, merged_cfg)
