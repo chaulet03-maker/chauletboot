@@ -30,7 +30,7 @@ load_dotenv(BASE / ".env")
 os.chdir(BASE)
 sys.path.insert(0, str(BASE))
 
-# ✅ Imports correctos del proyecto
+# ✅ Imports del proyecto
 from bot.settings import load_config
 from bot.engine import TradingApp
 from bot.telemetry.telegram_bot import start_telegram_bot
@@ -41,13 +41,67 @@ except Exception:
 
 def _normalize_symbols(cfg: dict) -> dict:
     """
-    Admite symbols como lista o como dict con 'whitelist'.
+    Acepta symbols como lista o como dict con 'whitelist'.
+    Normaliza a lista simple (engine-friendly).
     """
     syms = cfg.get("symbols")
     if isinstance(syms, dict):
         syms = syms.get("whitelist", [])
         cfg["symbols"] = syms
     return cfg
+
+# === ADAPTADOR DE CONFIG (evita claves ignoradas por el engine) ===
+def _adapt_cfg(cfg: dict) -> dict:
+    out = dict(cfg)
+
+    # 1) timeframe: subirlo del bloque strategy al top-level
+    tf = (cfg.get("strategy") or {}).get("timeframe")
+    if tf:
+        out["timeframe"] = tf
+
+    # 2) limits: mapear nombres usados por el engine
+    lim_in = cfg.get("limits", {}) or {}
+    lim_out = out.setdefault("limits", {})
+    if "max_open_total" in lim_in:
+        lim_out["max_total_positions"] = lim_in["max_open_total"]
+    if "max_open_per_symbol" in lim_in:
+        lim_out["max_per_symbol"] = lim_in["max_open_per_symbol"]
+    if "no_hedge" in lim_in:
+        lim_out["no_hedge"] = lim_in["no_hedge"]
+
+    # 3) persistence -> storage
+    pers = cfg.get("persistence", {}) or {}
+    sto = out.setdefault("storage", {})
+    if pers.get("dir"):
+        sto["csv_dir"] = pers["dir"]
+    if pers.get("sqlite_file"):
+        sto["sqlite_path"] = pers["sqlite_file"]
+
+    # 4) slippage: execution -> paper
+    exe = cfg.get("execution", {}) or {}
+    pap = out.setdefault("paper", {})
+    if "slippage_bps" in exe:
+        pap["slippage_bps"] = exe["slippage_bps"]
+
+    # 5) fees por si faltan (evita KeyError y asegura realismo)
+    if "fees" not in out:
+        out["fees"] = {"taker": 0.0005, "maker": 0.0002}
+
+    return out
+# === FIN ADAPTADOR ===
+
+def _log_boot_info(cfg: dict):
+    log = logging.getLogger("BOOT")
+    syms = cfg.get("symbols", [])
+    tf = cfg.get("timeframe", (cfg.get("strategy") or {}).get("timeframe"))
+    fees = (cfg.get("fees") or {})
+    taker = fees.get("taker", "n/a")
+    maker = fees.get("maker", "n/a")
+    slipp = ((cfg.get("paper") or {}).get("slippage_bps")
+             or (cfg.get("execution") or {}).get("slippage_bps"))
+    mode = cfg.get("mode", os.getenv("MODE", "paper"))
+    log.info("Mode: %s | Timeframe: %s | Symbols: %s", mode, tf, ", ".join(syms))
+    log.info("Fees: taker=%s maker=%s | Slippage bps=%s", taker, maker, slipp)
 
 async def main():
     # Algunos repos esperan load_config() sin args; otros reciben el modo.
@@ -57,11 +111,13 @@ async def main():
         cfg = load_config(os.getenv("MODE"))
 
     cfg = _normalize_symbols(cfg)
+    cfg = _adapt_cfg(cfg)
+    _log_boot_info(cfg)
 
     app = TradingApp(cfg)
     await app.start()
 
-    # 🚀 Iniciar bot de Telegram (no duplicar si ya estuviera iniciándose en otro lado)
+    # 🚀 Iniciar bot de Telegram (si está disponible)
     try:
         asyncio.create_task(start_telegram_bot(app, cfg))
     except Exception as e:
