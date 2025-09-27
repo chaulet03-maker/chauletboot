@@ -11,22 +11,14 @@ class Limits:
 
 @dataclass
 class Caps:
-    # límites agregados a nivel cartera
-    max_portfolio_leverage: float = 8.0               # notional/equity
-    max_portfolio_margin_pct: float = 1.0             # margin_used / equity
-    max_cluster_side_exposure_pct: float = 60.0       # % del equity
-    # mapping símbolo -> cluster (p.ej. "BTC/USDT:USDT": "MAJORS")
+    max_portfolio_leverage: float = 8.0
+    max_portfolio_margin_pct: float = 1.0
+    max_cluster_side_exposure_pct: float = 60.0
     clusters: Optional[Dict[str, str]] = None
-
-# ---------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------
 
 def _norm_side(side: str) -> Side:
     s = (side or "").strip().lower()
-    if s not in ("long", "short"):
-        return "long"
-    return s
+    return s if s in ("long", "short") else "long"
 
 def _positions_total_count(all_positions: Dict[str, List[dict]]) -> int:
     return sum(len(v) for v in (all_positions or {}).values())
@@ -36,20 +28,13 @@ def _price(sym: str, price_by_symbol: Dict[str, float]) -> Optional[float]:
     return float(p) if p is not None else None
 
 def _cluster_of(sym: str, clusters: Optional[Dict[str, str]]) -> str:
-    if not clusters:
-        return "UNCLUSTERED"
-    return clusters.get(sym, "UNCLUSTERED")
-
-# ---------------------------------------------------------------------
-# Reglas por símbolo
-# ---------------------------------------------------------------------
+    return (clusters or {}).get(sym, "UNCLUSTERED")
 
 def can_open(symbol: str, side: str, all_positions: Dict[str, List[dict]], limits: Limits) -> Tuple[bool, str]:
     """
     - Máx. total de posiciones
     - Máx. por símbolo
-    - No-hedge: no permite lados opuestos en el mismo símbolo
-    all_positions: { symbol: [ {side, qty, ...}, ... ] }
+    - No-hedge en el mismo símbolo
     """
     side = _norm_side(side)
     total = _positions_total_count(all_positions)
@@ -68,10 +53,6 @@ def can_open(symbol: str, side: str, all_positions: Dict[str, List[dict]], limit
 
     return True, "OK"
 
-# ---------------------------------------------------------------------
-# Reglas de cartera (apalancamiento, margen y exposición por clúster/lado)
-# ---------------------------------------------------------------------
-
 def portfolio_caps_ok(
     equity: float,
     positions: Dict[str, List[dict]],
@@ -84,10 +65,9 @@ def portfolio_caps_ok(
     """
     equity = float(equity or 0.0)
     if equity <= 0:
-        # si no tenemos equity no abrimos nada
         return False, "REJECT_NO_EQUITY"
 
-    # --- apalancamiento y margen totales ---
+    # apalancamiento/margen
     notional_total = 0.0
     margin_total = 0.0
     for sym, lots in (positions or {}).items():
@@ -111,10 +91,9 @@ def portfolio_caps_ok(
     if margin_pct > float(caps.max_portfolio_margin_pct):
         return False, "REJECT_PORTFOLIO_MARGIN"
 
-    # --- exposición por clúster y lado (ej. 60% del equity) ---
+    # exposición por clúster y lado
     max_cluster_pct = float(caps.max_cluster_side_exposure_pct or 0.0)
     if max_cluster_pct > 0:
-        # acumulamos exposición notional por (cluster, side)
         expo: Dict[Tuple[str, Side], float] = {}
         for sym, lots in (positions or {}).items():
             p = _price(sym, price_by_symbol)
@@ -128,11 +107,9 @@ def portfolio_caps_ok(
                     continue
                 expo[(cluster, side)] = expo.get((cluster, side), 0.0) + qty * p
 
-        # chequear cada cluster/lado
         for (cluster, side), notional in expo.items():
             pct_equity = (notional / equity) * 100.0
             if pct_equity > max_cluster_pct:
-                # Ej.: “MAJORS LONG 72.4% > 60%”
                 return False, f"REJECT_CLUSTER_SIDE_EXPOSURE:{cluster}:{side}:{pct_equity:.1f}%>{max_cluster_pct:.1f}%"
 
     return True, "OK"
