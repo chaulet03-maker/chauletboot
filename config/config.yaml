@@ -22,7 +22,7 @@ risk:
 strategy:
   timeframe: "5m"
   adx_min: 18
-  bbwidth_min: 10
+  bbwidth_min: 10         # ojo: 10 bps = 0.10%. Si querés 1%, poné 100.
   atr_len: 14
   adx_len: 14
   layers:
@@ -31,8 +31,8 @@ strategy:
     structure: { enabled: true }
   entry:
     confirm_layers: ["ma", "rsi", "structure"]
-    tp1_R: 1.0
-    tp2_R: 2.0
+    tp1_r: 1.0            # ← minúsculas para alinear con strategy.py
+    tp2_r: 2.0
   trailing:
     mode: "atr"
     atr_k: 1.5
@@ -41,9 +41,15 @@ strategy:
     # ema_period: 20   # si cambiás a mode: ema
     # percent: 0.4     # si cambiás a mode: percent
 
+# Sesgo por funding (opcional); algunos módulos lo usan
 funding:
   use_bias: true
   high_fr_threshold: 0.05
+  avoid_minutes_around: 10
+
+# ★ Ventana de funding que el engine sí consulta
+funding_window:
+  enabled: true
   avoid_minutes_around: 10
 
 execution:
@@ -78,3 +84,10 @@ order_sizing:
   default_pct: 0.30
   max_pct: 0.40
   min_pct_dca: 0.10
+
+# ★ Guard de correlación que el engine sí consulta
+correlation_guard:
+  enabled: true
+  same_side_max_exposure_ratio: 0.60   # 60% máx. del equity por lado dentro del clúster
+  clusters:
+    - ["BTC/USDT:USDT", "ETH/USDT:USDT", "BNB/USDT:USDT", "XRP/USDT:USDT"]
