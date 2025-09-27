@@ -184,7 +184,7 @@ def descargar_symbol_tf(ex: ccxt.Exchange, symbol: str, timeframe: str, since_ms
 def main():
     ap = argparse.ArgumentParser(description="Descarga OHLCV desde Binance (usdm/spot), reanudable.")
     ap.add_argument("--symbols", type=str, default="BTC/USDT,ETH/USDT,BNB/USDT,XRP/USDT")
-    ap.add_argument("--timeframes", type=str, default="1h,5m")
+    ap.add_argument("--timeframes", type=str, default="1h,4h")
     ap.add_argument("--since", type=str, default="2023-01-01T00:00:00Z")
     ap.add_argument("--until", type=str, default="now")
     ap.add_argument("--market", type=str, default="usdm", choices=["usdm", "spot"])
@@ -214,3 +214,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
