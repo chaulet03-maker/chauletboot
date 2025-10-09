@@ -1,0 +1,163 @@
+mode: paper
+
+# Control del loop/TF del engine (explícito para evitar ambigüedades)
+timeframe: "2m"
+loop_seconds: 120
+
+# Solo BTC
+symbols: ["BTC/USDT:USDT"]
+
+limits:
+  max_total_positions: 6
+  max_per_symbol: 4
+  no_hedge: true
+  # cooldown_seconds: 90
+
+risk:
+  # === para que opere como en tu simulador ===
+  size_mode: full_equity      # <-- mapea --size-mode full_equity
+  equity_usdt: 1000.0         # <-- --balance 1000
+  max_risk_per_trade_pct: 0.005
+  max_cluster_side_exposure_pct: 60.0
+  daily_stop_R: 2.5           # <-- --daily-stop-R 2.5
+  emerg_trade_stop_R: 1.65    # <-- --emerg-trade-stop-R 1.65
+  max_hold_bars: 16           # <-- --max-hold-bars 16
+  clusters:
+    "BTC/USDT:USDT": "MAJORS"
+
+portfolio_caps:
+  max_portfolio_leverage: 8.0
+  max_portfolio_margin_pct: 1.0
+
+strategy:
+  timeframe: "1h"             # (multi-TF de tu lógica; el engine usa el top-level timeframe="2m")
+  # === Entradas / filtros como tu corrida ganadora ===
+  entry_mode: pullback_grid   # <-- usaste grid_* en la corrida
+  trend_filter: ema200_4h     # <-- --trend-filter ema200_4h
+  rsi4h_gate: 56              # <-- --rsi4h-gate 56
+  ema200_1h_confirm: true     # <-- --ema200-1h-confirm
+  ban_hours: "1"              # <-- --ban-hours "1"
+
+  # Grid (pullback)
+  grid_anchor: ema30
+  grid_side: auto
+  grid_step_atr: 0.32         # <-- --grid-step-atr 0.32
+  grid_span_atr: 3.0          # <-- --grid-span-atr 3.0
+
+  # Filtros de volatilidad / funding
+  atrp_gate_min: 0.25         # <-- --atrp-gate-min 0.25    (en %)
+  atrp_gate_max: 1.25         # <-- --atrp-gate-max 1.25    (en %)
+  funding_gate_bps: 160       # <-- --funding-gate-bps 160
+
+  # TP por objetivo de equity (como en tu sim)
+  target_eq_pnl_pct: 0.10     # <-- --target-eq-pnl-pct 0.10
+
+  # SL/TP base por porcentaje (fallback si no se usa target_eq_pnl_pct)
+  use_atr: false
+  sl_pct: 0.007
+  tp_pct: 0.015
+
+indicators:
+  ema_fast: 20
+  ema_slow: 50
+  macd_fast: 12
+  macd_slow: 26
+  macd_signal: 9
+  rsi_len: 14
+  adx_len: 14
+  bb_len: 20
+  bb_dev: 2.0
+  atr_len: 14
+  vol_multiplier_vs_mean: 1.2
+  vol_ma_window: 20
+  ema200_4h_window: 200
+  rsi4h_len: 14
+
+# (Opcional) referencias multi-TF – dejo lo tuyo
+strategies:
+  - name: BTC_1h_BB_reversion
+    symbol: BTC/USDT:USDT
+    timeframe: 1h
+    kind: BB_reversion
+    params:
+      z_threshold: 2.5
+      ema200_filter: true
+      hold_bars: 30
+      atr_len: 14
+      adx_len: 14
+      adx_min: 18
+      bbwidth_min_bps: 10
+      trail: { mode: atr, atr_k: 1.5, hysteresis_pct: 0.05, min_step_pct: 0.05 }
+
+  - name: BTC_4h_BB_reversion
+    symbol: BTC/USDT:USDT
+    timeframe: 4h
+    kind: BB_reversion
+    params:
+      z_threshold: 2.0
+      ema200_filter: true
+      hold_bars: 12
+      atr_len: 14
+      adx_len: 14
+      adx_min: 18
+      bbwidth_min_bps: 6
+      trail: { mode: atr, atr_k: 1.5, hysteresis_pct: 0.05, min_step_pct: 0.05 }
+
+funding:
+  use_bias: true
+  high_fr_threshold: 0.05
+  avoid_minutes_around: 10
+
+funding_window:
+  enabled: true
+  minutes: 10
+  fr_abs_bps_min: 300
+
+execution:
+  slippage_bps: 5
+  leverage: 4.8                 # <-- --lev 4.8 (para que calce con tu corrida)
+  set_leverage: true
+  retries: 3
+  retry_backoff_s: 1.0
+  time_sync: true
+
+fees:
+  taker: 0.0002                 # <-- --fee 0.0002
+  maker: 0.0002
+
+telegram:
+  send_legacy: false
+  enabled: true
+  anti_spam: { min_interval_s: 1.0 }
+  dedup_window_s: 60
+  language: "es"
+  inline_commands: true
+  reports_in_bot: false
+  # Opcional: si no querés usar env-var, podés setear el token acá:
+  # token: "123456:ABCDEF-..."
+
+storage:
+  csv_dir: "data"
+  sqlite_path: "data/bot.sqlite"
+
+persistence:
+  dir: "data"
+  sqlite_file: "data/trades.sqlite"
+  equity_csv: "data/equity.csv"
+  trades_csv: "data/trades.csv"
+  state_file: "data/state.json"
+  logs_file: "data/logs.csv"
+
+leverage: { min: 5, max: 15, default: 10 }
+
+order_sizing:
+  min_pct: 0.20
+  default_pct: 0.30
+  max_pct: 0.40
+  min_pct_dca: 0.10
+
+correlation_guard:
+  enabled: true
+  same_side_max_exposure_ratio: 0.60
+  clusters:
+    - ["BTC/USDT:USDT"]
