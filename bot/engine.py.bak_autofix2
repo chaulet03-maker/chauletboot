@@ -1,0 +1,509 @@
+import asyncio, logging, time, datetime as dt, math, random, json, os
+import pandas as pd
+import ccxt.async_support as ccxt
+from bot.core.indicators import compute_indicators
+from bot.core.strategy import generate_signal
+from bot.risk.guards import Limits, can_open, portfolio_caps_ok
+from bot.exchanges.paper import PaperExchange
+from bot.exchanges.real import RealExchange
+from bot.storage.csv_store import append_trade_csv, append_equity_csv
+from bot.storage.sqlite_store import ensure_db, insert_trade, insert_equity
+from bot.trader import Trader
+from bot.telemetry.notifier import Notifier
+logger = logging.getLogger("engine")
+def usd_to_qty(symbol, usd, price, lev):
+    if price <= 0: return 0.0
+    return (usd * lev) / price
+class TradingApp:
+    def total_margin_used(self, price_by_symbol):
+        total = 0.0
+        for sym, lots in self.trader.state.positions.items():
+            price = price_by_symbol.get(sym) or self.price_cache.get(sym) or 0.0
+            if price <= 0: 
+                continue
+            for L in lots:
+                total += abs(price * L['qty']) / max(L.get('lev', 1), 1)
+        return total
+    def available_margin_usd(self, equity, price_by_symbol):
+        used = self.total_margin_used(price_by_symbol)
+        cap_pct = float(self.portfolio_caps.get("max_portfolio_margin_pct", 1.0))
+        max_allowed = max(0.0, equity * cap_pct)
+        return max(0.0, max_allowed - used)
+    STATE_FILE = os.path.join("Data", "state.json")
+    def __init__(self, config: dict):
+        self.cfg = config
+        self.symbols = config.get("symbols", ["BTC/USDT:USDT","ETH/USDT:USDT"])
+        self.timeframe = config.get("timeframe","2m")
+        self.loop_seconds = int(config.get("loop_seconds", 120))
+        ex_cfg = config.get("exchange",{})
+        self.ccxt = getattr(ccxt, ex_cfg.get("id","binanceusdm"))()
+        self.ccxt.enableRateLimit = ex_cfg.get("enableratelimit", True)
+        self.ccxt.options = ex_cfg.get("options", {"defaultType":"future"})
+        self.fees = config.get("fees", {"taker":0.0002,"maker":0.0002})
+        self.paper = PaperExchange(self.fees, slippage_bps=int(config.get("paper",{}).get("slippage_bps",5)))
+        self.trader = Trader(self.fees, equity0=1000.0)
+        self.csv_dir = config.get("storage",{}).get("csv_dir","data")
+        self.sqlite_path = config.get("storage",{}).get("sqlite_path","data/bot.sqlite")
+        ensure_db(self.sqlite_path)
+        lim = config.get("limits",{})
+        self.limits = Limits(max_total_positions=int(lim.get("max_total_positions",6)),
+                             max_per_symbol=int(lim.get("max_per_symbol",4)),
+                             no_hedge=bool(lim.get("no_hedge",True)))
+        self.cooldown = int(lim.get("cooldown_seconds",90))
+        self.order_sizes = config.get("order_sizing",{})
+        self.leverage_conf = config.get("leverage", {"min":1,"max":15,"default":5})
+        self.filters = config.get("filters",{})
+        self.strategy_conf = config.get("strategy",{})
+        self.portfolio_caps = config.get("portfolio_caps",{})
+        self.funding_guard = config.get("funding_guard",{"enabled":True,"annualized_bps_limit":5000})
+        self.circuit_breakers = config.get("circuit_breakers",{})
+        self.mode = config.get("mode","paper").lower()
+        self.price_cache = {}
+        self.allow_new_entries = True
+        self.notifier = Notifier()
+        self._loaded_state = False
+        self.exchange = self.paper if self.mode=='paper' else RealExchange(self.ccxt, self.fees)
+    async def fetch_ohlcv_2m(self, symbol):
+        tf = self.timeframe
+        if tf == "2m":
+            data = await self.with_retry(self.ccxt.fetch_ohlcv, symbol, timeframe="1m", limit=200)
+            df = pd.DataFrame(data, columns=["ts","open","high","low","close","volume"])
+            df['ts'] = pd.to_datetime(df['ts'], unit='ms')
+            df = df.set_index('ts').resample('2T').agg({
+                'open':'first','high':'max','low':'min','close':'last','volume':'sum'
+            }).dropna().reset_index()
+            return df
+        else:
+            data = await self.with_retry(self.ccxt.fetch_ohlcv, symbol, timeframe=tf, limit=200)
+            df = pd.DataFrame(data, columns=["ts","open","high","low","close","volume"])
+            df['ts'] = pd.to_datetime(df['ts'], unit='ms')
+            return df
+    async def fetch_last_price(self, symbol):
+        t = await self.with_retry(self.ccxt.fetch_ticker, symbol)
+        return float(t['last'])
+    async def funding_rate_bps_annualized(self, symbol):
+        try:
+            fr = await self.with_retry(self.ccxt.fetch_funding_rate, symbol)
+            rate = float(fr.get('fundingRate', 0.0))
+            annualized = rate * 3 * 24 * 365 * 10000.0  # bps
+            return annualized
+        except Exception:
+            return 0.0
+    def _choose_leverage_and_pct(self, last_row: dict, regime: str):
+        min_lev = int(self.leverage_conf.get("min",1))
+        max_lev = int(self.leverage_conf.get("max",15))
+        base_pct = float(self.order_sizes.get("default_pct",0.30))
+        adx = float(last_row.get('adx', 0))
+        bbw = float(last_row.get('bb_width', 0))
+        vol_ok = bool(last_row.get('vol_ok', True))
+        if regime in ("chop",):
+            lev = max(min_lev, 1)
+            pct = max(0.10, min(0.20, base_pct*0.5))
+        elif regime in ("range",):
+            lev = max(2, min(4, max_lev))
+            pct = max(0.15, min(0.30, base_pct*0.75))
+        else:
+            lev = max(5, min(8, max_lev))
+            pct = max(0.25, min(0.40, base_pct))
+        if adx >= 30 and vol_ok and bbw >= 12:
+            lev = min(max_lev, max(lev, 10))
+            pct = max(pct, 0.60)
+        if adx >= 40 and vol_ok and bbw >= 16:
+            lev = min(max_lev, max(lev, 12))
+            pct = max(pct, 0.80)
+        pct = max(float(self.order_sizes.get("min_pct",0.10)), min(float(self.order_sizes.get("max_pct",1.00)), pct))
+        lev = max(min_lev, min(max_lev, int(lev)))
+        return lev, pct
+    def _apply_caps(self, usd, price, lev):
+        cap = self.order_sizes.get("max_usd_per_trade", None)
+        if cap is not None:
+            try:
+                usd = min(usd, float(cap))
+            except Exception:
+                pass
+        max_notional = self.cfg.get("risk",{}).get("max_notional_per_trade", None)
+        if max_notional is not None:
+            try:
+                usd = min(usd, float(max_notional))
+            except Exception:
+                pass
+        max_margin = self.cfg.get("risk",{}).get("max_margin_per_trade", None)
+        if max_margin is not None:
+            try:
+                max_notional_by_margin = float(max_margin) * max(lev,1)
+                usd = min(usd, max_notional_by_margin)
+            except Exception:
+                pass
+        return usd
+    def _check_circuit_breakers(self):
+        cb = self.circuit_breakers or {}
+        if not cb: self.save_state()
+        return True
+        try:
+            df = pd.read_csv(f"{self.csv_dir}/equity.csv", parse_dates=["ts"])
+            df['ts'] = pd.to_datetime(df['ts'], utc=True)
+            now = pd.Timestamp.utcnow()
+            last = df[df['ts'] >= (now - pd.Timedelta(days=1))]
+            pnl_1d = float(last['pnl'].sum()) if not last.empty else 0.0
+            daily_loss_usd = float(cb.get("daily_loss_usd", 1e12))
+            daily_loss_pct = float(cb.get("daily_loss_pct", 1.0))
+            eq = self.trader.equity()
+            if pnl_1d <= -abs(daily_loss_usd): return False
+            if eq and (pnl_1d/eq) <= -abs(daily_loss_pct): return False
+            try:
+                tr = pd.read_csv(f"{self.csv_dir}/trades.csv", parse_dates=["ts"])
+                tr['ts'] = pd.to_datetime(tr['ts'], utc=True)
+                trd = tr[tr['ts'] >= (now - pd.Timedelta(days=1))]
+                if len(trd) >= int(cb.get("max_trades_per_day", 1000)): return False
+            except Exception:
+                pass
+        except Exception:
+            pass
+        self.save_state()
+        return True
+    async def with_retry(self, fn, *args, retries=5, base_delay=0.3, backoff=1.8, **kwargs):
+        last_exc = None
+        for i in range(retries):
+            try:
+                return await fn(*args, **kwargs)
+            except Exception as e:
+                last_exc = e
+                await asyncio.sleep(base_delay * (backoff ** i) * (1 + random.random()*0.2))
+        raise last_exc
+    async def bootstrap_real(self):
+        """Reconstruye equity y posiciones desde el exchange al iniciar en modo REAL."""
+        try:
+            bal = await self.exchange.fetch_balance_usdt()
+            if bal:
+                self.trader.state.equity = float(bal)
+        except Exception as e:
+            logger.warning("bootstrap balance failed: %s", e)
+        try:
+            poss = await self.exchange.fetch_positions()
+            for p in poss or []:
+                sym = p.get('symbol')
+                if not sym or sym not in self.symbols: 
+                    continue
+                # Detectar lado y tamaño neto
+                side = None; qty = 0.0; lev = int(self.leverage_conf.get("default",5))
+                entry = float(p.get('entryPrice') or p.get('entry_price') or p.get('info',{}).get('entryPrice') or 0.0)
+                contracts = p.get('contracts') or p.get('contractSize') or p.get('size')
+                if contracts is None:
+                    # fallback: try 'info'
+                    contracts = p.get('info',{}).get('positionAmt') or 0
+                qty = abs(float(contracts or 0.0))
+                if qty <= 0 or entry <= 0:
+                    continue
+                # side
+                s = p.get('side') or p.get('info',{}).get('positionSide')
+                if s:
+                    s_low = str(s).lower()
+                    side = 'long' if 'long' in s_low else 'short'
+                else:
+                    # infer by signed positionAmt
+                    pa = float(p.get('info',{}).get('positionAmt') or 0.0)
+                    side = 'long' if pa > 0 else 'short'
+                try:
+                    lev = int(p.get('leverage') or p.get('info',{}).get('leverage') or lev)
+                except Exception:
+                    pass
+                # Insertar como lot "existente"
+                self.trader.open_lot(sym, side, qty, entry, lev, sl=0.0, tp1=0.0, tp2=0.0, fee=0.0, entry_adx=0.0, leg=1)
+                self.log_trade(sym, side, qty, entry, lev, 0.0, pnl=0.0, note="BOOTSTRAP_EXISTING")
+            logger.info("bootstrap_real done: positions=%s", sum(len(v) for v in self.trader.state.positions.values()))
+        except Exception as e:
+            logger.warning("bootstrap positions failed: %s", e)
+    def _risk_normalized_qty(self, price, sl, equity, pct, lev, atr):
+        """Calcula tamaño usando riesgo en USD (ATR/SL) + cap por % de equity."""
+        stop_dist = abs(price - sl)
+        # Si falta SL o ATR, fallback a % equity puro
+        if stop_dist <= 0 or atr <= 0:
+            usd_margin = max(0.0, pct * equity)
+            return (usd_margin * lev) / max(price, 1e-9), usd_margin
+        risk_pct = float(self.cfg.get("risk",{}).get("size_pct_of_equity", 0.05))
+        risk_usd = max(0.0, risk_pct * equity)
+        qty_risk = risk_usd / stop_dist
+        # margen necesario para ese qty
+        margin_needed = qty_risk * price / max(lev,1)
+        margin_cap = max(0.0, pct * equity)
+        usd_margin = min(margin_needed, margin_cap)
+        qty = (usd_margin * lev) / max(price, 1e-9)
+        return qty, usd_margin
+    def _dca_should_add(self, symbol, side, last_row, lots, dca_cfg):
+        if not dca_cfg.get("enabled", True):
+            return False, 0.0
+        if len(lots) >= int(self.limits.max_per_symbol):
+            return False, 0.0
+        # ADX debe subir respecto a la última pata del mismo lado
+        last_leg_adx = 0.0
+        for L in lots[::-1]:
+            if L['side'] == side:
+                last_leg_adx = float(L.get('entry_adx',0.0)); break
+        adx_now = float(last_row.get('adx',0.0))
+        if adx_now < last_leg_adx + float(dca_cfg.get("min_adx_increase",2.0)):
+            return False, 0.0
+        # Pullback a EMA fast dentro de X*ATR
+        ema = float(last_row.get('ema_fast',0.0))
+        atr = float(last_row.get('atr',0.0))
+        c = float(last_row.get('close',0.0))
+        tol = float(dca_cfg.get("ema_pullback_atr",0.5)) * max(atr,1e-9)
+        if side == 'long':
+            if not (ema - tol <= c <= ema + tol):
+                return False, 0.0
+        else:
+            if not (ema - tol <= c <= ema + tol):
+                return False, 0.0
+        scale = float(dca_cfg.get("pct_scale_per_add",0.5))
+        self.save_state()
+        return True, scale
+    def _serialize_state(self):
+        # Minimal snapshot for PAPER to recover open positions and flags
+        return {
+            "killswitch": bool(self.trader.state.killswitch),
+            "last_entry_ts_by_symbol": self.trader.state.last_entry_ts_by_symbol,
+            "positions": {
+                sym: [dict(side=L['side'], qty=L['qty'], entry=L['entry'], lev=L['lev'],
+                           sl=L['sl'], tp1=L['tp1'], tp2=L['tp2'],
+                           realized_pnl=L.get('realized_pnl',0.0),
+                           trailing_anchor=L.get('trailing_anchor', L['entry']),
+                           entry_adx=L.get('entry_adx', 0.0),
+                           leg=L.get('leg', 1)) for L in lots]
+                for sym, lots in self.trader.state.positions.items()
+            }
+        }
+    def _restore_state(self, snap):
+        try:
+            self.trader.state.killswitch = bool(snap.get("killswitch", False))
+            self.trader.state.last_entry_ts_by_symbol = dict(snap.get("last_entry_ts_by_symbol", {}))
+            self.trader.state.positions.clear()
+            for sym, lots in snap.get("positions", {}).items():
+                arr = []
+                for L in lots:
+                    arr.append({
+                        "side": L["side"], "qty": float(L["qty"]), "entry": float(L["entry"]), "lev": int(L["lev"]),
+                        "ts": time.time(), "sl": float(L.get("sl",0.0)), "tp1": float(L.get("tp1",0.0)),
+                        "tp2": float(L.get("tp2",0.0)), "realized_pnl": float(L.get("realized_pnl",0.0)),
+                        "trailing_anchor": float(L.get("trailing_anchor", L["entry"])),
+                        "entry_adx": float(L.get("entry_adx",0.0)), "leg": int(L.get("leg",1))
+                    })
+                if arr:
+                    self.trader.state.positions[sym] = arr
+            self._loaded_state = True
+            logger.info("PAPER state restored: %s positions", sum(len(v) for v in self.trader.state.positions.values()))
+        except Exception as e:
+            logger.warning("restore_state failed: %s", e)
+    def save_state(self):
+        if self.mode != 'paper': 
+            return
+        try:
+            os.makedirs(os.path.dirname(self.STATE_FILE), exist_ok=True)
+            with open(self.STATE_FILE, "w", encoding="utf-8") as f:
+                json.dump(self._serialize_state(), f, ensure_ascii=False, separators=(",",":"))
+        except Exception as e:
+            logger.warning("save_state failed: %s", e)
+    def load_state(self):
+        if self.mode != 'paper': 
+            return
+        try:
+            if os.path.exists(self.STATE_FILE):
+                with open(self.STATE_FILE, "r", encoding="utf-8") as f:
+                    snap = json.load(f)
+                self._restore_state(snap)
+        except Exception as e:
+            logger.warning("load_state failed: %s", e)
+    def get_status(self):
+        eq = self.trader.equity()
+        open_cnt = sum(len(v) for v in self.trader.state.positions.values())
+        by_sym = {s: len(v) for s,v in self.trader.state.positions.items()}
+        return {"equity": eq, "open_positions": open_cnt, "per_symbol": by_sym, "killswitch": self.trader.state.killswitch}
+    def get_positions(self):
+        out = {}
+        for sym, lots in self.trader.state.positions.items():
+            out[sym] = [{"side":L["side"], "qty":L["qty"], "entry":L["entry"], "lev":L["lev"], "sl":L["sl"], "tp1":L["tp1"], "tp2":L["tp2"], "leg":L.get("leg",1)} for L in lots]
+        return out
+    async def run(self):
+        logger.info("Trading loop started in %s mode", self.mode.upper())
+        if self.mode == 'paper':
+            self.load_state()
+        if self.mode == 'real':
+            try:
+                await self.exchange.set_position_mode(one_way=True)
+            except Exception as e:
+                logger.warning('set_position_mode failed: %s', e)
+            try:
+                await self.bootstrap_real()
+            except Exception as e:
+                logger.warning('bootstrap_real failed: %s', e)
+        while True:
+            try:
+                await self.step_all_symbols()
+            except Exception as e:
+                logger.exception("step error: %s", e)
+            await asyncio.sleep(self.loop_seconds)
+    async def step_all_symbols(self):
+        if not self._check_circuit_breakers():
+            self.trader.state.killswitch = True
+            return
+        price_by_symbol = {}
+        for sym in self.symbols:
+            df = await self.fetch_ohlcv_2m(sym)
+            ind = compute_indicators(df, {**self.filters, **self.strategy_conf, **self.cfg.get("indicators",{})})
+            sig = generate_signal(ind, {**self.filters, **self.strategy_conf})
+            price = float(ind.iloc[-1]['close'])
+            price_by_symbol[sym] = price
+            self.price_cache[sym] = price
+            if not self.allow_new_entries or self.trader.state.killswitch:
+                continue
+            if self.funding_guard.get("enabled", True):
+                fr_bps = await self.funding_rate_bps_annualized(sym)
+                if abs(fr_bps) > float(self.funding_guard.get("annualized_bps_limit",5000)):
+                    continue
+            now = time.time()
+            last_t = self.trader.state.last_entry_ts_by_symbol.get(sym, 0)
+            if now - last_t < self.cooldown:
+                continue
+            if sig.side in ("long","short"):
+                ok, reason = self.pre_open_checks(sym, sig.side, price_by_symbol)
+                if not ok:
+                    continue
+                lev, pct = self._choose_leverage_and_pct(ind.iloc[-1], sig.regime)
+                eq = self.trader.equity()
+                qty, usd = self._risk_normalized_qty(price, sig.sl, eq, pct, lev, float(ind.iloc[-1].get('atr',0.0)))
+                usd = self._apply_caps(usd, price, lev)
+                # free-margin cap (cartera): no gastar más que el saldo disponible
+                free = self.available_margin_usd(eq, price_by_symbol)
+                if usd > free:
+                    usd = free
+                    qty = (usd * lev) / max(price, 1e-9)
+                if qty <= 0:
+                    continue
+                try:
+                    await self.exchange.set_leverage(sym, lev)
+                except Exception as e:
+                    logger.warning('set_leverage failed: %s', e)
+                fill, fee = await self.exchange.market_order(sym, sig.side, qty, price)
+                leg_no = 1 + sum(1 for L in self.trader.state.positions.get(sym, []) if L['side']==sig.side)
+                self.trader.open_lot(sym, sig.side, qty, fill.price, lev, sig.sl, sig.tp1, sig.tp2, fee, entry_adx=float(ind.iloc[-1].get('adx',0.0)), leg=leg_no)
+                self.trader.state.last_entry_ts_by_symbol[sym] = now
+                self.save_state()
+                self.log_trade(sym, sig.side, qty, fill.price, lev, fee, note=f"OPEN usd={usd:.2f} lev={lev} pct={pct:.2f}")
+                if self.mode == 'real':
+                    try:
+                        await self.exchange.place_protections(sym, sig.side, qty, sig.sl, sig.tp1, sig.tp2)
+                    except Exception as e:
+                        logger.warning('place_protections failed: %s', e)
+            # DCA a favor: si hay posición y condiciones de refuerzo
+            lots = self.trader.state.positions.get(sym, [])
+            if lots:
+                side_net = None
+                net = sum(L['qty'] if L['side']=='long' else -L['qty'] for L in lots)
+                if abs(net) > 0:
+                    side_net = 'long' if net>0 else 'short'
+                dca_cfg = self.cfg.get("dca",{})
+                if side_net and self.allow_new_entries and not self.trader.state.killswitch:
+                    if sum(len(v) for v in self.trader.state.positions.values()) < self.limits.max_total_positions and len(lots) < self.limits.max_per_symbol:
+                        ok_add, scale = self._dca_should_add(sym, side_net, ind.iloc[-1], lots, dca_cfg)
+                        if ok_add:
+                            # usar el mismo lev/pct pero escalado
+                            lev, pct_base = self._choose_leverage_and_pct(ind.iloc[-1], sig.regime)
+                            pct = max(self.order_sizes.get("min_pct",0.10), min(self.order_sizes.get("max_pct",1.00), pct_base*scale))
+                            eq = self.trader.equity()
+                            qty_add, usd_add = self._risk_normalized_qty(price, lots[-1]['sl'] if lots[-1]['sl'] else sig.sl, eq, pct, lev, float(ind.iloc[-1].get('atr',0.0)))
+                            usd_add = self._apply_caps(usd_add, price, lev)
+                            free2 = self.available_margin_usd(eq, price_by_symbol)
+                            if usd_add > free2:
+                                usd_add = free2
+                                qty_add = (usd_add * lev) / max(price, 1e-9)
+                            if qty_add > 0:
+                                fill2, fee2 = await self.exchange.market_order(sym, side_net, qty_add, price)
+                                leg_no = 1 + sum(1 for L in lots if L['side']==side_net)
+                                self.trader.open_lot(sym, side_net, qty_add, fill2.price, lev, sig.sl, sig.tp1, sig.tp2, fee2, entry_adx=float(ind.iloc[-1].get('adx',0.0)), leg=leg_no)
+                                self.trader.state.last_entry_ts_by_symbol[sym] = now
+                                self.log_trade(sym, side_net, qty_add, fill2.price, lev, fee2, note=f"DCA_ADD usd={usd_add:.2f} lev={lev} pct={pct:.2f}")
+                                self.save_state()
+            await self.manage_positions(price_by_symbol)
+        self.persist_equity(0.0)
+    def persist_equity(self, pnl=0.0):
+        ts = dt.datetime.utcnow().isoformat()
+        row = {"ts": ts, "equity": round(self.trader.equity(), 6), "pnl": round(pnl, 6)}
+        append_equity_csv(self.csv_dir, row)
+        insert_equity(self.sqlite_path, row)
+    def log_trade(self, symbol, side, qty, price, lev, fee, pnl=0.0, note=""):
+        ts = dt.datetime.utcnow().isoformat()
+        row = {"ts": ts, "symbol": symbol, "side": side, "qty": qty, "price": price, "lev": lev, "fee": fee, "pnl": pnl, "note": note}
+        append_trade_csv(self.csv_dir, row)
+        insert_trade(self.sqlite_path, row)
+    def price_of(self, symbol):
+        return self.price_cache.get(symbol)
+    async def manage_positions(self, price_by_symbol):
+        for sym, lots in list(self.trader.state.positions.items()):
+            price = price_by_symbol.get(sym)
+            if price is None: continue
+            idx = 0
+            while idx < len(lots):
+                L = lots[idx]
+                fee_unit = abs(price*L['qty'])*self.fees['taker']
+                if L['side']=='long':
+                    if price <= L['sl']:
+                        pnl = self.trader.close_lot(sym, idx, price, fee=fee_unit, note="SL")
+                        self.log_trade(sym, L['side'], L['qty'], price, L['lev'], fee_unit, pnl, note="CLOSE_SL"); self.save_state()
+                        await self.notifier.send(f"❌ SL {sym} long qty={L['qty']:.6f} @ {price:.2f} pnl={pnl:.2f}")
+                        continue
+                    if price >= L['tp2']:
+                        pnl = self.trader.close_lot(sym, idx, price, fee=fee_unit, note="TP2")
+                        self.log_trade(sym, L['side'], L['qty'], price, L['lev'], fee_unit, pnl, note="CLOSE_TP2"); self.save_state()
+                        await self.notifier.send(f"✅ TP2 {sym} long qty={L['qty']:.6f} @ {price:.2f} pnl={pnl:.2f}")
+                        continue
+                    if price >= L['tp1']:
+                        half = L['qty']*0.5
+                        pnl = self.trader.close_lot(sym, idx, price, fee=abs(price*half)*self.fees['taker'], note="TP1_HALF")
+                        self.log_trade(sym, L['side'], half, price, L['lev'], abs(price*half)*self.fees['taker'], pnl, note="CLOSE_TP1_HALF"); self.save_state()
+                        await self.notifier.send(f"🟢 TP1 {sym} long half qty={half:.6f} @ {price:.2f} pnl={pnl:.2f}")
+                        rem = {"side":L['side'], "qty":L['qty']-half, "entry":price, "lev":L['lev'], "ts":time.time(),
+                               "sl":L['sl'], "tp1":L['tp1'], "tp2":L['tp2'], "realized_pnl":0.0, "trailing_anchor":price}
+                        self.trader.state.positions.setdefault(sym, []).append(rem)
+                        continue
+                else:
+                    if price >= L['sl']:
+                        pnl = self.trader.close_lot(sym, idx, price, fee=fee_unit, note="SL")
+                        self.log_trade(sym, L['side'], L['qty'], price, L['lev'], fee_unit, pnl, note="CLOSE_SL"); self.save_state()
+                        await self.notifier.send(f"❌ SL {sym} short qty={L['qty']:.6f} @ {price:.2f} pnl={pnl:.2f}")
+                        continue
+                    if price <= L['tp2']:
+                        pnl = self.trader.close_lot(sym, idx, price, fee=fee_unit, note="TP2")
+                        self.log_trade(sym, L['side'], L['qty'], price, L['lev'], fee_unit, pnl, note="CLOSE_TP2"); self.save_state()
+                        await self.notifier.send(f"✅ TP2 {sym} short qty={L['qty']:.6f} @ {price:.2f} pnl={pnl:.2f}")
+                        continue
+                    if price <= L['tp1']:
+                        half = L['qty']*0.5
+                        pnl = self.trader.close_lot(sym, idx, price, fee=abs(price*half)*self.fees['taker'], note="TP1_HALF")
+                        self.log_trade(sym, L['side'], half, price, L['lev'], abs(price*half)*self.fees['taker'], pnl, note="CLOSE_TP1_HALF"); self.save_state()
+                        await self.notifier.send(f"🟢 TP1 {sym} short half qty={half:.6f} @ {price:.2f} pnl={pnl:.2f}")
+                        rem = {"side":L['side'], "qty":L['qty']-half, "entry":price, "lev":L['lev'], "ts":time.time(),
+                               "sl":L['sl'], "tp1":L['tp1'], "tp2":L['tp2'], "realized_pnl":0.0, "trailing_anchor":price}
+                        self.trader.state.positions.setdefault(sym, []).append(rem)
+                        continue
+                idx += 1
+    def pre_open_checks(self, symbol, side, price_by_symbol):
+        ok, reason = can_open(symbol, side, self.trader.state.positions, self.limits)
+        if not ok:
+            return False, reason
+        equity = self.trader.equity()
+        ok, reason = portfolio_caps_ok(equity, self.trader.state.positions, price_by_symbol, self.portfolio_caps)
+        if not ok:
+            return False, reason
+        self.save_state()
+        return True, ""
+    def toggle_killswitch(self):
+        self.trader.state.killswitch = not self.trader.state.killswitch
+        return self.trader.state.killswitch
+    async def close_all(self):
+        for sym, lots in list(self.trader.state.positions.items()):
+            price = self.price_cache.get(sym) or await self.fetch_last_price(sym)
+            for _ in range(len(lots)):
+                L = self.trader.state.positions[sym][0]
+                fee_unit = abs(price*L['qty'])*self.fees['taker']
+                pnl = self.trader.close_lot(sym, 0, price, fee=fee_unit, note="FORCE_CLOSE")
+                self.log_trade(sym, L['side'], L['qty'], price, L['lev'], fee_unit, pnl, note="FORCE_CLOSE")
+        self.save_state()
+        return True

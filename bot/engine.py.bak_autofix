@@ -1,0 +1,294 @@
+import asyncio, json, traceback, math, os
+from datetime import datetime, timezone
+import pandas as pd
+
+# Import tolerante: si no existe REGIME_PARAMS en settings, seguimos con {}
+try:
+    from bot.settings import (
+        MODE, SYMBOLS, TIMEFRAME, LOOP_SECONDS, RISK, LEV, ORDER, FILTERS, INDICATORS,
+        STRAT, REGIME, TELEGRAM_NOTIFY_ERRORS, FEES, FUNDING, REGIME_PARAMS
+    )
+except ImportError:
+    from bot.settings import (
+        MODE, SYMBOLS, TIMEFRAME, LOOP_SECONDS, RISK, LEV, ORDER, FILTERS, INDICATORS,
+        STRAT, REGIME, TELEGRAM_NOTIFY_ERRORS, FEES, FUNDING
+    )
+    REGIME_PARAMS = {}
+
+from bot.logger import BOT_LOGGER, decision_event, log_exception
+from bot.core.indicators import add_indicators
+from bot.core.strategy import generate_signal
+from bot.core.regime import classify
+from bot.core.risk import dynamic_leverage_from_regime, position_size, BudgetManager
+from bot.exchanges.binance_client import build_exchange, fetch_ohlcv_df, fetch_orderbook_stats, PaperExchange
+from bot.execution.trader import Trader
+from bot.storage.csv_store import append_csv
+from bot.utils.time_utils import now_utc, to_iso
+from bot.telemetry.telegram_bot import build_app, notify
+from bot.telemetry.formatter import open_msg
+from bot.telemetry.webhooks import post_event
+from bot.state import load_state, save_state, read_and_clear_cmds
+
+DATA_POS = "data/positions.json"
+DATA_MKT = "data/market_snapshot.json"
+DATA_DIAG = "data/diag.json"
+
+def _bps_distance(p_from: float, p_to: float) -> float:
+    try:
+        return abs((p_to - p_from) / max(p_from, 1e-9)) * 10000.0
+    except Exception:
+        return 0.0
+
+def _write_json(path, payload):
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+
+def _append_diag(sym, reason):
+    try:
+        d = {}
+        try:
+            with open(DATA_DIAG, "r", encoding="utf-8") as f:
+                d = json.load(f)
+        except Exception:
+            d = {}
+        d.setdefault(sym, []).append(reason)
+        _write_json(DATA_DIAG, d)
+    except Exception:
+        pass
+
+async def trade_symbol(app, trader: Trader, exchange, symbol: str, allow_new_entries: bool, budget: BudgetManager):
+    # OHLCV
+    try:
+        tf = "1m" if TIMEFRAME == "2m" else TIMEFRAME
+        limit = 600 if tf == "1m" else 300
+        df = fetch_ohlcv_df(exchange, symbol, tf, limit=limit)
+        if TIMEFRAME == "2m":
+            df = (
+                df.set_index("timestamp")
+                  .resample("2T")
+                  .agg({"open":"first","high":"max","low":"min","close":"last","volume":"sum"})
+                  .dropna().reset_index()
+            )
+    except Exception as e:
+        decision_event("API_ERROR", f"OHLCV fail {symbol}: {e}")
+        _append_diag(symbol, f"API_ERROR OHLCV {e}")
+        return
+
+    if len(df) < 50:
+        decision_event("DATA_TOO_SHORT", f"Pocas velas {symbol}")
+        _append_diag(symbol, "DATA_TOO_SHORT")
+        return
+
+    # Indicadores y régimen
+    try:
+        dfi = add_indicators(df, INDICATORS | {"atr_period": FILTERS.get("atr_period", 14)})
+    except Exception as e:
+        decision_event("INDICATOR_ERROR", f"Indicadores fail {symbol}: {e}")
+        _append_diag(symbol, "INDICATOR_ERROR")
+        return
+    if dfi.empty:
+        _append_diag(symbol, "DATA_EMPTY")
+        return
+
+    row = dfi.iloc[-1]
+    price = float(row.close)
+    atr = float(getattr(row, "atr", 0.0) or 0.0)
+
+    # Market snapshot
+    try:
+        snap = {}
+        try:
+            with open(DATA_MKT, "r", encoding="utf-8") as f:
+                snap = json.load(f)
+        except Exception:
+            snap = {}
+        snap[symbol] = {"last_close": price, "ts": to_iso(now_utc())}
+        _write_json(DATA_MKT, snap)
+    except Exception as e:
+        log_exception(BOT_LOGGER, "snapshot error", err=str(e))
+
+    # Microestructura
+    try:
+        ob = fetch_orderbook_stats(exchange, symbol, depth=5)
+    except Exception as e:
+        decision_event("API_ERROR", f"Orderbook fail {symbol}: {e}")
+        _append_diag(symbol, f"API_ERROR OB {e}")
+        return
+    if ob.get("liq_usdt", 0) < float(FILTERS.get("min_orderbook_liquidity_usdt", 600000)):
+        decision_event("LIQUIDITY_LOW", f"{symbol} liquidez insuficiente", **ob)
+        _append_diag(symbol, "LIQUIDITY_LOW")
+        return
+    if ob.get("spread_bps") is not None and ob["spread_bps"] > float(FILTERS.get("max_spread_bps", 5)):
+        decision_event("SPREAD_WIDE", f"{symbol} spread {ob['spread_bps']:.2f} bps")
+        _append_diag(symbol, "SPREAD_WIDE")
+        return
+
+    # Circuit breakers (usa tu implementación actual)
+    paused, why = budget.circuit_breakers()
+    if paused:
+        decision_event("CIRCUIT_PAUSE", f"{symbol} {why}")
+        _append_diag(symbol, why)
+        return
+
+    # Filtro de lateralidad/fuerza
+    adx = float(getattr(row, "adx", 0.0) or 0.0)
+    bbw = float(getattr(row, "bb_width_bps", 0.0) or 0.0)
+    if adx < float(FILTERS.get("adx_threshold", 15)) or bbw < float(FILTERS.get("bb_width_min_bps", 12)):
+        decision_event("SIDEWAYS_FILTER", f"{symbol} lateral", adx=adx, bb=bbw)
+        _append_diag(symbol, "SIDEWAYS_FILTER")
+        can_open = False
+    else:
+        can_open = True
+
+    # Señal
+    sig = generate_signal(dfi, STRAT, FILTERS)
+
+    # Permisos
+    if not allow_new_entries:
+        decision_event("BOT_PAUSED", f"{symbol} nuevas entradas deshabilitadas")
+        _append_diag(symbol, "BOT_PAUSED")
+        return
+    if getattr(sig, "side", "flat") == "flat":
+        decision_event("SIGNAL_WEAK", f"{symbol} señal insuficiente",
+                       conf=float(getattr(sig, "confidence", 0.0) or 0.0))
+        _append_diag(symbol, f"SIGNAL_WEAK conf={float(getattr(sig,'confidence',0.0) or 0.0):.2f}")
+        return
+    if not can_open:
+        _append_diag(symbol, "FILTER_BLOCK")
+        return
+
+    # Régimen (usa EMA 9/20/50/200 si está configurado) -> leverage dinámico
+    regime = classify(dfi, REGIME)  # dfi para permitir pendientes/EMAs
+    lev = dynamic_leverage_from_regime(regime.name, int(LEV.get("min", 5)), int(LEV.get("max", 15)))
+
+    # Tamaño por R + mínimos y caps (position_size aplica min_stop_bps y caps)
+    qty, notional, margin = position_size(
+        trader.equity(), price, atr,
+        float(RISK.get("risk_per_trade", 0.01)),
+        float(STRAT.get("stop_atr_mult", 2.0)),
+        float(RISK.get("min_notional_usdt", 100)),
+        float(RISK.get("min_margin_usdt", 20)),
+        lev,
+    )
+    if qty <= 0 or notional <= 0:
+        decision_event("RISK_REJECTED", f"{symbol} qty/notional inválido",
+                       qty=qty, notional=notional, margin=margin, lev=lev)
+        _append_diag(symbol, f"RISK_REJECTED qty={qty:.6f} notional={notional:.2f}")
+        return
+
+    # ---------- Chequeo de TP mínimo (fees/slippage) ----------
+    rp = (REGIME_PARAMS or {}).get(regime.name, {})
+    min_tp_bps = float(rp.get("min_tp_bps", FEES.get("min_tp_bps", 15)))
+
+    sl = (price - float(STRAT.get("stop_atr_mult", 2.0)) * atr) if sig.side == "long" else (price + float(STRAT.get("stop_atr_mult", 2.0)) * atr)
+    tp1 = price + (float(STRAT.get("tp1_R", 1.0)) * atr if sig.side == "long" else -float(STRAT.get("tp1_R", 1.0)) * atr)
+    tp2 = price + (float(STRAT.get("tp2_R", 2.0)) * atr if sig.side == "long" else -float(STRAT.get("tp2_R", 2.0)) * atr)
+
+    if _bps_distance(price, tp1) < min_tp_bps:
+        decision_event("REJECT_TP_MIN", f"{symbol} TP1<{min_tp_bps}bps", tp_bps=_bps_distance(price, tp1))
+        _append_diag(symbol, f"REJECT_TP_MIN {min_tp_bps}bps")
+        return
+    # ----------------------------------------------------------
+
+    # Abrir
+    ok, latency, notional2 = trader.open(symbol, sig.side, qty, price, atr, lev)
+    if ok:
+        msg = open_msg(symbol, sig.side, margin, lev, notional2, price, tp1, tp2, sl, ORDER.get("order_type", "market"), latency)
+        if app:
+            await notify(app, msg)
+        post_event({"type": "open", "symbol": symbol, "side": sig.side, "qty": qty, "price": price, "lev": lev, "notional": notional2})
+
+async def process_commands(trader: Trader, app, exchange):
+    cmds = read_and_clear_cmds()
+    if not cmds:
+        return
+    st = load_state()
+    for cmd in cmds:
+        t = cmd.get("type")
+        if t == "bot_on":
+            st["allow_new_entries"] = True
+            if app: await notify(app, "✅ Bot ON")
+        elif t == "bot_off":
+            st["allow_new_entries"] = False
+            if app: await notify(app, "⏸️ Bot OFF")
+        elif t == "close_all":
+            for sym in list(trader.positions.keys()):
+                price = exchange.fetch_ticker(sym)["last"] if hasattr(exchange, "fetch_ticker") else 0.0
+                trader.close_symbol(sym, price, label="CLOSE_CMD_ALL")
+            if app: await notify(app, "Cierre de todas las posiciones enviado.")
+        elif t == "close_symbol":
+            sym = cmd.get("symbol")
+            if sym:
+                price = exchange.fetch_ticker(sym)["last"] if hasattr(exchange, "fetch_ticker") else 0.0
+                trader.close_symbol(sym, price, label="CLOSE_CMD_SYMBOL")
+                if app: await notify(app, f"Cierre manual {sym} enviado.")
+    save_state(st)
+
+async def loop(app, trader, exchange):
+    os.makedirs("data", exist_ok=True)
+    st = load_state()
+    allow_new = bool(st.get("allow_new_entries", True))
+    budget = BudgetManager(cfg=RISK)
+
+    if app:
+        await notify(app, f"🤖 BESTIA ULTRA online ({MODE})")
+
+    while True:
+        try:
+            await process_commands(trader, app, exchange)
+            for sym in SYMBOLS:
+                await trade_symbol(app, trader, exchange, sym, allow_new, budget)
+            eq = trader.equity()
+            append_csv("data/equity.csv", {"ts": to_iso(now_utc()), "equity": eq, "pnl": 0.0}, header=["ts", "equity", "pnl"])
+            with open(DATA_POS, "w", encoding="utf-8") as f:
+                json.dump(trader.snapshot_positions(), f, ensure_ascii=False, indent=2)
+            st["allow_new_entries"] = allow_new
+            st["updated_at"] = to_iso(now_utc())
+            save_state(st)
+        except Exception as e:
+            log_exception(BOT_LOGGER, "Loop error", err=str(e), tb=traceback.format_exc())
+            if TELEGRAM_NOTIFY_ERRORS and app:
+                await notify(app, f"❌ Error loop: {e}")
+        await asyncio.sleep(LOOP_SECONDS)
+
+async def _main():
+    exchange = build_exchange()
+    paper = PaperExchange(
+        taker_fee=float(FEES.get("taker", 0.0005)),
+        maker_fee=float(FEES.get("maker", 0.0002)),
+        latency_ms=int(ORDER.get("latency_ms_sim", 150)),
+    )
+    trader = Trader(paper)
+
+    # Rehidrata posiciones previas (si tu Trader tiene el método)
+    try:
+        if hasattr(trader, "rehydrate"):
+            trader.rehydrate(exchange)
+    except Exception as e:
+        log_exception(BOT_LOGGER, "rehydrate_startup_error", error=str(e))
+
+    app = build_app()
+    if app:
+        try:
+            await app.initialize()
+            await app.start()
+            if getattr(app, "updater", None):
+                await app.updater.start_polling()
+        except Exception as e:
+            log_exception(BOT_LOGGER, "telegram_startup_error", error=str(e))
+            app = None
+
+    try:
+        await loop(app, trader, exchange)
+    finally:
+        if app:
+            try:
+                if getattr(app, "updater", None):
+                    await app.updater.stop()
+                await app.stop()
+                await app.shutdown()
+            except Exception as e:
+                log_exception(BOT_LOGGER, "telegram_shutdown_error", error=str(e))
+
+def run():
+    asyncio.run(_main())

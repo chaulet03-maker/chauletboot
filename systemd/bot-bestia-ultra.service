@@ -1,0 +1,17 @@
+[Unit]
+Description=BESTIA ULTRA Trading Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/bestia-ultra
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/python3 -m bot.engine
+Restart=always
+RestartSec=5
+# EnvironmentFile can point to your .env location:
+# EnvironmentFile=%h/bestia-ultra/.env
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,153 @@
+mode: paper
+
+# Solo BTC
+symbols: ["BTC/USDT:USDT"]
+
+limits:
+  max_total_positions: 6
+  max_per_symbol: 4
+  no_hedge: true
+  # cooldown_seconds: 90
+
+risk:
+  size_pct_of_equity: 0.02
+  equity_usdt: 1000.0
+  max_risk_per_trade_pct: 0.005
+  max_cluster_side_exposure_pct: 60.0
+  clusters:
+    "BTC/USDT:USDT": "MAJORS"
+
+portfolio_caps:
+  max_portfolio_leverage: 8.0
+  max_portfolio_margin_pct: 1.0
+
+strategy:
+  timeframe: "1h"
+
+  # Entradas del simulador
+  entry_mode: rsi_cross        # rsi_cross | pullback_grid | legacy
+  rsi_gate: 55
+  rsi4h_gate: 52
+  trend_filter: ema200_4h
+  ema200_1h_confirm: false
+
+  # Filtros de volatilidad / horario (sim)
+  atrp_gate_min: 0.05
+  atrp_gate_max: 2.0
+  ban_hours: "1"                # "0,1,2,3" en UTC si querés
+
+  # === SL/TP estilo simulador ===
+  use_atr: false               # default del sim -> porcentual
+  sl_pct: 0.007                # 0.7%
+  tp_pct: 0.015                # 1.5%
+  # si quisieras ATR:
+  # use_atr: true
+  # sl_atr_mult: 1.3
+  # tp_atr_mult: 2.0
+
+  # (Opcional) Target de equity (si activás el bloque B1 en engine)
+  # target_eq_pnl_pct: 0.10     # 10% del equity al abrir
+
+
+indicators:
+  ema_fast: 20
+  ema_slow: 50
+  macd_fast: 12
+  macd_slow: 26
+  macd_signal: 9
+  rsi_len: 14
+  adx_len: 14
+  bb_len: 20
+  bb_dev: 2.0
+  atr_len: 14
+  vol_multiplier_vs_mean: 1.2
+  vol_ma_window: 20
+  ema200_4h_window: 200
+  rsi4h_len: 14
+
+# (Opcional) referencias multi-TF – eliminado lo que no es BTC
+strategies:
+  - name: BTC_1h_BB_reversion
+    symbol: BTC/USDT:USDT
+    timeframe: 1h
+    kind: BB_reversion
+    params:
+      z_threshold: 2.5
+      ema200_filter: true
+      hold_bars: 30
+      atr_len: 14
+      adx_len: 14
+      adx_min: 18
+      bbwidth_min_bps: 10
+      trail: { mode: atr, atr_k: 1.5, hysteresis_pct: 0.05, min_step_pct: 0.05 }
+
+  - name: BTC_4h_BB_reversion
+    symbol: BTC/USDT:USDT
+    timeframe: 4h
+    kind: BB_reversion
+    params:
+      z_threshold: 2.0
+      ema200_filter: true
+      hold_bars: 12
+      atr_len: 14
+      adx_len: 14
+      adx_min: 18
+      bbwidth_min_bps: 6
+      trail: { mode: atr, atr_k: 1.5, hysteresis_pct: 0.05, min_step_pct: 0.05 }
+
+funding:
+  use_bias: true
+  high_fr_threshold: 0.05
+  avoid_minutes_around: 10
+
+funding_window:
+  enabled: true
+  minutes: 10
+  fr_abs_bps_min: 300
+
+execution:
+  slippage_bps: 5
+  leverage: 10
+  set_leverage: true
+  retries: 3
+  retry_backoff_s: 1.0
+  time_sync: true
+
+fees:
+  taker: 0.0005
+  maker: 0.0002
+
+telegram:
+  send_legacy: false
+  enabled: true
+  anti_spam: { min_interval_s: 1.0 }
+  dedup_window_s: 60
+  language: "es"
+  inline_commands: false
+  reports_in_bot: false
+
+storage:
+  csv_dir: "data"
+  sqlite_path: "data/bot.sqlite"
+
+persistence:
+  dir: "data"
+  sqlite_file: "data/trades.sqlite"
+  equity_csv: "data/equity.csv"
+  trades_csv: "data/trades.csv"
+  state_file: "data/state.json"
+  logs_file: "data/logs.csv"
+
+leverage: { min: 5, max: 15, default: 10 }
+
+order_sizing:
+  min_pct: 0.20
+  default_pct: 0.30
+  max_pct: 0.40
+  min_pct_dca: 0.10
+
+correlation_guard:
+  enabled: true
+  same_side_max_exposure_ratio: 0.60
+  clusters:
+    - ["BTC/USDT:USDT"]
