@@ -193,7 +193,13 @@ async def start_telegram_bot(app, config):
                 if low == "precio":
                     parts = []
                     for sym in app.symbols:
-                        p = app.price_of(sym) or await app.fetch_last_price(sym)
+                        p = app.price_of(sym)
+                        if p is None:
+                            try:
+                                p = await app.fetch_last_price(sym)
+                            except Exception as e:
+                                logger.warning("telegram price fetch failed for %s: %s", sym, e)
+                                continue
                         parts.append(f"{sym}: {_fmt_num(p)}")
                     await context.bot.send_message(chat_id, "📈 " + " | ".join(parts))
 

@@ -76,6 +76,11 @@ except Exception:
 logger = logging.getLogger("engine")
 
 
+class DataUnavailable(RuntimeError):
+    """Raised when we cannot fetch fresh market data and have no cache to reuse."""
+    pass
+
+
 def usd_to_qty(symbol, usd, price, lev):
     if price <= 0:
         return 0.0
@@ -199,6 +204,7 @@ class TradingApp:
         self.circuit_breakers = config.get("circuit_breakers", {})
 
         self.price_cache = {}
+        self._ohlcv_cache = {}
         self.allow_new_entries = True
         self.notifier = Notifier()
         self._loaded_state = False
@@ -283,30 +289,65 @@ class TradingApp:
 
     async def fetch_ohlcv_2m(self, symbol):
         tf = self.timeframe
+        cache_key = ("ohlcv", "2m", symbol, tf)
         if tf == "2m":
-            data = await self.with_retry(self.ccxt.fetch_ohlcv, symbol, timeframe="1m", limit=200)
-            df = pd.DataFrame(data, columns=["ts", "open", "high", "low", "close", "volume"])
-            df['ts'] = pd.to_datetime(df['ts'], unit='ms')
-            df = df.set_index('ts').resample('2min').agg({
-                'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last', 'volume': 'sum'
-            }).dropna().reset_index()
-            return df
+            try:
+                data = await self.with_retry(self.ccxt.fetch_ohlcv, symbol, timeframe="1m", limit=200)
+                df = pd.DataFrame(data, columns=["ts", "open", "high", "low", "close", "volume"])
+                df['ts'] = pd.to_datetime(df['ts'], unit='ms')
+                df = df.set_index('ts').resample('2min').agg({
+                    'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last', 'volume': 'sum'
+                }).dropna().reset_index()
+                self._ohlcv_cache[cache_key] = df.copy()
+                return df
+            except Exception as e:
+                logger.warning("fetch_ohlcv_2m failed for %s (tf=1m): %s", symbol, e)
+                cached = self._ohlcv_cache.get(cache_key)
+                if cached is not None:
+                    return cached.copy()
+                raise DataUnavailable(f"ohlcv 2m unavailable for {symbol}") from e
         else:
-            data = await self.with_retry(self.ccxt.fetch_ohlcv, symbol, timeframe=tf, limit=200)
-            df = pd.DataFrame(data, columns=["ts", "open", "high", "low", "close", "volume"])
-            df['ts'] = pd.to_datetime(df['ts'], unit='ms')
-            return df
+            try:
+                data = await self.with_retry(self.ccxt.fetch_ohlcv, symbol, timeframe=tf, limit=200)
+                df = pd.DataFrame(data, columns=["ts", "open", "high", "low", "close", "volume"])
+                df['ts'] = pd.to_datetime(df['ts'], unit='ms')
+                self._ohlcv_cache[cache_key] = df.copy()
+                return df
+            except Exception as e:
+                logger.warning("fetch_ohlcv failed for %s (tf=%s): %s", symbol, tf, e)
+                cached = self._ohlcv_cache.get(cache_key)
+                if cached is not None:
+                    return cached.copy()
+                raise DataUnavailable(f"ohlcv {tf} unavailable for {symbol}") from e
 
     async def fetch_ohlcv_4h(self, symbol):
         """OHLCV 4h para enriquecer indicadores (ema200_4h, rsi4h)."""
-        data = await self.with_retry(self.ccxt.fetch_ohlcv, symbol, timeframe="4h", limit=500)
-        df = pd.DataFrame(data, columns=["ts", "open", "high", "low", "close", "volume"])
-        df["ts"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
-        return df
+        cache_key = ("ohlcv", "4h", symbol)
+        try:
+            data = await self.with_retry(self.ccxt.fetch_ohlcv, symbol, timeframe="4h", limit=500)
+            df = pd.DataFrame(data, columns=["ts", "open", "high", "low", "close", "volume"])
+            df["ts"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
+            self._ohlcv_cache[cache_key] = df.copy()
+            return df
+        except Exception as e:
+            logger.warning("fetch_ohlcv_4h failed for %s: %s", symbol, e)
+            cached = self._ohlcv_cache.get(cache_key)
+            if cached is not None:
+                return cached.copy()
+            raise DataUnavailable(f"ohlcv 4h unavailable for {symbol}") from e
 
     async def fetch_last_price(self, symbol):
-        t = await self.with_retry(self.ccxt.fetch_ticker, symbol)
-        return float(t['last'])
+        try:
+            t = await self.with_retry(self.ccxt.fetch_ticker, symbol)
+            price = float(t['last'])
+            self.price_cache[symbol] = price
+            return price
+        except Exception as e:
+            logger.warning("fetch_last_price failed for %s: %s", symbol, e)
+            price = self.price_cache.get(symbol)
+            if price is not None:
+                return price
+            raise DataUnavailable(f"last price unavailable for {symbol}") from e
 
     async def funding_rate_bps_annualized(self, symbol):
         try:
@@ -853,8 +894,12 @@ class TradingApp:
 
         for sym in self.symbols:
             # === OHLCV 1h/2m (según config) + 4h para enriquecer indicadores ===
-            df = await self.fetch_ohlcv_2m(sym)
-            df4 = await self.fetch_ohlcv_4h(sym)
+            try:
+                df = await self.fetch_ohlcv_2m(sym)
+                df4 = await self.fetch_ohlcv_4h(sym)
+            except DataUnavailable as e:
+                logger.warning("skipping %s due to missing market data: %s", sym, e)
+                continue
 
             ind = compute_indicators(
                 df,
@@ -1235,7 +1280,13 @@ class TradingApp:
 
     async def close_all(self):
         for sym, lots in list(self.trader.state.positions.items()):
-            price = self.price_cache.get(sym) or await self.fetch_last_price(sym)
+            price = self.price_cache.get(sym)
+            if price is None:
+                try:
+                    price = await self.fetch_last_price(sym)
+                except DataUnavailable as e:
+                    logger.warning("close_all skipped %s due to missing price: %s", sym, e)
+                    continue
             for _ in range(len(lots)):
                 L = self.trader.state.positions[sym][0]
                 fee_unit = abs(price * L['qty']) * self.fees['taker']
