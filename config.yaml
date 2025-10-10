@@ -115,7 +115,7 @@ funding_window:
 
 execution:
   slippage_bps: 5
-  leverage: 4.8                 # <-- --lev 4.8 (para que calce con tu corrida)
+  leverage: 5.0                 # <-- --lev 5.0 (para que calce con tu corrida)
   set_leverage: true
   retries: 3
   retry_backoff_s: 1.0
