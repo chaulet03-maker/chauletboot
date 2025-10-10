@@ -703,24 +703,17 @@ class RiskSizingBacktester:
     def _get_dynamic_leverage(self, row: pd.Series) -> float:
         """
         Analiza la fuerza de la tendencia (ADX) y devuelve el apalancamiento
-        apropiado según 3 niveles definidos: x5, x10 o x15.
+        apropiado según 2 niveles: x5 o x10.
         """
         adx = float(row["adx"])
 
-        # --- Definimos los 3 niveles de tendencia ---
-
-        # Nivel 3: Tendencia MUY FUERTE
-        if adx >= 40:
-            leverage = 15.0
-            trend_strength = "MUY FUERTE"
-
-        # Nivel 2: Tendencia FUERTE
-        elif adx >= 25:
+        # --- Definimos el umbral de tendencia ---
+        if adx >= 25:
+            # Tendencia FUERTE, usamos apalancamiento agresivo
             leverage = 10.0
             trend_strength = "FUERTE"
-
-        # Nivel 1: Tendencia DEBIL o LATERAL
         else:
+            # Tendencia DEBIL o LATERAL, usamos apalancamiento base
             leverage = 5.0
             trend_strength = "DEBIL"
 
