@@ -19,6 +19,7 @@ import argparse
 import os
 import json
 import logging
+import sqlite3
 from typing import Optional, Tuple, List, Dict
 
 import numpy as np
@@ -323,23 +324,144 @@ class RiskSizingBacktester:
         self.active = False
         self.side: Optional[str] = None
         self.entry: Optional[float] = None
+        self.entry_ts: Optional[pd.Timestamp] = None
         self.qty: float = 0.0
         self.sl_price: Optional[float] = None
         self.tp_price: Optional[float] = None
         self.bars_in_position: int = 0
         self.risk_usd_trade: Optional[float] = None
         self.eq_on_open: Optional[float] = None
+        self.entry_atr: Optional[float] = None
+        self.last_sl_regime: Optional[str] = None
+        self.last_sl_multiplier: Optional[float] = None
 
         # Tracking
         self.trades: List[Dict] = []
         self.equity_series: List[float] = [self.balance]
         self.daily_R: Dict[pd.Timestamp, float] = {}
 
+        # Persistencia
+        self.db_path = os.path.join("data", "backtests", "trades_history.db")
+        self._init_db()
+
         logging.info(
             f"Backtest RISK SIZING | fee={self.fee*100:.3f}% lev={self.lev:.2f} "
             f"use_atr={self.use_atr} SL%={self.sl_pct} SL_ATR={self.sl_atr_mult} "
             f"TP%={self.tp_pct} TP_ATR={self.tp_atr_mult} entry_mode={self.entry_mode}"
         )
+
+    def _init_db(self) -> None:
+        os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS trades (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    open_timestamp TEXT,
+                    close_timestamp TEXT NOT NULL,
+                    side TEXT,
+                    entry_price REAL,
+                    exit_price REAL,
+                    qty REAL,
+                    pnl REAL,
+                    note TEXT,
+                    vol_regime TEXT,
+                    sl_price REAL,
+                    tp_price REAL,
+                    sl_multiplier REAL,
+                    atr_on_entry REAL
+                )
+                """
+            )
+            conn.commit()
+
+    def _persist_trade(
+        self,
+        open_ts: Optional[pd.Timestamp],
+        close_ts: pd.Timestamp,
+        side: Optional[str],
+        entry_price: Optional[float],
+        exit_price: float,
+        qty: float,
+        pnl: float,
+        note: str,
+        vol_regime: Optional[str],
+        sl_price: Optional[float],
+        tp_price: Optional[float],
+        sl_multiplier: Optional[float],
+        atr_on_entry: Optional[float],
+    ) -> None:
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                """
+                INSERT INTO trades (
+                    open_timestamp,
+                    close_timestamp,
+                    side,
+                    entry_price,
+                    exit_price,
+                    qty,
+                    pnl,
+                    note,
+                    vol_regime,
+                    sl_price,
+                    tp_price,
+                    sl_multiplier,
+                    atr_on_entry
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    open_ts.isoformat() if open_ts is not None else None,
+                    close_ts.isoformat(),
+                    side,
+                    entry_price,
+                    exit_price,
+                    qty,
+                    pnl,
+                    note,
+                    vol_regime,
+                    sl_price,
+                    tp_price,
+                    sl_multiplier,
+                    atr_on_entry,
+                ),
+            )
+            conn.commit()
+
+    def _get_dynamic_sl_multiplier(self, row: pd.Series) -> float:
+        """
+        Analiza la volatilidad actual (ATR%) y devuelve el multiplicador de SL apropiado.
+        """
+        atr = float(row["atr"])
+        close = float(row["close"])
+
+        # Calculamos la volatilidad como un porcentaje del precio para poder compararla
+        atrp = (atr / close) * 100.0 if close else 0.0
+
+        # --- Definimos los Regímenes de Volatilidad y sus Multiplicadores ---
+
+        # Régimen 1: BAJA VOLATILIDAD (mercado lento, podemos ajustar más el SL)
+        if atrp < 0.5:  # Menos de 0.5% de volatilidad
+            sl_multiplier = 1.1
+            regime = "BAJA"
+
+        # Régimen 2: ALTA VOLATILIDAD (mercado peligroso, necesitamos más espacio)
+        elif atrp > 1.5:  # Más de 1.5% de volatilidad
+            sl_multiplier = 1.8  # Usamos un SL más amplio
+            regime = "ALTA"
+
+        # Régimen 3: VOLATILIDAD NORMAL (el escenario ideal)
+        else:
+            sl_multiplier = 1.3  # Usamos el valor por defecto que ya probamos
+            regime = "NORMAL"
+
+        # Esta línea es para que veas en la terminal qué está haciendo el bot
+        logging.info(
+            f"Volatilidad detectada: {regime} (ATR%={atrp:.2f}). Usando multiplicador de SL: {sl_multiplier}"
+        )
+        self.last_sl_regime = regime
+        self.last_sl_multiplier = sl_multiplier
+        return sl_multiplier
 
     # ------------- Funding utils -------------
     @staticmethod
@@ -565,12 +687,22 @@ class RiskSizingBacktester:
         return eq
 
     # ------------- SL/TP helpers -------------
-    def _calc_sl_tp(self, side: str, entry: float, atr: float, eq_now: float, target_pct: Optional[float]) -> Tuple[Optional[float], Optional[float]]:
+    def _calc_sl_tp(
+        self,
+        side: str,
+        entry: float,
+        atr: float,
+        eq_now: float,
+        target_pct: Optional[float],
+        dynamic_sl_mult: Optional[float] = None,
+    ) -> Tuple[Optional[float], Optional[float]]:
         sl = None; tp = None
         # SL
-        if self.use_atr and self.sl_atr_mult is not None:
-            move = self.sl_atr_mult * atr
-            sl = entry - move if side == "LONG" else entry + move
+        if self.use_atr:
+            sl_mult = dynamic_sl_mult if dynamic_sl_mult is not None else self.sl_atr_mult
+            if sl_mult is not None:
+                move = sl_mult * atr
+                sl = entry - move if side == "LONG" else entry + move
         elif (not self.use_atr) and self.sl_pct is not None:
             sl = entry * (1 - self.sl_pct) if side == "LONG" else entry * (1 + self.sl_pct)
         # TP
@@ -657,6 +789,10 @@ class RiskSizingBacktester:
 
                     # ATR actual para SL/TP
                     atr = float(row["atr"]) if not np.isnan(row["atr"]) else 0.0
+                    dynamic_sl_mult = self._get_dynamic_sl_multiplier(row) if self.use_atr else None
+                    if not self.use_atr:
+                        self.last_sl_regime = None
+                        self.last_sl_multiplier = self.sl_atr_mult
                     target_pct = self._dynamic_target_pct(row, prev)
 
                     # Sizing
@@ -664,9 +800,13 @@ class RiskSizingBacktester:
                         qty = self._qty_full_equity(entry_fill)
                     else:
                         # modo risk: necesito SL provisional para sizing
-                        if self.use_atr and self.sl_atr_mult is not None:
-                            move = self.sl_atr_mult * atr
-                            sl_tmp = entry_fill - move if side == "LONG" else entry_fill + move
+                        if self.use_atr:
+                            if dynamic_sl_mult is None:
+                                dynamic_sl_mult = self._get_dynamic_sl_multiplier(row)
+                            move = dynamic_sl_mult * atr if dynamic_sl_mult is not None else None
+                            sl_tmp = (
+                                entry_fill - move if side == "LONG" else entry_fill + move
+                            ) if move is not None else None
                         elif (not self.use_atr) and self.sl_pct is not None:
                             sl_tmp = entry_fill * (1 - self.sl_pct) if side == "LONG" else entry_fill * (1 + self.sl_pct)
                         else:
@@ -693,7 +833,11 @@ class RiskSizingBacktester:
                     self.active = True
                     self.side = side
                     self.entry = entry_fill
-                    self.sl_price, self.tp_price = self._calc_sl_tp(side, entry_fill, atr, eq_now, target_pct)
+                    self.entry_ts = ts
+                    self.entry_atr = atr
+                    self.sl_price, self.tp_price = self._calc_sl_tp(
+                        side, entry_fill, atr, eq_now, target_pct, dynamic_sl_mult
+                    )
                     self.bars_in_position = 0
                     self.eq_on_open = eq_now
 
@@ -711,7 +855,9 @@ class RiskSizingBacktester:
                         "timestamp": ts, "action": "OPEN", "side": self.side, "price": float(self.entry),
                         "qty": float(self.qty), "regime": "RISK", "mode": "RISK",
                         "pnl": -float(fee_open), "balance": float(self.balance),
-                        "note": f"lev={self.lev:.2f} sl={self.sl_price if self.sl_price is not None else np.nan} tp={self.tp_price if self.tp_price is not None else np.nan} size={self.size_mode} target%={target_pct if target_pct is not None else np.nan}"
+                        "note": f"lev={self.lev:.2f} sl={self.sl_price if self.sl_price is not None else np.nan} tp={self.tp_price if self.tp_price is not None else np.nan} size={self.size_mode} target%={target_pct if target_pct is not None else np.nan}",
+                        "vol_regime": self.last_sl_regime,
+                        "sl_multiplier": self.last_sl_multiplier,
                     })
 
                 # consumir la pendiente
@@ -798,6 +944,14 @@ class RiskSizingBacktester:
     def _close(self, ts: pd.Timestamp, price: float, note: str):
         if not self.active:
             return
+        entry_price = self.entry
+        entry_ts = self.entry_ts
+        sl_price = self.sl_price
+        tp_price = self.tp_price
+        qty = self.qty
+        vol_regime = self.last_sl_regime
+        sl_multiplier = self.last_sl_multiplier
+        atr_on_entry = self.entry_atr
         pnl_gross = (price - self.entry) * self.qty if self.side == "LONG" else (self.entry - price) * self.qty
         notional_close = self.qty * price
 
@@ -815,13 +969,35 @@ class RiskSizingBacktester:
         self.trades.append({
             "timestamp": ts, "action": "CLOSE", "side": self.side, "price": float(price),
             "qty": float(self.qty), "regime": "RISK", "mode": "RISK",
-            "pnl": float(trade_pnl), "balance": float(self.balance), "note": note
+            "pnl": float(trade_pnl), "balance": float(self.balance), "note": note,
+            "vol_regime": vol_regime,
+            "sl_multiplier": sl_multiplier,
         })
+
+        try:
+            self._persist_trade(
+                entry_ts,
+                ts,
+                self.side,
+                entry_price,
+                float(price),
+                float(qty),
+                float(trade_pnl),
+                note,
+                vol_regime,
+                sl_price,
+                tp_price,
+                sl_multiplier,
+                atr_on_entry,
+            )
+        except Exception as exc:
+            logging.error(f"Error al guardar trade en base de datos: {exc}")
 
         # Reset
         self.active = False
         self.side = None
         self.entry = None
+        self.entry_ts = None
         self.qty = 0.0
         self.sl_price = None
         self.tp_price = None
@@ -829,6 +1005,7 @@ class RiskSizingBacktester:
         self.risk_usd_trade = None
         self.eq_on_open = None
         self.initial_margin = None
+        self.entry_atr = None
 
     # ------------- Reporte -------------
     def _suffix(self) -> str:
