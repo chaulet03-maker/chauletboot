@@ -428,41 +428,6 @@ class RiskSizingBacktester:
             )
             conn.commit()
 
-    def _get_dynamic_sl_multiplier(self, row: pd.Series) -> float:
-        """
-        Analiza la volatilidad actual (ATR%) y devuelve el multiplicador de SL apropiado.
-        """
-        atr = float(row["atr"])
-        close = float(row["close"])
-
-        # Calculamos la volatilidad como un porcentaje del precio para poder compararla
-        atrp = (atr / close) * 100.0 if close else 0.0
-
-        # --- Definimos los Regímenes de Volatilidad y sus Multiplicadores ---
-
-        # Régimen 1: BAJA VOLATILIDAD (mercado lento, podemos ajustar más el SL)
-        if atrp < 0.5:  # Menos de 0.5% de volatilidad
-            sl_multiplier = 1.1
-            regime = "BAJA"
-
-        # Régimen 2: ALTA VOLATILIDAD (mercado peligroso, necesitamos más espacio)
-        elif atrp > 1.5:  # Más de 1.5% de volatilidad
-            sl_multiplier = 1.8  # Usamos un SL más amplio
-            regime = "ALTA"
-
-        # Régimen 3: VOLATILIDAD NORMAL (el escenario ideal)
-        else:
-            sl_multiplier = 1.3  # Usamos el valor por defecto que ya probamos
-            regime = "NORMAL"
-
-        # Esta línea es para que veas en la terminal qué está haciendo el bot
-        logging.info(
-            f"Volatilidad detectada: {regime} (ATR%={atrp:.2f}). Usando multiplicador de SL: {sl_multiplier}"
-        )
-        self.last_sl_regime = regime
-        self.last_sl_multiplier = sl_multiplier
-        return sl_multiplier
-
     # ------------- Funding utils -------------
     @staticmethod
     def _load_funding_series(path: str) -> pd.Series:
@@ -694,15 +659,12 @@ class RiskSizingBacktester:
         atr: float,
         eq_now: float,
         target_pct: Optional[float],
-        dynamic_sl_mult: Optional[float] = None,
     ) -> Tuple[Optional[float], Optional[float]]:
         sl = None; tp = None
         # SL
-        if self.use_atr:
-            sl_mult = dynamic_sl_mult if dynamic_sl_mult is not None else self.sl_atr_mult
-            if sl_mult is not None:
-                move = sl_mult * atr
-                sl = entry - move if side == "LONG" else entry + move
+        if self.use_atr and self.sl_atr_mult is not None:
+            move = self.sl_atr_mult * atr
+            sl = entry - move if side == "LONG" else entry + move
         elif (not self.use_atr) and self.sl_pct is not None:
             sl = entry * (1 - self.sl_pct) if side == "LONG" else entry * (1 + self.sl_pct)
         # TP
@@ -737,6 +699,26 @@ class RiskSizingBacktester:
         notional = self.balance * self.lev
         qty = notional / max(price, 1e-12)
         return max(qty, 0.0)
+
+    def _get_dynamic_leverage(self, row: pd.Series) -> float:
+        """
+        Analiza la fuerza de la tendencia (ADX) y devuelve el apalancamiento apropiado.
+        """
+        adx = float(row["adx"])
+
+        # --- Definimos el umbral de tendencia ---
+        if adx >= 25:
+            # Tendencia fuerte, usamos apalancamiento agresivo
+            leverage = 10.0
+            trend_strength = "FUERTE"
+        else:
+            # Tendencia débil o mercado lateral, usamos apalancamiento base
+            leverage = 5.0
+            trend_strength = "DEBIL"
+
+        logging.info(f"Fuerza de tendencia: {trend_strength} (ADX={adx:.2f}). Usando apalancamiento: x{leverage}")
+
+        return leverage
 
     # ------------- Funding -------------
     def _apply_funding(self, ts: pd.Timestamp, price: float):
@@ -789,24 +771,21 @@ class RiskSizingBacktester:
 
                     # ATR actual para SL/TP
                     atr = float(row["atr"]) if not np.isnan(row["atr"]) else 0.0
-                    dynamic_sl_mult = self._get_dynamic_sl_multiplier(row) if self.use_atr else None
-                    if not self.use_atr:
-                        self.last_sl_regime = None
-                        self.last_sl_multiplier = self.sl_atr_mult
+                    self.last_sl_regime = None
+                    self.last_sl_multiplier = self.sl_atr_mult if self.use_atr else None
                     target_pct = self._dynamic_target_pct(row, prev)
 
                     # Sizing
+                    leverage_for_this_trade = self.lev
                     if self.size_mode == "full_equity":
-                        qty = self._qty_full_equity(entry_fill)
+                        leverage_for_this_trade = self._get_dynamic_leverage(row)
+                        notional = self.balance * leverage_for_this_trade
+                        qty = notional / max(entry_fill, 1e-12)
                     else:
                         # modo risk: necesito SL provisional para sizing
-                        if self.use_atr:
-                            if dynamic_sl_mult is None:
-                                dynamic_sl_mult = self._get_dynamic_sl_multiplier(row)
-                            move = dynamic_sl_mult * atr if dynamic_sl_mult is not None else None
-                            sl_tmp = (
-                                entry_fill - move if side == "LONG" else entry_fill + move
-                            ) if move is not None else None
+                        if self.use_atr and self.sl_atr_mult is not None:
+                            move = self.sl_atr_mult * atr
+                            sl_tmp = entry_fill - move if side == "LONG" else entry_fill + move
                         elif (not self.use_atr) and self.sl_pct is not None:
                             sl_tmp = entry_fill * (1 - self.sl_pct) if side == "LONG" else entry_fill * (1 + self.sl_pct)
                         else:
@@ -836,13 +815,13 @@ class RiskSizingBacktester:
                     self.entry_ts = ts
                     self.entry_atr = atr
                     self.sl_price, self.tp_price = self._calc_sl_tp(
-                        side, entry_fill, atr, eq_now, target_pct, dynamic_sl_mult
+                        side, entry_fill, atr, eq_now, target_pct
                     )
                     self.bars_in_position = 0
                     self.eq_on_open = eq_now
 
                     # Margen inicial (aprox) para safety: notional/lev
-                    self.initial_margin = (self.qty * self.entry) / max(self.lev, 1e-12)
+                    self.initial_margin = (self.qty * self.entry) / max(leverage_for_this_trade, 1e-12)
 
                     # R real en full_equity
                     if self.size_mode == "full_equity":
@@ -851,11 +830,18 @@ class RiskSizingBacktester:
                         else:
                             self.risk_usd_trade = self.balance * (self.risk_pct if self.risk_pct is not None else 0.01)
 
+                    note_msg = (
+                        f"lev={leverage_for_this_trade:.2f} "
+                        f"sl={self.sl_price if self.sl_price is not None else np.nan} "
+                        f"tp={self.tp_price if self.tp_price is not None else np.nan} "
+                        f"size={self.size_mode} "
+                        f"target%={target_pct if target_pct is not None else np.nan}"
+                    )
                     self.trades.append({
                         "timestamp": ts, "action": "OPEN", "side": self.side, "price": float(self.entry),
                         "qty": float(self.qty), "regime": "RISK", "mode": "RISK",
                         "pnl": -float(fee_open), "balance": float(self.balance),
-                        "note": f"lev={self.lev:.2f} sl={self.sl_price if self.sl_price is not None else np.nan} tp={self.tp_price if self.tp_price is not None else np.nan} size={self.size_mode} target%={target_pct if target_pct is not None else np.nan}",
+                        "note": note_msg,
                         "vol_regime": self.last_sl_regime,
                         "sl_multiplier": self.last_sl_multiplier,
                     })
