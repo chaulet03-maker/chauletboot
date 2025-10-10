@@ -382,7 +382,7 @@ def _get_engine_from_context(context: ContextTypes.DEFAULT_TYPE):
     app = getattr(context, "application", None)
     if app is None:
         return None
-    return app.user_data.get("engine")
+    return app.bot_data.get("engine")
 
 
 async def estado_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -537,7 +537,7 @@ def setup_telegram_bot(engine_instance):
         logger.warning("Telegram application init failed: %s", exc)
         return None
 
-    application.user_data["engine"] = engine_instance
+    application.bot_data["engine"] = engine_instance
 
     text_filter = filters.TEXT & (~filters.COMMAND)
 
