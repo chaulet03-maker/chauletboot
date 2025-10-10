@@ -512,6 +512,23 @@ async def logs_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _reply_chunks(update, text)
 
 
+async def motivos_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Envía los últimos motivos registrados por los filtros de entrada."""
+    engine = _get_engine_from_context(context)
+    if engine is None:
+        await _reply_chunks(update, "No pude acceder al engine para consultar motivos.")
+        return
+
+    log = list(getattr(engine, "rejection_log", []))
+    if not log:
+        await _reply_chunks(update, "No se ha registrado ningún rechazo de operación todavía.")
+        return
+
+    motivos_list = "\n".join(f"• {item}" for item in reversed(log))
+    header = "Últimos 10 motivos para no entrar al mercado:\n"
+    await _reply_chunks(update, header + "\n" + motivos_list)
+
+
 def setup_telegram_bot(engine_instance):
     """Configura y devuelve la aplicación de Telegram con TODOS los handlers."""
     cfg = _engine_config(engine_instance)
@@ -569,6 +586,9 @@ def setup_telegram_bot(engine_instance):
 
     application.add_handler(CommandHandler("logs", logs_command))
     application.add_handler(MessageHandler(text_filter & filters.Regex(r"(?i)^logs(?:\s+\d+)?$"), logs_command))
+
+    application.add_handler(CommandHandler("motivos", motivos_command))
+    application.add_handler(MessageHandler(text_filter & filters.Regex(r"(?i)^motivos$"), motivos_command))
 
     print("Todos los comandos de Telegram han sido registrados correctamente.")
     return application

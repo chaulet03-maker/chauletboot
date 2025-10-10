@@ -5,7 +5,7 @@ import numpy as np
 import pandas as pd
 from .market_regime import infer_regime  # acepta DF completo o una fila
 
-__all__ = ["Signal", "generate_signal"]
+__all__ = ["Signal", "generate_signal", "check_all_filters", "_check_all_filters"]
 
 @dataclass
 class Signal:
@@ -15,6 +15,7 @@ class Signal:
     tp1: float
     tp2: float
     regime: str
+    reason: str = ""
 
 def _clip(v, lo, hi):
     return max(lo, min(hi, v))
@@ -34,18 +35,11 @@ def _is_bad_number(x) -> bool:
 
 # ======== Filtros del simulador (opcionales) ========
 
-def _passes_filters(row: pd.Series, conf: Dict) -> bool:
-    """
-    Filtros previos a la entrada:
-      - Tendencia 4h: precio vs ema200_4h
-      - Gate RSI 4h: rsi4h >= gate para LONG (<= 100-gate para SHORT)
-      - Confirmación 1h opcional: precio vs ema200(1h) (si no hay, usa ema_slow como fallback)
-      - ATR% gate: [min, max]
-      - ban_hours: descarta si ts.hour está en la lista
-    """
-    side = row.get("_side_pref", None)  # 'LONG'/'SHORT' sugerido por la señal
-    if side not in ("LONG", "SHORT"):
-        return False
+def check_all_filters(row: pd.Series, conf: Dict, side: Optional[str]) -> Optional[str]:
+    """Return a human-readable reason if any entry filter fails, otherwise ``None``."""
+    side_norm = str(side or row.get("_side_pref", "")).upper()
+    if side_norm not in ("LONG", "SHORT"):
+        return "Dirección de la señal desconocida"
 
     price = float(row.get("close", np.nan))
     ema200_4h = float(row.get("ema200_4h", np.nan))
@@ -56,49 +50,66 @@ def _passes_filters(row: pd.Series, conf: Dict) -> bool:
     # Tendencia 4h (si existen columnas)
     trend_filter = str(conf.get("trend_filter", "ema200_4h")).lower()
     if trend_filter == "ema200_4h" and np.isfinite(ema200_4h) and np.isfinite(price):
-        if side == "LONG" and not (price > ema200_4h):
-            return False
-        if side == "SHORT" and not (price < ema200_4h):
-            return False
+        if side_norm == "LONG" and not (price > ema200_4h):
+            return "Filtro de Tendencia (Precio < EMA200 4h)"
+        if side_norm == "SHORT" and not (price < ema200_4h):
+            return "Filtro de Tendencia (Precio > EMA200 4h)"
 
     # RSI 4h gate
     rsi4h_gate = conf.get("rsi4h_gate", None)
     if rsi4h_gate is not None and np.isfinite(rsi4h):
         rsi4h_gate = float(rsi4h_gate)
-        if side == "LONG" and not (rsi4h >= rsi4h_gate):
-            return False
-        if side == "SHORT" and not (rsi4h <= (100.0 - rsi4h_gate)):
-            return False
+        if side_norm == "LONG" and not (rsi4h >= rsi4h_gate):
+            return f"Filtro RSI 4h (RSI {rsi4h:.2f} < Mínimo {rsi4h_gate:.2f})"
+        if side_norm == "SHORT" and not (rsi4h <= (100.0 - rsi4h_gate)):
+            return f"Filtro RSI 4h (RSI {rsi4h:.2f} > Máximo {(100.0 - rsi4h_gate):.2f})"
 
     # Confirmación 1h opcional
     if conf.get("ema200_1h_confirm", False) and np.isfinite(ema200_1h) and np.isfinite(price):
-        if side == "LONG" and not (price > ema200_1h):
-            return False
-        if side == "SHORT" and not (price < ema200_1h):
-            return False
+        if side_norm == "LONG" and not (price > ema200_1h):
+            return "Filtro de Tendencia 1h (Precio < EMA200 1h)"
+        if side_norm == "SHORT" and not (price < ema200_1h):
+            return "Filtro de Tendencia 1h (Precio > EMA200 1h)"
 
     # ATR% gate
     atrp_min = conf.get("atrp_gate_min", None)
     atrp_max = conf.get("atrp_gate_max", None)
     if (atrp_min is not None) or (atrp_max is not None):
         if not (np.isfinite(atr) and np.isfinite(price) and price > 0):
-            return False
+            return "Filtro de Volatilidad (Datos ATR/Precio inválidos)"
         atrp = (atr / price) * 100.0
         if atrp_min is not None and atrp < float(atrp_min):
-            return False
+            return f"Filtro de Volatilidad (ATR% {atrp:.2f} < Mínimo {float(atrp_min):.2f})"
         if atrp_max is not None and atrp > float(atrp_max):
-            return False
+            return f"Filtro de Volatilidad (ATR% {atrp:.2f} > Máximo {float(atrp_max):.2f})"
 
     # ban_hours
     if "ts" in row.index and pd.notna(row["ts"]) and conf.get("ban_hours"):
         try:
             ban = {int(h) for h in str(conf["ban_hours"]).split(",") if str(h).strip() != ""}
             if pd.to_datetime(row["ts"], utc=True).hour in ban:
-                return False
+                return "Sesión bloqueada por ban_hours"
         except Exception:
             pass
 
-    return True
+    return None
+
+
+def _check_all_filters(row: pd.Series, conf: Dict, side: Optional[str]):
+    return check_all_filters(row, conf, side)
+
+
+def _passes_filters(row: pd.Series, conf: Dict) -> bool:
+    """
+    Filtros previos a la entrada:
+      - Tendencia 4h: precio vs ema200_4h
+      - Gate RSI 4h: rsi4h >= gate para LONG (<= 100-gate para SHORT)
+      - Confirmación 1h opcional: precio vs ema200(1h) (si no hay, usa ema_slow como fallback)
+      - ATR% gate: [min, max]
+      - ban_hours: descarta si ts.hour está en la lista
+    """
+    reason = check_all_filters(row, conf, row.get("_side_pref", None))
+    return reason is None
 
 def _signal_rsi_cross(row: pd.Series, prev: Optional[pd.Series], conf: Dict) -> Optional[str]:
     gate = float(conf.get("rsi_gate", 55.0))
@@ -334,8 +345,9 @@ def generate_signal(df: pd.DataFrame, conf: Dict) -> Signal:
         return Signal("flat", 0.0, 0.0, 0.0, 0.0, regime)
 
     # Filtros previos (tendencia/volatilidad/sesiones)
-    if not _passes_filters(row, conf):
-        return Signal("flat", 0.0, 0.0, 0.0, 0.0, regime)
+    rejection_reason = check_all_filters(row, conf, side_sim)
+    if rejection_reason:
+        return Signal("flat", 0.0, 0.0, 0.0, 0.0, regime, reason=rejection_reason)
 
     # === SL/TP estilo simulador ===
     use_atr     = bool(conf.get("use_atr", False))
