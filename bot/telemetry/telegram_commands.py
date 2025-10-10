@@ -3,6 +3,16 @@ from typing import Dict, Tuple, List, Optional
 from telegram.ext import Application, MessageHandler, filters
 import unicodedata
 
+from .telegram_bot import (
+    _build_config_text,
+    _build_estado_text,
+    _build_rendimiento_text,
+    _find_and_set_config,
+    _parse_adjust_value,
+    _read_logs_text,
+    _set_killswitch,
+)
+
 log = logging.getLogger("tg")
 
 # ========= Helpers de texto / formato =========
@@ -46,12 +56,15 @@ async def _cmd_help(reply):
         "📖 *Ayuda*\n"
         "• *ayuda*: muestra esta ayuda.\n"
         "• *estado*: saldo, abiertas y últimos saldos.\n"
+        "• *rendimiento*: estadísticas acumuladas desde la base SQLite.\n"
         "• *saldo* / *saldo=NUM*: consulta / fija saldo inicial (paper, si el engine lo soporta).\n"
         "• *posicion* / *posiciones*: detalle de posiciones abiertas.\n"
         "• *precio [SIMBOLO]*: precio actual o todos.\n"
+        "• *config*: parámetros clave de la estrategia actual.\n"
+        "• *logs [N]*: últimas N líneas del log.\n"
         "• *bot on* / *bot off*: habilita/deshabilita nuevas entradas.\n"
-        "• *kill* / *killswitch*: alterna bloqueo de entradas.\n"
-        "• *cerrar todo* / *sos*: cierra todas (sos = apaga y cierra).\n"
+        "• *cerrar* / *cerrar todo* / *sos*: cierra posiciones (sos = apaga y cierra).\n"
+        "• *ajustar parametro valor*: modifica la configuración en caliente.\n"
         "• *recientes* / *motivos*: últimos 10 motivos de NO-entrada.\n"
         "• *stats* / *stats semana*: PF, winrate, expectancy por símbolo/capa.\n"
         "• *report hoy* / *report semana*: reporte diario/semanal.\n"
@@ -353,24 +366,12 @@ class CommandBot:
             return update.message.reply_text(text)
 
         # --- BOT ON / OFF (killswitch inverso) ---
-        if norm in ("bot on", "prender bot", "activar bot", "bot prender"):
-            try:
-                ks = getattr(self.engine.trader.state, "killswitch", False)
-            except Exception:
-                ks = False
-            desired_ks = False  # ON => permitir nuevas operaciones
-            if ks != desired_ks:
-                self.engine.toggle_killswitch()
+        if norm in ("bot on", "prender bot", "activar bot", "bot prender", "reanudar"):
+            _set_killswitch(self.engine, False)
             return await reply("✅ Bot ON: habilitadas nuevas operaciones (killswitch desactivado).")
 
-        if norm in ("bot off", "apagar bot", "desactivar bot", "bot apagar"):
-            try:
-                ks = getattr(self.engine.trader.state, "killswitch", False)
-            except Exception:
-                ks = False
-            desired_ks = True  # OFF => bloquear nuevas operaciones
-            if ks != desired_ks:
-                self.engine.toggle_killswitch()
+        if norm in ("bot off", "apagar bot", "desactivar bot", "bot apagar", "pausa"):
+            _set_killswitch(self.engine, True)
             return await reply("⛔ Bot OFF: bloqueadas nuevas operaciones (killswitch ACTIVADO).")
 
         # --- POSICION DETALLE ---
@@ -383,7 +384,10 @@ class CommandBot:
 
         # --- ESTADO ---
         if msg in ("estado", "status"):
-            return await reply(_status_text(self.engine))
+            return await reply(_build_estado_text(self.engine))
+
+        if msg == "rendimiento":
+            return await reply(_build_rendimiento_text(self.engine))
 
         # --- SALDO / SALDO=NUM (best effort) ---
         if msg in ("equity", "saldo"):
@@ -473,6 +477,9 @@ class CommandBot:
             listado = "\n".join(f"• {k}: {_fmt_money(v)}" for k, v in cache.items())
             return await reply("Precios:\n" + listado)
 
+        if msg == "config":
+            return await reply(_build_config_text(self.engine))
+
         # --- DIAGNOSTICO ---
         if norm_all in ("diag on", "diagnostico on", "diagnostico activar"):
             setattr(self.engine, "diag", True)
@@ -483,8 +490,24 @@ class CommandBot:
 
         # --- KILL / KILLSWITCH ---
         if msg in ("kill", "killswitch"):
-            ks = self.engine.toggle_killswitch()
-            return await reply(f"Killswitch: {'ACTIVADO' if ks else 'desactivado'}")
+            return await reply("Usá 'bot on' / 'bot off' para controlar el killswitch.")
+
+        if msg.startswith("logs"):
+            m = re.search(r"(\d+)", msg)
+            limit = int(m.group(1)) if m else 15
+            limit = max(1, min(200, limit))
+            return await reply(_read_logs_text(self.engine, limit))
+
+        if msg.startswith("ajustar"):
+            m = re.match(r"(?i)ajustar\s+([\w.]+)\s+(.+)$", msg_raw.strip())
+            if not m:
+                return await reply("Uso: ajustar [parametro] [valor]. Ej: ajustar risk.max_hold_bars 20")
+            param = m.group(1)
+            value = _parse_adjust_value(m.group(2))
+            path = _find_and_set_config(self.engine, param, value)
+            if path:
+                return await reply(f"✅ Actualicé {'/'.join(path)} = {value}")
+            return await reply(f"No encontré el parámetro '{param}' en la configuración.")
 
         # --- STATS (24h / 7d) ---
         if norm_all in ('stats', 'estadisticas', 'estadísticas'):
