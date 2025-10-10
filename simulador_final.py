@@ -702,34 +702,31 @@ class RiskSizingBacktester:
 
     def _get_dynamic_leverage(self, row: pd.Series) -> float:
         """
-        Analiza la fuerza de la tendencia (ADX) y devuelve un apalancamiento
-        progresivo en una escala de x5 a x15.
+        Analiza la fuerza de la tendencia (ADX) y devuelve el apalancamiento
+        apropiado según 3 niveles definidos: x5, x10 o x15.
         """
         adx = float(row["adx"])
 
-        # --- Límites de la escala ---
-        base_leverage = 5.0
-        max_leverage = 15.0
-        adx_min_threshold = 25.0  # ADX a partir del cual el apalancamiento empieza a subir
-        adx_max_threshold = 50.0  # ADX en el que se alcanza el apalancamiento máximo
+        # --- Definimos los 3 niveles de tendencia ---
 
-        # --- Lógica de cálculo progresivo ---
-        if adx < adx_min_threshold:
-            leverage = base_leverage
+        # Nivel 3: Tendencia MUY FUERTE
+        if adx >= 40:
+            leverage = 15.0
+            trend_strength = "MUY FUERTE"
+
+        # Nivel 2: Tendencia FUERTE
+        elif adx >= 25:
+            leverage = 10.0
+            trend_strength = "FUERTE"
+
+        # Nivel 1: Tendencia DEBIL o LATERAL
         else:
-            # Calculamos qué tan "avanzado" está el ADX dentro de nuestro rango (de 0.0 a 1.0)
-            progress = (adx - adx_min_threshold) / (adx_max_threshold - adx_min_threshold)
+            leverage = 5.0
+            trend_strength = "DEBIL"
 
-            # Aplicamos ese progreso al rango de apalancamiento
-            additional_leverage = (max_leverage - base_leverage) * progress
-            leverage = base_leverage + additional_leverage
+        logging.info(f"Fuerza de tendencia: {trend_strength} (ADX={adx:.2f}). Usando apalancamiento: x{leverage}")
 
-        # Usamos np.clip para asegurarnos de que el apalancamiento nunca exceda los límites 5 y 15
-        final_leverage = np.clip(leverage, base_leverage, max_leverage)
-
-        logging.info(f"Fuerza de tendencia: Progresiva (ADX={adx:.2f}). Usando apalancamiento: x{final_leverage:.2f}")
-
-        return final_leverage
+        return leverage
 
     # ------------- Funding -------------
     def _apply_funding(self, ts: pd.Timestamp, price: float):
