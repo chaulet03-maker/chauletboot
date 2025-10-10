@@ -1,4 +1,5 @@
 import asyncio, logging, time, datetime as dt, math, random, json, os
+from collections import deque
 import pandas as pd
 import ccxt.async_support as ccxt
 
@@ -190,6 +191,9 @@ class TradingApp:
         self.filters       = config.get("filters", {})
         self.strategy_conf = config.get("strategy", {})
         self.mode          = config.get("mode", "paper").lower()
+
+        # Registro en memoria de motivos de rechazo (últimos 10)
+        self.rejection_log = deque(maxlen=10)
 
         # === Caps de cartera (DATACLASS) ===
         risk_cfg = config.get("risk", {}) or {}
@@ -916,6 +920,23 @@ class TradingApp:
                 df_4h=df4,  # <<<<<<<<<<<<<< agrega ema200_4h + rsi4h
             )
             sig = generate_signal(ind, {**self.filters, **self.strategy_conf})
+
+            rejection_reason = getattr(sig, "reason", "") if sig else ""
+            if rejection_reason:
+                ts_txt = pd.Timestamp.now(tz="UTC").strftime("%Y-%m-%d %H:%M")
+                log_entry = f"[{ts_txt}] {sym}: {rejection_reason}"
+                if not self.rejection_log or self.rejection_log[-1] != log_entry:
+                    self.rejection_log.append(log_entry)
+                try:
+                    self.log_decision(sym, "strategy_filters", detail=rejection_reason)
+                except Exception:
+                    pass
+                tg = getattr(self, "telegram", None)
+                if tg is not None:
+                    try:
+                        tg.log_reject(symbol=sym, side=str(getattr(sig, "side", "")).upper(), code="strategy_filters", detail=rejection_reason)
+                    except Exception:
+                        pass
 
             # Cache ATR para trailing
             try:
