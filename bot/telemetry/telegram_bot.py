@@ -50,6 +50,51 @@ def _cfg_csv_paths(cfg: dict):
 def _tz():
     return ZoneInfo("America/Argentina/Buenos_Aires")
 
+
+def _app_config(app):
+    if app is None:
+        return {}
+    if isinstance(getattr(app, "config", None), dict):
+        return app.config
+    if isinstance(getattr(app, "cfg", None), dict):
+        return app.cfg
+    return {}
+
+
+def setup_telegram_bot(app):
+    """Build the Telegram Application instance for the given engine app."""
+    config = _app_config(app)
+    tconf = (config or {}).get("telegram", {}) if isinstance(config, dict) else {}
+
+    enabled = bool(tconf.get("enabled", True))
+    if not enabled:
+        logger.info("Telegram disabled")
+        return None
+
+    token = _env("TELEGRAM_TOKEN")
+    if not token:
+        logger.warning("No TELEGRAM_TOKEN provided; Telegram disabled")
+        return None
+
+    try:
+        application = ApplicationBuilder().token(token).build()
+    except Exception as exc:
+        logger.warning("Telegram application init failed: %s", exc)
+        return None
+
+    return application
+
+
+def _chat_id_from_env():
+    chat_id_env = _env("TELEGRAM_CHAT_ID")
+    if not chat_id_env:
+        return None
+    try:
+        return int(chat_id_env)
+    except (TypeError, ValueError):
+        logger.warning("Invalid TELEGRAM_CHAT_ID provided; ignoring")
+        return None
+
 # =========================
 # Notificador PRO
 # =========================
@@ -74,14 +119,39 @@ class TelegramNotifier:
     def set_default_chat(self, chat_id):
         self.default_chat_id = chat_id
 
+    def attach_app(self, application):
+        self.app = application
+
+    def _schedule(self, coro):
+        if not self.app:
+            logger.debug("telegram application not available; skipping notification")
+            return
+        try:
+            self.app.create_task(coro)
+        except Exception as exc:
+            logger.warning("telegram scheduling failed: %s", exc)
+
     # API pública (no-async): el engine llama a estos
-    def open(self, **kwargs):       self.app.create_task(self._send_open(**kwargs))
-    def tp1(self, **kwargs):        self.app.create_task(self._send_tp1(**kwargs))
-    def trailing(self, **kwargs):   self.app.create_task(self._send_trailing(**kwargs))
-    def close_tp(self, **kwargs):   self.app.create_task(self._send_close(kind="TP", **kwargs))
-    def close_sl(self, **kwargs):   self.app.create_task(self._send_close(kind="SL", **kwargs))
-    def close_manual(self, **kwargs): self.app.create_task(self._send_close(kind="MANUAL", **kwargs))
-    def reject(self, **kwargs):     self.app.create_task(self._send_reject(**kwargs))
+    def open(self, **kwargs):
+        self._schedule(self._send_open(**kwargs))
+
+    def tp1(self, **kwargs):
+        self._schedule(self._send_tp1(**kwargs))
+
+    def trailing(self, **kwargs):
+        self._schedule(self._send_trailing(**kwargs))
+
+    def close_tp(self, **kwargs):
+        self._schedule(self._send_close(kind="TP", **kwargs))
+
+    def close_sl(self, **kwargs):
+        self._schedule(self._send_close(kind="SL", **kwargs))
+
+    def close_manual(self, **kwargs):
+        self._schedule(self._send_close(kind="MANUAL", **kwargs))
+
+    def reject(self, **kwargs):
+        self._schedule(self._send_reject(**kwargs))
 
     # Permite que el engine registre motivos para /motivos (o command-bot)
     def log_reject(self, symbol: str, side: str, code: str, detail: str = ""):
@@ -156,30 +226,35 @@ class TelegramNotifier:
 # Arranque del bot (con flags)
 # =========================
 async def start_telegram_bot(app, config):
-    tconf = (config or {}).get("telegram", {}) if isinstance(config, dict) else {}
-    enabled = bool(tconf.get("enabled", True))
+    config_dict = config if isinstance(config, dict) else _app_config(app)
+
+    application = getattr(app, "telegram_app", None)
+    if application is None:
+        application = setup_telegram_bot(app)
+        if application is None:
+            return
+        setattr(app, "telegram_app", application)
+
+    tconf = (config_dict or {}).get("telegram", {}) if isinstance(config_dict, dict) else {}
     inline_commands = bool(tconf.get("inline_commands", False))   # ← por defecto OFF
     reports_in_bot = bool(tconf.get("reports_in_bot", False))     # ← por defecto OFF
 
-    if not enabled:
-        logger.info("Telegram disabled")
-        return
+    default_chat_id = _chat_id_from_env()
 
-    token = _env("TELEGRAM_TOKEN")
-    if not token:
-        logger.warning("No TELEGRAM_TOKEN provided; Telegram disabled")
-        return
+    notifier = getattr(app, "notifier", None)
+    if notifier is None:
+        notifier = TelegramNotifier(application, config_dict, default_chat_id=default_chat_id)
+        setattr(app, "notifier", notifier)
+    else:
+        notifier.attach_app(application)
+        if default_chat_id is not None and getattr(notifier, "default_chat_id", None) is None:
+            notifier.set_default_chat(default_chat_id)
 
-    application = ApplicationBuilder().token(token).build()
-
-    # Notificador PRO y exposición al engine
-    chat_id_env = _env("TELEGRAM_CHAT_ID")
-    notifier = TelegramNotifier(application, config, default_chat_id=int(chat_id_env) if chat_id_env else None)
     setattr(app, "telegram", notifier)
 
     # ============ (opcional) comandos inline ============
-    if inline_commands:
-        equity_csv, trades_csv = _cfg_csv_paths(config)
+    if inline_commands and not getattr(application, "_chaulet_inline_handler_added", False):
+        equity_csv, _ = _cfg_csv_paths(config_dict)
 
         async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             try:
@@ -187,8 +262,9 @@ async def start_telegram_bot(app, config):
                 low = text.lower()
                 chat_id = update.effective_chat.id
 
-                if notifier.default_chat_id is None:
-                    notifier.set_default_chat(chat_id)
+                current_notifier = getattr(app, "notifier", notifier)
+                if current_notifier and current_notifier.default_chat_id is None:
+                    current_notifier.set_default_chat(chat_id)
 
                 if low == "precio":
                     parts = []
@@ -230,11 +306,12 @@ async def start_telegram_bot(app, config):
                 logger.exception("telegram msg error: %s", e)
 
         application.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), on_message))
-    else:
+        setattr(application, "_chaulet_inline_handler_added", True)
+    elif not inline_commands:
         logger.info("Inline commands deshabilitados (usando telegram_commands.py)")
 
     # ============ (opcional) reportes diarios/semanales en ESTE bot ============
-    if reports_in_bot:
+    if reports_in_bot and not getattr(application, "_chaulet_reports_scheduled", False):
         try:
             j = application.job_queue
             tz = _tz()
@@ -243,9 +320,10 @@ async def start_telegram_bot(app, config):
             j.run_daily(lambda c: notifier.app.create_task(_report_periodic(notifier, days=7)),
                         time=dtime(hour=23, minute=59, tzinfo=tz), days=(6,), name="weekly_report")
             logger.info("Reportes diarios/semanales programados en telegram_bot")
+            setattr(application, "_chaulet_reports_scheduled", True)
         except Exception as e:
             logger.warning("No job_queue; reportes deshabilitados: %s", e)
-    else:
+    elif not reports_in_bot:
         logger.info("Reportes en telegram_bot deshabilitados (usa ReportingScheduler)")
 
     await application.initialize()

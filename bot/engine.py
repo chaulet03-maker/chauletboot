@@ -11,7 +11,7 @@ from bot.exchanges.real import RealExchange
 from bot.storage.csv_store import append_trade_csv, append_equity_csv
 from bot.storage.sqlite_store import ensure_db, insert_trade, insert_equity
 from bot.trader import Trader
-from bot.telemetry.telegram_bot import TelegramNotifier as Notifier
+from bot.telemetry.telegram_bot import TelegramNotifier as Notifier, setup_telegram_bot
 # Importación añadida por el parche
 try:
     from bot.telemetry.telegram_bot import run_telegram_bot
@@ -138,7 +138,9 @@ class TradingApp:
 
     STATE_FILE = os.path.join("data", "state.json")
 
-    def __init__(self, config: dict):
+    def __init__(self, cfg: dict):
+        self.config = cfg or {}
+        config = self.config
         self.cfg = config
         self.symbols = config.get("symbols", ["BTC/USDT:USDT", "ETH/USDT:USDT"])
         self.timeframe = config.get("timeframe", "2m")
@@ -200,7 +202,14 @@ class TradingApp:
 
         self.price_cache = {}
         self.allow_new_entries = True
-        self.notifier = Notifier()
+        self.telegram_app = setup_telegram_bot(self)
+        try:
+            default_chat = int(TELEGRAM_CHAT_ID) if TELEGRAM_CHAT_ID else None
+        except (TypeError, ValueError):
+            logger.warning("Invalid TELEGRAM_CHAT_ID provided; ignoring")
+            default_chat = None
+        self.notifier = Notifier(application=self.telegram_app, cfg=self.config, default_chat_id=default_chat)
+        self.telegram = self.notifier
         self._loaded_state = False
 
         self.exchange = self.paper if self.mode == 'paper' else RealExchange(self.ccxt, self.fees)
