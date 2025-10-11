@@ -8,7 +8,10 @@ import ccxt
 class Exchange:
     def __init__(self, cfg):
         self.config = cfg
+        self.public_client = None
         self.client = self._setup_client()
+        if self.public_client is None:
+            self.public_client = self.client
 
     def _setup_client(self):
         """ Configura e inicializa el cliente del exchange. """
@@ -50,6 +53,7 @@ class Exchange:
             public_client = ccxt.binance({
                 'options': {'defaultType': 'future'},
             })
+            self.public_client = public_client
             return public_client
 
     async def get_klines(self, timeframe: str = '1h', symbol: Optional[str] = None, limit: int = 300) -> List[List[Any]]:
@@ -61,15 +65,31 @@ class Exchange:
         logging.debug("Solicitando klines %s para %s", timeframe, ccxt_symbol)
         return await asyncio.to_thread(self.client.fetch_ohlcv, ccxt_symbol, timeframe=timeframe, limit=limit)
 
-    async def get_current_price(self, symbol: Optional[str] = None) -> float:
-        """Obtiene el último precio de un par."""
+    async def get_current_price(self, symbol=None):
+        """ Obtiene el último precio de un par de forma resiliente. """
         if symbol is None:
             symbol = self.config.get('symbol', 'BTC/USDT')
 
-        ticker = await asyncio.to_thread(self.client.fetch_ticker, symbol)
-        price = float(ticker.get('last') or 0.0)
-        logging.debug("Precio actual de %s: %s", symbol, price)
-        return price
+        # Priorizamos el cliente autenticado si existe, sino el público de respaldo.
+        client_to_use = self.client if self.client is not None else self.public_client
+
+        try:
+            # Usamos el método fetch_ticker que es universal
+            ticker = await client_to_use.fetch_ticker(symbol)
+
+            # El precio se encuentra en la clave 'last'
+            price = ticker.get('last')
+            if price is not None:
+                return price
+            else:
+                # Si 'last' no existe por alguna razón, devolvemos None.
+                logging.warning(f"El ticker no devolvió el precio 'last' para {symbol}.")
+                return None
+
+        except Exception as e:
+            # Captura cualquier error de conexión o API y lo informa sin romper el bot.
+            logging.error(f"FALLA CRÍTICA: No se pudo obtener el precio de {symbol}: {e}")
+            return None
 
     async def set_leverage(self, leverage: float, symbol: Optional[str] = None) -> None:
         """Establece el apalancamiento para un par."""
