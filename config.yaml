@@ -46,3 +46,4 @@ adx_strong_threshold: 25.0
 
 # modo
 trading_mode: "simulado"   # "real" para operar live en exchange
+debug_signals: true
