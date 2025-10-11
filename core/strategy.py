@@ -105,6 +105,116 @@ class Strategy:
 
         return True
 
+    def get_rejection_reason(self, data: pd.DataFrame) -> tuple[str, str, str]:
+        """
+        Devuelve (side, code, detail) con un motivo humano si la última vela NO habilita entrada.
+        Compatible con los mismos filtros que usa check_entry_signal/_passes_filters.
+        """
+        import numpy as np
+
+        if data is None or len(data) == 0:
+            return ("", "no_signal", "Sin datos")
+
+        row = data.iloc[-1]
+        ts = data.index[-1] if hasattr(data, "index") and len(data.index) else None
+
+        # Variables base
+        price = float(row.get("close", float("nan")))
+        ema200_4h = float(row.get("ema200_4h", float("nan")))
+        ema200_1h = float(row.get("ema200", float("nan")))
+        rsi4h = float(row.get("rsi4h", float("nan")))
+        atr = float(row.get("atr", float("nan")))
+
+        # Lado preferido (mismo criterio que check_entry_signal)
+        side_pref = self._decide_grid_side(row)
+        side_out = (side_pref or "").upper()
+
+        # ATR%
+        atrp = (atr / price * 100.0) if (np.isfinite(atr) and np.isfinite(price) and price > 0) else float("nan")
+
+        # Funding runtime (como explain_signal)
+        gate_bps = self.config.get("funding_gate_bps", None)
+        r_dec = self.config.get("_funding_rate_now", None)
+        r_bps = self.config.get("_funding_rate_bps_now", None)
+        if r_dec is None and r_bps is not None:
+            try:
+                r_dec = float(r_bps) / 10000.0
+            except Exception:
+                r_dec = None
+        g_frac = (float(gate_bps) / 10000.0) if gate_bps is not None else None
+
+        # === Orden de chequeo igual a _passes_filters ===
+        # 1) Tendencia 4h
+        if str(self.config.get("trend_filter", "ema200_4h")) == "ema200_4h" and np.isfinite(price) and np.isfinite(ema200_4h):
+            if side_out == "LONG" and not (price > ema200_4h):
+                return (side_out, "trend_4h", "Filtro de Tendencia 4h (Precio <= EMA200 4h)")
+            if side_out == "SHORT" and not (price < ema200_4h):
+                return (side_out, "trend_4h", "Filtro de Tendencia 4h (Precio >= EMA200 4h)")
+
+        # 2) RSI 4h gate
+        rsi_gate = self.config.get("rsi4h_gate", None)
+        if rsi_gate is not None and np.isfinite(rsi4h):
+            g = float(rsi_gate)
+            if side_out == "LONG" and not (rsi4h >= g):
+                return (side_out, "rsi4h_gate", f"Gate RSI 4h (RSI {rsi4h:.2f} < {g:.2f})")
+            if side_out == "SHORT" and not (rsi4h <= (100.0 - g)):
+                return (side_out, "rsi4h_gate", f"Gate RSI 4h (RSI {rsi4h:.2f} > {100.0 - g:.2f})")
+
+        # 3) Confirmación EMA200 1h
+        if bool(self.config.get("ema200_1h_confirm", False)) and np.isfinite(price) and np.isfinite(ema200_1h):
+            if side_out == "LONG" and not (price >= ema200_1h):
+                return (side_out, "ema200_1h_confirm", "Filtro de Tendencia 1h (Precio < EMA200 1h)")
+            if side_out == "SHORT" and not (price <= ema200_1h):
+                return (side_out, "ema200_1h_confirm", "Filtro de Tendencia 1h (Precio > EMA200 1h)")
+
+        # 4) ATR% gates
+        minp = self.config.get("atrp_gate_min", None)
+        maxp = self.config.get("atrp_gate_max", None)
+        if (minp is not None or maxp is not None):
+            if not (np.isfinite(atr) and np.isfinite(price) and price > 0):
+                return (side_out, "atr_gate", "Filtro de Volatilidad (Datos ATR/Precio inválidos)")
+            atrp_val = (atr / price) * 100.0
+            if minp is not None and atrp_val < float(minp):
+                return (side_out, "atr_gate", f"Filtro de Volatilidad (ATR% {atrp_val:.2f} < Mínimo {float(minp):.2f})")
+            if maxp is not None and atrp_val > float(maxp):
+                return (side_out, "atr_gate", f"Filtro de Volatilidad (ATR% {atrp_val:.2f} > Máximo {float(maxp):.2f})")
+
+        # 5) ban_hours
+        if ts is not None and self.config.get("ban_hours"):
+            try:
+                ban = {int(h) for h in str(self.config.get("ban_hours")).split(",") if str(h).strip().isdigit()}
+                hour = int(getattr(ts, "hour", 0))
+                if hour in ban:
+                    return (side_out, "ban_hours", f"Sesión bloqueada por ban_hours (hora={hour})")
+            except Exception:
+                pass
+
+        # 6) Funding gate (si configurado)
+        if g_frac is not None and r_dec is not None:
+            try:
+                if (side_out == "LONG" and float(r_dec) > float(g_frac)) or (side_out == "SHORT" and float(r_dec) < -float(g_frac)):
+                    return (side_out, "funding_gate", f"Funding gate side={side_out} rate={float(r_dec):.6f} gate={float(g_frac):.6f}")
+            except Exception:
+                pass
+
+        # 7) Grid: fuera de rango (coincide con check_entry_signal)
+        anchor_name = str(self.config.get("grid_anchor", "ema30")).lower()
+        anchor = float(row.get("ema30" if anchor_name == "ema30" else "ema200_4h", float("nan")))
+        step = float(self.config.get("grid_step_atr", 0.32)) * (atr if np.isfinite(atr) else 0.0)
+        span = float(self.config.get("grid_span_atr", 3.0)) * (atr if np.isfinite(atr) else 0.0)
+        if np.isfinite(price) and np.isfinite(anchor) and np.isfinite(step) and np.isfinite(span):
+            if side_out == "LONG":
+                ok = (price < anchor) and ((anchor - price) >= step) and ((anchor - price) <= span)
+                if not ok:
+                    return (side_out, "grid_out_of_range", "Grid LONG fuera de rango [step, span]")
+            else:
+                ok = (price > anchor) and ((price - anchor) >= step) and ((price - anchor) <= span)
+                if not ok:
+                    return (side_out, "grid_out_of_range", "Grid SHORT fuera de rango [step, span]")
+
+        # Si llegaste acá y no se abrió, asumimos “sin señal”
+        return (side_out, "no_signal", "No pasó filtros / sin señal utilizable")
+
     def _decide_grid_side(self, row: pd.Series) -> str | None:
         side_cfg = str(self.config.get("grid_side", "auto")).lower()
         if side_cfg in ("long", "short"):
