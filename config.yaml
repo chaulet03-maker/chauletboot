@@ -8,6 +8,7 @@ trading_mode: "simulado"
 entry_mode: "pullback_grid"
 timeframe: "1h" # Timeframe de operación
 symbol: "BTC/USDT"
+balance: 1000 # Balance inicial para el modo simulado
 
 # ---------------------------------------------------
 # PARÁMETROS DE LA ESTRATEGIA GANADORA
