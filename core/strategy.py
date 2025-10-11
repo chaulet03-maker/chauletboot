@@ -233,13 +233,24 @@ class Strategy:
         return None
 
     def _anchor_price(self, row: pd.Series) -> float | None:
-        anchor = str(self.config.get("grid_anchor", "ema30")).lower()
-        if anchor == "ema30":
-            return float(row.get("ema30", np.nan))
-        if anchor == "ema200_4h":
-            return float(row.get("ema200_4h", np.nan))
-        # intento devolver cualquier otra columna existente con ese nombre
-        return float(row.get(anchor, np.nan))
+        anchor_name = str(self.config.get("grid_anchor", "ema30")).lower()
+
+        if anchor_name in ("ema30", "ema_fast"):
+            raw = row.get("ema30", row.get("ema_fast", np.nan))
+        elif anchor_name == "ema200_4h":
+            raw = row.get("ema200_4h", np.nan)
+        else:
+            raw = row.get(anchor_name, np.nan)
+
+        if raw is None or not np.isfinite(raw):
+            return None
+
+        price = float(row.get("close", np.nan))
+        k = float(self.config.get("anchor_bias_frac", 1.0))
+        if np.isfinite(price):
+            return float(price + k * (float(raw) - price))
+
+        return float(raw)
 
     # --- DEBUG: explica por qué no hay señal en la última vela ---
     def explain_signal(self, data: pd.DataFrame) -> None:
@@ -274,7 +285,21 @@ class Strategy:
 
         # Grid geometry
         anchor_name = str(self.config.get("grid_anchor", "ema30")).lower()
-        anchor = float(row.get("ema30" if anchor_name == "ema30" else "ema200_4h", float("nan")))
+        if anchor_name in ("ema30", "ema_fast"):
+            anchor_raw_val = row.get("ema30", row.get("ema_fast", float("nan")))
+        elif anchor_name == "ema200_4h":
+            anchor_raw_val = row.get("ema200_4h", float("nan"))
+        else:
+            anchor_raw_val = row.get(anchor_name, float("nan"))
+
+        anchor_raw = (
+            float(anchor_raw_val)
+            if (anchor_raw_val is not None and np.isfinite(anchor_raw_val))
+            else float("nan")
+        )
+
+        anchor_biased = self._anchor_price(row)
+        anchor = float(anchor_biased) if (anchor_biased is not None and np.isfinite(anchor_biased)) else float("nan")
         step = float(self.config.get("grid_step_atr", 0.32)) * (atr if np.isfinite(atr) else 0.0)
         span = float(self.config.get("grid_span_atr", 3.0)) * (atr if np.isfinite(atr) else 0.0)
 
@@ -335,8 +360,10 @@ class Strategy:
             if not ok: reasons.append("grid SHORT: fuera de rango [step,span]")
 
         log.info(
-            "SIGNAL DEBUG ts=%s side_pref=%s price=%.2f anchor=%s step=%.2f span=%.2f atr=%.2f atrp=%.2f rsi4h=%.2f adx=%.2f ema200_4h=%.2f ema200_1h=%.2f funding_dec=%s gate_bps=%s reasons=%s",
-            str(ts), side_pref, price, ("%.2f" % anchor) if np.isfinite(anchor) else "nan",
+            "SIGNAL DEBUG ts=%s side_pref=%s price=%.2f anchor_raw=%s anchor=%s step=%.2f span=%.2f atr=%.2f atrp=%.2f rsi4h=%.2f adx=%.2f ema200_4h=%.2f ema200_1h=%.2f funding_dec=%s gate_bps=%s reasons=%s",
+            str(ts), side_pref, price,
+            ("%.2f" % anchor_raw) if np.isfinite(anchor_raw) else "nan",
+            ("%.2f" % anchor) if np.isfinite(anchor) else "nan",
             step if np.isfinite(step) else 0.0, span if np.isfinite(span) else 0.0,
             atr if np.isfinite(atr) else float("nan"),
             atrp if np.isfinite(atrp) else float("nan"),

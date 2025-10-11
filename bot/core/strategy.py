@@ -138,18 +138,29 @@ def _decide_grid_side(row: pd.Series, conf: Dict) -> Optional[str]:
     return None
 
 def _anchor_price(row: pd.Series, conf: Dict) -> Optional[float]:
-    """
-    Ancla del grid. Por defecto usamos ema_fast como aprox de ema30 (si no hay ema30 en indicadores).
-    También podés elegir 'ema200_4h' como ancla.
-    """
-    anchor = str(conf.get("grid_anchor", "ema_fast")).lower()
-    if anchor == "ema30" or anchor == "ema_fast":
-        v = row.get("ema_fast", np.nan)
-    elif anchor == "ema200_4h":
-        v = row.get("ema200_4h", np.nan)
+    import numpy as np
+
+    anchor_name = str(conf.get("grid_anchor", "ema_fast")).lower()
+
+    # === anchor "crudo" según config (como antes) ===
+    if anchor_name in ("ema30", "ema_fast"):
+        raw = row.get("ema_fast", np.nan)  # tu runtime usa ema_fast como proxy de ema30
+    elif anchor_name == "ema200_4h":
+        raw = row.get("ema200_4h", np.nan)
     else:
-        v = row.get(anchor, np.nan)
-    return float(v) if np.isfinite(v) else None
+        raw = row.get(anchor_name, np.nan)
+
+    if raw is None or not np.isfinite(raw):
+        return None
+
+    # === SESGO hacia el precio ===
+    price = float(row.get("close", np.nan))
+    k = float(conf.get("anchor_bias_frac", 1.0))  # 1.0 = sin cambio; 0.5 = 50% hacia price
+    if np.isfinite(price):
+        # anchor' = price + k*(raw - price)
+        return float(price + k * (float(raw) - price))
+
+    return float(raw)
 
 def _signal_pullback_grid(row: pd.Series, conf: Dict) -> Optional[str]:
     atr = float(row.get("atr", np.nan))
