@@ -5,7 +5,7 @@ import sqlite3
 import re
 import inspect
 from collections import deque
-from datetime import time as dtime
+from datetime import datetime, timedelta, time as dtime
 from zoneinfo import ZoneInfo
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -385,10 +385,119 @@ def _get_engine_from_context(context: ContextTypes.DEFAULT_TYPE):
     return app.bot_data.get("engine")
 
 
-async def estado_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def posicion_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.effective_message
+    if message is None:
+        return
+
     engine = _get_engine_from_context(context)
-    text = _build_estado_text(engine)
-    await _reply_chunks(update, text)
+    if engine is None:
+        await message.reply_text("No pude acceder al engine para consultar la posición.")
+        return
+
+    trader = getattr(engine, "trader", None)
+    if trader is None or not hasattr(trader, "check_open_position"):
+        await message.reply_text("No hay un trader disponible para consultar posiciones.")
+        return
+
+    try:
+        result = trader.check_open_position(getattr(engine, "exchange", None))
+        position = await result if inspect.isawaitable(result) else result
+    except Exception as exc:
+        await message.reply_text(f"Error al consultar la posición: {exc}")
+        return
+
+    if position:
+        pnl = float(position.get("unrealizedPnl", 0) or 0)
+        entry_price = float(position.get("entryPrice", 0) or 0)
+        side = (position.get("side") or "N/A").upper()
+        symbol = position.get("symbol", "N/A")
+
+        reply_text = (
+            "**Estado Actual: Posición Abierta**\n"
+            "---------------------------------\n"
+            f"Símbolo: {symbol}\n"
+            f"Lado: {side}\n"
+            f"Precio de Entrada: ${entry_price:,.2f}\n"
+            f"PNL Actual: ${pnl:+.2f}"
+        )
+    else:
+        reply_text = (
+            "**Estado Actual: Esperando Señal**\n"
+            "---------------------------------\n"
+            "No hay ninguna posición abierta en este momento."
+        )
+
+    await message.reply_text(reply_text, parse_mode="Markdown")
+
+
+async def estado_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.effective_message
+    if message is None:
+        return
+
+    engine = _get_engine_from_context(context)
+    if engine is None:
+        await message.reply_text("No pude acceder al engine para consultar el estado.")
+        return
+
+    storage = getattr(engine, "storage", None)
+    db_path = None
+    if storage is not None:
+        db_path = getattr(storage, "db_path", None)
+    if not db_path:
+        db_path = getattr(engine, "db_path", None)
+    if not db_path:
+        db_path = _engine_sqlite_path(engine)
+
+    try:
+        now = datetime.now()
+        start_of_day = now - timedelta(hours=24)
+        start_of_week = now - timedelta(days=7)
+
+        pnl_day = 0.0
+        pnl_week = 0.0
+        if db_path and os.path.exists(db_path):
+            with sqlite3.connect(db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    "SELECT SUM(pnl) FROM trades WHERE close_timestamp >= ?",
+                    (start_of_day.isoformat(),),
+                )
+                row = cursor.fetchone()
+                pnl_day = float(row[0]) if row and row[0] is not None else 0.0
+
+                cursor.execute(
+                    "SELECT SUM(pnl) FROM trades WHERE close_timestamp >= ?",
+                    (start_of_week.isoformat(),),
+                )
+                row = cursor.fetchone()
+                pnl_week = float(row[0]) if row and row[0] is not None else 0.0
+
+        trader = getattr(engine, "trader", None)
+        balance = 0.0
+        if trader and hasattr(trader, "get_balance"):
+            try:
+                balance_result = trader.get_balance(getattr(engine, "exchange", None))
+                balance = (
+                    await balance_result
+                    if inspect.isawaitable(balance_result)
+                    else float(balance_result or 0.0)
+                )
+            except Exception:
+                balance = 0.0
+
+        reply_text = (
+            "**Estado de Cuenta Rápido**\n"
+            "---------------------------\n"
+            f"PNL Hoy (24h): ${pnl_day:+.2f}\n"
+            f"PNL Semana (7d): ${pnl_week:+.2f}\n"
+            f"Balance Actual: ${balance:,.2f}"
+        )
+    except Exception as exc:
+        reply_text = f"Error al generar el estado: {exc}"
+
+    await message.reply_text(reply_text, parse_mode="Markdown")
 
 
 async def rendimiento_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -591,6 +700,9 @@ def setup_telegram_bot(engine_instance):
         pass
 
     text_filter = filters.TEXT & (~filters.COMMAND)
+
+    application.add_handler(CommandHandler("posicion", posicion_command))
+    application.add_handler(MessageHandler(text_filter & filters.Regex(r"(?i)^posicion$"), posicion_command))
 
     application.add_handler(CommandHandler("estado", estado_command))
     application.add_handler(MessageHandler(text_filter & filters.Regex(r"(?i)^estado$"), estado_command))
@@ -809,6 +921,8 @@ async def start_telegram_bot(app, config):
 
                 if re.match(r"(?i)^precio", low):
                     await precio_command(update, context)
+                elif low == "posicion":
+                    await posicion_command(update, context)
                 elif low == "estado":
                     await estado_command(update, context)
                 elif low == "rendimiento":
@@ -828,7 +942,7 @@ async def start_telegram_bot(app, config):
                 else:
                     await context.bot.send_message(
                         chat_id,
-                        "Comandos: estado | rendimiento | precio [SIMBOLO] | config | bot on/off | cerrar | logs [n] | ajustar parametro valor",
+                        "Comandos: posicion | estado | rendimiento | precio [SIMBOLO] | config | bot on/off | cerrar | logs [n] | ajustar parametro valor",
                     )
             except Exception as e:
                 logger.exception("telegram msg error: %s", e)
