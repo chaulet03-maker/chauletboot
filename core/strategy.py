@@ -55,15 +55,17 @@ class Strategy:
         else:
             return entry_price + (atr * sl_mult)
 
-    def calculate_tp(self, entry_price: float, quantity: float, balance_on_open: float, side: str) -> float:
-        # TP único a target_eq_pnl_pct del equity al abrir (sin parciales)
+    def calculate_tp(self, entry_price: float, quantity: float, equity_on_open: float, side: str) -> float:
+        """
+        TP al % del equity al abrir (idéntico al simulador):
+          move = (target_eq_pnl_pct * equity_on_open) / qty
+          LONG  -> entry + move
+          SHORT -> entry - move
+        """
         tp_pct = float(self.config.get("target_eq_pnl_pct", 0.10))
-        pnl_target = balance_on_open * tp_pct
+        pnl_target = equity_on_open * tp_pct
         move = pnl_target / max(quantity, 1e-12)
-        if side == "LONG":
-            return entry_price + move
-        else:
-            return entry_price - move
+        return (entry_price + move) if side == "LONG" else (entry_price - move)
 
     # -------------------------------
     # Leverage dinámico por ADX

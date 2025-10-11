@@ -80,6 +80,7 @@ class TradingApp:
                 logging.info("No se encontraron señales de entrada válidas.")
                 return
 
+            # leverage dinámico por ADX (x5 / x10)
             leverage_for_this_trade = self.strategy.dynamic_leverage(last_candle)
             await self.exchange.set_leverage(
                 leverage_for_this_trade,
@@ -87,11 +88,22 @@ class TradingApp:
             )
 
             entry_price = await self.exchange.get_current_price()
-            balance = await self.trader.get_balance(self.exchange)
-            quantity = (balance * leverage_for_this_trade) / max(entry_price, 1e-12)
 
+            # (antes de abrir la orden) calculá el equity actual, igual que en el simulador
+            eq_now = await self.trader.get_balance(self.exchange)  # lo que ya uses para marcar equity (balance +/- PnL latente)
+
+            # guardá el equity al momento de apertura (idéntico al sim)
+            eq_on_open = eq_now
+
+            # sizing full_equity (usa todo el equity como margen * lev)
+            entry_price = float(entry_price)
+            quantity = (eq_on_open * leverage_for_this_trade) / max(entry_price, 1e-12)
+
+            # SL (ATR * mult), igual que el sim
             sl_price = self.strategy.calculate_sl(entry_price, last_candle, signal)
-            tp_price = self.strategy.calculate_tp(entry_price, quantity, balance, signal)
+
+            # TP único al 10% del equity al abrir (idéntico al sim)
+            tp_price = self.strategy.calculate_tp(entry_price, quantity, eq_on_open, signal)
 
             order_result = await self.exchange.create_order(signal, quantity, sl_price, tp_price)
 
