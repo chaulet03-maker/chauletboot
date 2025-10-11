@@ -80,16 +80,20 @@ class TradingApp:
                 logging.info("No se encontraron señales de entrada válidas.")
                 return
 
-            leverage_for_this_trade = self.strategy.dynamic_leverage(last_candle)
+            # === leverage dinámico x5/x10 por ADX ===
+            leverage = self.strategy.dynamic_leverage(last_candle)
             await self.exchange.set_leverage(
-                leverage_for_this_trade,
+                leverage,
                 self.config.get('symbol', 'BTC/USDT'),
             )
 
             entry_price = await self.exchange.get_current_price()
             balance = await self.trader.get_balance(self.exchange)
-            quantity = (balance * leverage_for_this_trade) / max(entry_price, 1e-12)
+            # === sizing full_equity ===
+            # qty = (equity * leverage) / entry_price
+            quantity = (balance * leverage) / max(entry_price, 1e-12)
 
+            # === SL / TP (único) ===
             sl_price = self.strategy.calculate_sl(entry_price, last_candle, signal)
             tp_price = self.strategy.calculate_tp(entry_price, quantity, balance, signal)
 
@@ -99,7 +103,7 @@ class TradingApp:
                 await self.notifier.send(
                     f"🚀 **Nueva Operación Abierta: {signal}**\n"
                     f"Símbolo: {self.config['symbol']}\n"
-                    f"Apalancamiento: x{leverage_for_this_trade}"
+                    f"Apalancamiento: x{leverage}"
                 )
                 await self.trader.set_position(order_result)
 
