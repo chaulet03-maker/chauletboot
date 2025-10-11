@@ -15,12 +15,10 @@ class Notifier:
             logging.warning("Notifier no configurado. No se puede enviar mensaje.")
             return
         try:
-            # Escapar caracteres especiales para MarkdownV2
-            safe_message = message.replace('.', '\\.').replace('-', '\\-')
             await self.app.bot.send_message(
                 chat_id=self.chat_id,
-                text=safe_message,
-                parse_mode='MarkdownV2'
+                text=message,
+                parse_mode='Markdown'
             )
         except Exception as e:
             logging.error(f"Error al enviar notificación por Telegram: {e}")

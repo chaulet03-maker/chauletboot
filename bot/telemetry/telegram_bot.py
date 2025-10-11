@@ -125,6 +125,27 @@ async def _reply_chunks(update: Update, text: str):
             await message.reply_text(chunk)
 
 
+async def ayuda_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Muestra la lista de comandos disponibles para interactuar con el bot."""
+    ayuda_texto = (
+        "**Lista de Comandos Disponibles**\n\n"
+        "**Monitoreo:**\n"
+        "`posicion` - Muestra el estado de la operación actual.\n"
+        "`estado` - Muestra el PNL del día/semana y balance.\n"
+        "`rendimiento` - Muestra estadísticas históricas completas.\n"
+        "`precio` - Devuelve el precio actual de BTC/USDT.\n"
+        "`motivos` - Muestra los últimos 10 rechazos de señales.\n"
+        "`config` - Muestra los parámetros actuales del bot.\n"
+        "`logs [N]` - Muestra las últimas N líneas del log.\n\n"
+        "**Control:**\n"
+        "`pausa` - Detiene la apertura de nuevas operaciones.\n"
+        "`reanudar` - Reanuda la apertura de operaciones.\n"
+        "`cerrar` - Cierra la posición actual.\n"
+        "`killswitch` - Cierra la posición y pausa el bot."
+    )
+    await update.effective_message.reply_text(ayuda_texto, parse_mode='Markdown')
+
+
 def _calc_equity_stats(engine) -> Tuple[float, float, float]:
     equity = 0.0
     d1 = 0.0
@@ -701,6 +722,9 @@ def setup_telegram_bot(engine_instance):
 
     text_filter = filters.TEXT & (~filters.COMMAND)
 
+    application.add_handler(CommandHandler("ayuda", ayuda_command))
+    application.add_handler(MessageHandler(text_filter & filters.Regex(r"(?i)^ayuda$"), ayuda_command))
+
     application.add_handler(CommandHandler("posicion", posicion_command))
     application.add_handler(MessageHandler(text_filter & filters.Regex(r"(?i)^posicion$"), posicion_command))
 
@@ -736,7 +760,7 @@ def setup_telegram_bot(engine_instance):
     application.add_handler(CommandHandler("motivos", motivos_command))
     application.add_handler(MessageHandler(text_filter & filters.Regex(r"(?i)^motivos$"), motivos_command))
 
-    print("Todos los comandos de Telegram han sido registrados correctamente.")
+    logging.info("Todos los comandos de Telegram han sido registrados correctamente.")
     return application
 
 
