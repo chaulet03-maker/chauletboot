@@ -26,9 +26,8 @@ import numpy as np
 import pandas as pd
 
 from ta.momentum import RSIIndicator
-from ta.trend import EMAIndicator, ADXIndicator, MACD
+from ta.trend import EMAIndicator, ADXIndicator
 from ta.volatility import AverageTrueRange
-from ta.volume import OnBalanceVolumeIndicator
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 np.random.seed(42)
@@ -138,18 +137,13 @@ def leer_archivo_smart(path: str) -> pd.DataFrame:
 
 def indicators(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
-    c, h, l, v = df["close"], df["high"], df["low"], df["volume"]
+    c, h, l = df["close"], df["high"], df["low"]
     df["ema10"] = EMAIndicator(c, window=10).ema_indicator()
     df["ema30"] = EMAIndicator(c, window=30).ema_indicator()
     df["ema200"] = EMAIndicator(c, window=200).ema_indicator()  # 1h
     df["rsi"] = RSIIndicator(c, window=14).rsi()
     df["adx"] = ADXIndicator(h, l, c, window=14).adx()
     df["atr"] = AverageTrueRange(h, l, c, window=14).average_true_range()
-    df["obv"] = OnBalanceVolumeIndicator(c, v).on_balance_volume()
-    df["obv_sma"] = EMAIndicator(df["obv"], window=20).ema_indicator()
-    macd_indicator = MACD(c)
-    df["macd"] = macd_indicator.macd()
-    df["macd_signal"] = macd_indicator.macd_signal()
     return df.dropna()
 
 # ============================
@@ -554,30 +548,6 @@ class RiskSizingBacktester:
                 return False
         return True
 
-    def _passes_alpha_filters(self, row: pd.Series, side: str) -> bool:
-        """Revisa confirmaciones de volumen (OBV) y momento (MACD)."""
-        obv = float(row["obv"])
-        obv_sma = float(row["obv_sma"])
-        macd = float(row["macd"])
-        macd_signal = float(row["macd_signal"])
-
-        if side == "LONG":
-            volume_ok = obv > obv_sma
-            momentum_ok = macd > macd_signal
-        else:
-            volume_ok = obv < obv_sma
-            momentum_ok = macd < macd_signal
-
-        if not volume_ok:
-            logging.info("Rechazo Alpha: Señal no confirmada por Volumen (OBV).")
-            return False
-
-        if not momentum_ok:
-            logging.info("Rechazo Alpha: Señal no confirmada por Momento (MACD).")
-            return False
-
-        return True
-
     def _volatility_and_session_ok(self, row: pd.Series, ts: pd.Timestamp) -> bool:
         if self.atrp_gate_min is not None or self.atrp_gate_max is not None:
             atr = float(row["atr"])
@@ -939,11 +909,10 @@ class RiskSizingBacktester:
                 else:
                     sig = self._signal_pullback_grid(row)
                 if sig is not None and self._passes_trend_filters(row, sig) and self._volatility_and_session_ok(row, ts):
-                    if self._passes_alpha_filters(row, sig):
-                        # Funding gate en la barra de señal
-                        open_rate = self._funding_rate_at(ts)
-                        if not ((sig == "LONG" and open_rate > self.funding_gate_frac) or (sig == "SHORT" and open_rate < -self.funding_gate_frac)):
-                            self.pending_order = {"side": sig}
+                    # Funding gate en la barra de señal
+                    open_rate = self._funding_rate_at(ts)
+                    if not ((sig == "LONG" and open_rate > self.funding_gate_frac) or (sig == "SHORT" and open_rate < -self.funding_gate_frac)):
+                        self.pending_order = {"side": sig}
 
         # Cierre al final
         if self.active:
