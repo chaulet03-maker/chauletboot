@@ -86,6 +86,9 @@ class TradingApp:
                 logging.info("No se encontraron señales de entrada válidas.")
                 return
 
+            # === equity al abrir (idéntico al simulador) ===
+            eq_on_open = await self.trader.get_balance(self.exchange)
+
             # === leverage dinámico x5/x10 por ADX ===
             leverage = self.strategy.dynamic_leverage(last_candle)
             await self.exchange.set_leverage(
@@ -94,16 +97,15 @@ class TradingApp:
             )
 
             entry_price = await self.exchange.get_current_price()
-            balance = await self.trader.get_balance(self.exchange)
             # === sizing full_equity ===
-            # qty = (equity * leverage) / entry_price
-            quantity = (balance * leverage) / max(entry_price, 1e-12)
+            entry_price = float(entry_price)
+            qty = (eq_on_open * leverage) / max(entry_price, 1e-12)
 
-            # === SL / TP (único) ===
+            # === SL / TP (TP único al 10% del equity al abrir, como el simulador) ===
             sl_price = self.strategy.calculate_sl(entry_price, last_candle, signal)
-            tp_price = self.strategy.calculate_tp(entry_price, quantity, balance, signal)
+            tp_price = self.strategy.calculate_tp(entry_price, qty, eq_on_open, signal)
 
-            order_result = await self.exchange.create_order(signal, quantity, sl_price, tp_price)
+            order_result = await self.exchange.create_order(signal, qty, sl_price, tp_price)
 
             if order_result:
                 await self.notifier.send(
