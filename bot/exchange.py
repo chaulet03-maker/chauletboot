@@ -11,26 +11,46 @@ class Exchange:
         self.client = self._setup_client()
 
     def _setup_client(self):
-        """Configura e inicializa el cliente del exchange (ccxt)."""
+        """ Configura e inicializa el cliente del exchange. """
         mode = self.config.get('trading_mode', 'simulado')
-        logging.info(f"Configurando el exchange en modo: {mode.upper()}")
+        self.is_authenticated = False  # Bandera de estado
 
-        api_key_env = 'binance_api_key_real' if mode == 'real' else 'binance_api_key_test'
-        api_secret_env = 'binance_api_secret_real' if mode == 'real' else 'binance_api_secret_test'
+        # 1. Intento de Conexión Autenticada (para Trading)
+        try:
+            if mode == 'real':
+                api_key = self.config.get('binance_api_key_real')
+                secret = self.config.get('binance_api_secret_real')
+            else:
+                api_key = self.config.get('binance_api_key_test')
+                secret = self.config.get('binance_api_secret_test')
 
-        client = ccxt.binance({
-            'apiKey': self.config.get(api_key_env),
-            'secret': self.config.get(api_secret_env),
-            'options': {
-                'defaultType': 'future',
-            },
-        })
+            client = ccxt.binance({
+                'apiKey': api_key,
+                'secret': secret,
+                'options': {'defaultType': 'future'},
+            })
 
-        if mode != 'real':
-            client.set_sandbox_mode(True)
+            if mode != 'real':
+                client.set_sandbox_mode(True)
 
-        logging.info("Cliente de CCXT para Binance inicializado correctamente.")
-        return client
+            # Intentamos verificar si las credenciales funcionan cargando mercados
+            client.load_markets()
+            self.is_authenticated = True
+            logging.info("Cliente de CCXT AUTENTICADO e inicializado correctamente.")
+            return client
+
+        except Exception as e:
+            # 2. FALLBACK: Si las claves fallan, inicializar cliente PÚBLICO (solo lectura)
+            logging.warning(
+                f"ADVERTENCIA: Fallo de autenticación. El bot operará en modo SÓLO LECTURA. Error: {e}"
+            )
+            logging.warning("Verifique las claves de Testnet en su archivo .env.")
+
+            # Creamos un cliente que NO necesita claves para obtener precios públicos
+            public_client = ccxt.binance({
+                'options': {'defaultType': 'future'},
+            })
+            return public_client
 
     async def get_klines(self, timeframe: str = '1h', symbol: Optional[str] = None, limit: int = 300) -> List[List[Any]]:
         """Obtiene las velas (klines) de un par."""
