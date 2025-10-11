@@ -27,6 +27,8 @@ class TradingApp:
         self.rejection_log = deque(maxlen=10)
         self.telegram_app = setup_telegram_bot(self)
         self.notifier = Notifier(application=self.telegram_app, cfg=self.config)
+        self.symbols = [self.config.get('symbol', 'BTC/USDT')]
+        self.price_cache = {}
 
         schedule.every().day.at("08:00", "America/Argentina/Buenos_Aires").do(self._generate_daily_report)
         schedule.every().sunday.at("00:00", "America/Argentina/Buenos_Aires").do(self._generate_weekly_report)
@@ -122,8 +124,25 @@ class TradingApp:
                 await self.notifier.send(f"💥 **Error inesperado en el bot:** {e}")
                 self.connection_lost = True
 
+    def price_of(self, symbol: str):
+        return self.price_cache.get(symbol)
+
+    async def fetch_last_price(self, symbol: str):
+        return await self.exchange.get_current_price(symbol)
+
+    async def _update_price_cache_job(self, context):
+        try:
+            symbols = self.symbols or [self.config.get('symbol', 'BTC/USDT')]
+            for sym in symbols:
+                px = await self.exchange.get_current_price(sym)
+                if px is not None:
+                    self.price_cache[sym] = float(px)
+        except Exception as e:
+            logging.warning(f"No pude actualizar la cache de precios: {e}")
+
     def run(self):
         job_queue = self.telegram_app.job_queue
+        job_queue.run_repeating(self._update_price_cache_job, interval=10, first=1)
         job_queue.run_repeating(self.trading_loop, interval=60, first=5)
 
         loop = asyncio.get_event_loop()
