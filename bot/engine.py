@@ -49,6 +49,26 @@ class TradingApp:
                 except Exception as exc:
                     logging.warning("No se pudo cargar la serie de funding desde %s: %s", funding_csv, exc)
 
+    # === Rejection recording helpers ===
+    def record_rejection(self, symbol: str, side: str, code: str, detail: str = "", ts=None):
+        try:
+            from datetime import datetime, timezone
+            from collections import deque
+            if not hasattr(self, "rejection_log"):
+                self.rejection_log = deque(maxlen=50)  # si no existe, lo creo
+            if ts is None:
+                ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")
+            item = {"iso": ts, "symbol": symbol, "side": side, "code": code, "detail": detail}
+            self.rejection_log.append(item)
+
+            # Reflejá también en el notificador PRO si existe
+            tg = getattr(self, "telegram", None) or getattr(self, "notifier", None)
+            if tg is not None and hasattr(tg, "log_reject"):
+                tg.log_reject(symbol=symbol, side=side, code=code, detail=detail)
+        except Exception as e:
+            import logging
+            logging.debug(f"record_rejection failed: {e}")
+
     async def trading_loop(self, context: ContextTypes.DEFAULT_TYPE):
         """Bucle principal de trading ejecutado por la JobQueue de Telegram."""
         try:
@@ -120,6 +140,36 @@ class TradingApp:
 
             signal = self.strategy.check_entry_signal(data)
             if not signal:
+                # Registrar motivo estimado (ATR gate, tendencia, sesiones, etc.)
+                try:
+                    from core.strategy import check_all_filters
+                    last_row = data.iloc[-1]  # última vela con indicadores
+                    side_pref = str(self.config.get("grid_side", "auto")).upper()
+                    sides = (["LONG", "SHORT"] if side_pref == "AUTO" else [side_pref])
+
+                    reason = None
+                    side_used = ""
+                    for s in sides:
+                        try:
+                            r = check_all_filters(last_row, self.config, s)
+                            if r:  # si algún filtro falla, lo usamos
+                                reason = r
+                                side_used = s
+                                break
+                        except Exception:
+                            pass
+
+                    code = "atr_gate" if (reason and "ATR%" in reason) else "pre_open_checks"
+                    self.record_rejection(
+                        symbol=self.config.get("symbol", ""),
+                        side=side_used or (sides[0] if sides else ""),
+                        code=code,
+                        detail=reason or "Sin detalle"
+                    )
+                except Exception:
+                    # no impide el flujo normal si algo falla en el diagnóstico
+                    pass
+
                 logging.info("No se encontraron señales de entrada válidas.")
                 if self.config.get("debug_signals", False):
                     try:

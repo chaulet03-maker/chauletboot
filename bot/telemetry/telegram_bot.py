@@ -679,14 +679,45 @@ async def motivos_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _reply_chunks(update, "No pude acceder al engine para consultar motivos.")
         return
 
-    log = list(getattr(engine, "rejection_log", []))
+    # 1) Preferí el buffer del engine si existe
+    log = list(getattr(engine, "rejection_log", []) or [])
+    # 2) Fallback: si está vacío, uso el ring buffer del notificador de Telegram
+    if not log:
+        tg = (
+            getattr(engine, "telegram", None)
+            or getattr(engine, "notifier", None)
+            or getattr(context.application, "notifier", None)
+        )
+        try:
+            if tg is not None:
+                log = list(getattr(tg, "_rejections", []) or [])
+        except Exception:
+            log = []
+
     if not log:
         await _reply_chunks(update, "No se ha registrado ningún rechazo de operación todavía.")
         return
 
-    motivos_list = "\n".join(f"• {item}" for item in reversed(log))
-    header = "Últimos 10 motivos para no entrar al mercado:\n"
-    await _reply_chunks(update, header + "\n" + motivos_list)
+    # Formateo (acepta dicts o strings). Máximo 10 últimos motivos.
+    lines = []
+    for item in list(reversed(log))[:10]:
+        if isinstance(item, dict):
+            iso  = item.get("iso") or item.get("ts") or ""
+            sym  = item.get("symbol") or ""
+            side = item.get("side") or ""
+            code = item.get("code") or item.get("reason") or ""
+            det  = item.get("detail") or ""
+            extra = []
+            for k, v in item.items():
+                if k.startswith("extra_"):
+                    extra.append(f"{k[6:]}={v}")
+            extra_txt = (" [" + ", ".join(extra) + "]") if extra else ""
+            lines.append(f"• {iso} — {sym} {side}: {code}" + (f" ({det})" if det else "") + extra_txt)
+        else:
+            lines.append(f"• {str(item)}")
+
+    header = "🕒 Motivos recientes (últimas 10 oportunidades NO abiertas):\n"
+    await _reply_chunks(update, header + "\n".join(lines))
 
 
 def setup_telegram_bot(engine_instance):
