@@ -34,17 +34,6 @@ class TradingApp:
         schedule.every().sunday.at("00:00", "America/Argentina/Buenos_Aires").do(self._generate_weekly_report)
         logging.info("Componentes y tareas de reporte inicializados.")
 
-    def _get_dynamic_leverage(self, df_row):
-        adx = float(df_row["adx"])
-        if adx >= 25:
-            leverage = 10.0
-            trend_strength = "FUERTE"
-        else:
-            leverage = self.config.get('leverage', 5.0)
-            trend_strength = "DEBIL"
-        logging.info(f"Fuerza de tendencia: {trend_strength} (ADX={adx:.2f}). Usando apalancamiento: x{leverage}")
-        return leverage
-
     async def trading_loop(self, context: ContextTypes.DEFAULT_TYPE):
         """Bucle principal de trading ejecutado por la JobQueue de Telegram."""
         try:
@@ -91,19 +80,15 @@ class TradingApp:
                 logging.info("No se encontraron señales de entrada válidas.")
                 return
 
-            rejection_reason = self.strategy.check_all_filters(last_candle, signal)
-            if rejection_reason:
-                log_entry = f"[{pd.Timestamp.now(tz='UTC').strftime('%H:%M')}] Señal Rechazada: {rejection_reason}"
-                self.rejection_log.append(log_entry)
-                logging.info(log_entry)
-                return
-
-            leverage_for_this_trade = self._get_dynamic_leverage(last_candle)
-            await self.exchange.set_leverage(leverage_for_this_trade)
+            leverage_for_this_trade = self.strategy.dynamic_leverage(last_candle)
+            await self.exchange.set_leverage(
+                leverage_for_this_trade,
+                self.config.get('symbol', 'BTC/USDT'),
+            )
 
             entry_price = await self.exchange.get_current_price()
             balance = await self.trader.get_balance(self.exchange)
-            quantity = (balance * leverage_for_this_trade) / entry_price
+            quantity = (balance * leverage_for_this_trade) / max(entry_price, 1e-12)
 
             sl_price = self.strategy.calculate_sl(entry_price, last_candle, signal)
             tp_price = self.strategy.calculate_tp(entry_price, quantity, balance, signal)
