@@ -219,6 +219,7 @@ class RiskSizingBacktester:
         grid_anchor: str = "ema30",
         grid_side: str = "auto",
         anchor_bias_frac: float = 1.0,
+        grid_short_mode: str = "pullback",
         # tagging
         tag: Optional[str] = None,
     ):
@@ -319,6 +320,9 @@ class RiskSizingBacktester:
             raise ValueError("grid_side debe ser 'auto', 'long' o 'short'")
         # Sesgo del anchor hacia el precio (k=1 sin cambio; k=0.5 = 50% hacia price)
         self.anchor_bias_frac = float(anchor_bias_frac)
+        self.grid_short_mode = grid_short_mode.lower().strip()
+        if self.grid_short_mode not in ("pullback", "breakdown", "either"):
+            raise ValueError("grid_short_mode debe ser 'pullback', 'breakdown' o 'either'")
 
         # Tag
         self.tag = (tag or "").strip()
@@ -595,8 +599,6 @@ class RiskSizingBacktester:
             anchor_biased = price + k * (anchor_raw - price)
         donde k = self.anchor_bias_frac (1.0 = sin cambio; 0.5 = 50% hacia price).
         """
-        import numpy as np
-
         if self.grid_anchor == "ema30":
             raw = row.get("ema30", np.nan)
         elif self.grid_anchor == "ema200_4h":
@@ -611,7 +613,7 @@ class RiskSizingBacktester:
         if not np.isfinite(price):
             return float(raw)
 
-        k = float(getattr(self, "anchor_bias_frac", 1.0))
+        k = float(self.anchor_bias_frac)
         return float(price + k * (float(raw) - price))
 
     def _signal_pullback_grid(self, row: pd.Series) -> Optional[str]:
@@ -629,11 +631,21 @@ class RiskSizingBacktester:
         step = self.grid_step_atr * atr
         half_span = self.grid_span_atr * atr
         if side_pref == "LONG":
-            if (price < anchor) and (anchor - price >= step) and (anchor - price <= half_span):
+            long_ok = (price < anchor) and (step <= (anchor - price) <= half_span)
+            if long_ok:
                 return "LONG"
         else:
-            if (price > anchor) and (price - anchor >= step) and (price - anchor <= half_span):
-                return "SHORT"
+            pullback_ok = (price > anchor) and (step <= (price - anchor) <= half_span)
+            breakdown_ok = (price < anchor) and (step <= (anchor - price) <= half_span)
+            if self.grid_short_mode == "pullback":
+                if pullback_ok:
+                    return "SHORT"
+            elif self.grid_short_mode == "breakdown":
+                if breakdown_ok:
+                    return "SHORT"
+            else:  # either
+                if pullback_ok or breakdown_ok:
+                    return "SHORT"
         return None
 
     # ------------- Fuerza de señal -> target dinámico -------------
@@ -1269,6 +1281,13 @@ def main():
         default=1.0,
         help="Sesgo del anchor hacia el precio: anchor'=price + k*(anchor-price). Usa 0.5 para mover el anchor 50% hacia price.",
     )
+    ap.add_argument(
+        "--grid-short-mode",
+        type=str,
+        default="pullback",
+        choices=["pullback", "breakdown", "either"],
+        help="Para señales SHORT: pullback (retroceso), breakdown (continuación) o either (ambos)",
+    )
 
     # Fees por lado y slippage
     ap.add_argument("--taker-fee", type=float, default=None, help="Fee taker por lado (ej 0.0006)")
@@ -1336,6 +1355,7 @@ def main():
         grid_anchor=args.grid_anchor,
         grid_side=args.grid_side,
         anchor_bias_frac=args.anchor_bias_frac,
+        grid_short_mode=args.grid_short_mode,
         tag=(args.tag or "").strip(),
     )
 
