@@ -8,9 +8,9 @@ from dotenv import load_dotenv
 from bot.engine import TradingApp
 
 
-async def main():
+def main():
     """
-    Función principal asíncrona que configura e inicia la aplicación.
+    Función principal que configura e inicia la aplicación.
     """
     # 1. Cargar configuración y secretos
     load_dotenv()
@@ -36,12 +36,13 @@ async def main():
 
     # 3. Iniciar la aplicación del bot
     app = TradingApp(cfg)
-    await app.run()
+
+    # 4. El método run() ahora es el punto de entrada que maneja el bucle
+    asyncio.run(app.run())
 
 
 if __name__ == "__main__":
-    # 4. Este es el único punto de entrada que inicia el bucle de eventos
     try:
-        asyncio.run(main())
+        main()
     except KeyboardInterrupt:
         logging.info("Bot detenido manualmente.")
