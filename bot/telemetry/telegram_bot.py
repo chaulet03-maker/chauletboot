@@ -700,6 +700,16 @@ async def motivos_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Formateo (acepta dicts o strings). Máximo 10 últimos motivos.
     lines = []
+    friendly = {
+        "atr_gate": "ATR alto/bajo",
+        "trend_4h": "Tendencia 4h contraria",
+        "ema200_1h_confirm": "Cruce/confirmación EMA200 1h fallida",
+        "rsi4h_gate": "RSI 4h fuera de umbral",
+        "ban_hours": "Horario bloqueado",
+        "funding_gate": "Funding desfavorable",
+        "grid_out_of_range": "Fuera de rango de pullback",
+        "no_signal": "Sin señal utilizable",
+    }
     for item in list(reversed(log))[:10]:
         if isinstance(item, dict):
             iso  = item.get("iso") or item.get("ts") or ""
@@ -712,7 +722,8 @@ async def motivos_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if k.startswith("extra_"):
                     extra.append(f"{k[6:]}={v}")
             extra_txt = (" [" + ", ".join(extra) + "]") if extra else ""
-            lines.append(f"• {iso} — {sym} {side}: {code}" + (f" ({det})" if det else "") + extra_txt)
+            title = friendly.get(code, code)
+            lines.append(f"• {iso} — {sym} {side}: {title}" + (f" ({det})" if det else "") + extra_txt)
         else:
             lines.append(f"• {str(item)}")
 
