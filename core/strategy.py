@@ -105,14 +105,12 @@ class Strategy:
 
         return True
 
-    def get_rejection_reason(self, data: pd.DataFrame) -> tuple[str, str, str]:
-        """
-        Devuelve (side, code, detail) si la última vela NO habilita entrada.
-        code: 'trend_4h' | 'ema200_1h_confirm' | 'rsi4h_gate' | 'atr_gate' | 'ban_hours' | 'funding_gate' | 'grid_out_of_range' | 'no_signal'
-        """
+    def get_rejection_reasons_all(self, data: pd.DataFrame):
+        """Devuelve lista de (code, detail) para la última vela si NO habilita entrada."""
         import numpy as np
+        reasons = []
         if data is None or len(data) == 0:
-            return ("", "no_signal", "Sin datos")
+            return [("no_signal", "Sin datos")]
 
         row = data.iloc[-1]
         ts = data.index[-1] if hasattr(data, "index") and len(data.index) else None
@@ -128,6 +126,7 @@ class Strategy:
 
         atrp = (atr / price * 100.0) if (np.isfinite(atr) and np.isfinite(price) and price > 0) else float("nan")
 
+        # Funding (runtime)
         gate_bps = self.config.get("funding_gate_bps", None)
         r_dec = self.config.get("_funding_rate_now", None)
         r_bps = self.config.get("_funding_rate_bps_now", None)
@@ -138,37 +137,38 @@ class Strategy:
 
         # 1) Tendencia 4h
         if str(self.config.get("trend_filter", "ema200_4h")) == "ema200_4h" and np.isfinite(price) and np.isfinite(ema200_4h):
-            if side_out == "LONG"  and not (price > ema200_4h):  return (side_out, "trend_4h", "Precio <= EMA200 (4h)")
-            if side_out == "SHORT" and not (price < ema200_4h):  return (side_out, "trend_4h", "Precio >= EMA200 (4h)")
+            if side_out == "LONG"  and not (price > ema200_4h):  reasons.append(("trend_4h", "Precio <= EMA200 (4h)"))
+            if side_out == "SHORT" and not (price < ema200_4h):  reasons.append(("trend_4h", "Precio >= EMA200 (4h)"))
 
         # 2) RSI 4h
         rsi_gate = self.config.get("rsi4h_gate", None)
         if rsi_gate is not None and np.isfinite(rsi4h):
             g = float(rsi_gate)
-            if side_out == "LONG"  and not (rsi4h >= g):              return (side_out, "rsi4h_gate", f"RSI4h {rsi4h:.2f} < {g:.2f}")
-            if side_out == "SHORT" and not (rsi4h <= (100.0 - g)):    return (side_out, "rsi4h_gate", f"RSI4h {rsi4h:.2f} > {100.0 - g:.2f}")
+            if side_out == "LONG"  and not (rsi4h >= g):           reasons.append(("rsi4h_gate", f"RSI4h {rsi4h:.2f} < {g:.2f}"))
+            if side_out == "SHORT" and not (rsi4h <= (100.0 - g)): reasons.append(("rsi4h_gate", f"RSI4h {rsi4h:.2f} > {100.0 - g:.2f}"))
 
         # 3) Confirmación EMA200 1h
         if bool(self.config.get("ema200_1h_confirm", False)) and np.isfinite(price) and np.isfinite(ema200_1h):
-            if side_out == "LONG"  and not (price >= ema200_1h):      return (side_out, "ema200_1h_confirm", "Precio < EMA200 (1h)")
-            if side_out == "SHORT" and not (price <= ema200_1h):      return (side_out, "ema200_1h_confirm", "Precio > EMA200 (1h)")
+            if side_out == "LONG"  and not (price >= ema200_1h):   reasons.append(("ema200_1h_confirm", "Precio < EMA200 (1h)"))
+            if side_out == "SHORT" and not (price <= ema200_1h):   reasons.append(("ema200_1h_confirm", "Precio > EMA200 (1h)"))
 
         # 4) ATR%
         minp = self.config.get("atrp_gate_min", None)
         maxp = self.config.get("atrp_gate_max", None)
         if (minp is not None or maxp is not None):
             if not (np.isfinite(atr) and np.isfinite(price) and price > 0):
-                return (side_out, "atr_gate", "ATR/Precio inválidos")
-            atrp_val = (atr / price) * 100.0
-            if minp is not None and atrp_val < float(minp):            return (side_out, "atr_gate", f"ATR% {atrp_val:.2f} < Min {float(minp):.2f}")
-            if maxp is not None and atrp_val > float(maxp):            return (side_out, "atr_gate", f"ATR% {atrp_val:.2f} > Max {float(maxp):.2f}")
+                reasons.append(("atr_gate", "ATR/Precio inválidos"))
+            else:
+                atrp_val = (atr / price) * 100.0
+                if minp is not None and atrp_val < float(minp): reasons.append(("atr_gate", f"ATR% {atrp_val:.2f} < Min {float(minp):.2f}"))
+                if maxp is not None and atrp_val > float(maxp): reasons.append(("atr_gate", f"ATR% {atrp_val:.2f} > Max {float(maxp):.2f}"))
 
         # 5) ban_hours
         if ts is not None and self.config.get("ban_hours"):
             try:
                 ban = {int(h) for h in str(self.config.get("ban_hours")).split(",") if str(h).strip().isdigit()}
                 if int(getattr(ts, "hour", 0)) in ban:
-                    return (side_out, "ban_hours", f"Hora bloqueada={int(getattr(ts,'hour',0))}")
+                    reasons.append(("ban_hours", f"Hora bloqueada={int(getattr(ts,'hour',0))}"))
             except Exception:
                 pass
 
@@ -176,7 +176,7 @@ class Strategy:
         if g_frac is not None and r_dec is not None:
             try:
                 if (side_out == "LONG" and float(r_dec) > float(g_frac)) or (side_out == "SHORT" and float(r_dec) < -float(g_frac)):
-                    return (side_out, "funding_gate", f"rate={float(r_dec):.6f} gate={float(g_frac):.6f}")
+                    reasons.append(("funding_gate", f"rate={float(r_dec):.6f} gate={float(g_frac):.6f}"))
             except Exception:
                 pass
 
@@ -188,12 +188,20 @@ class Strategy:
         if np.isfinite(price) and np.isfinite(anchor) and np.isfinite(step) and np.isfinite(span):
             if side_out == "LONG":
                 ok = (price < anchor) and ((anchor - price) >= step) and ((anchor - price) <= span)
-                if not ok: return (side_out, "grid_out_of_range", "Grid LONG fuera de [step,span]")
+                if not ok: reasons.append(("grid_out_of_range", "Grid LONG fuera de [step,span]"))
             else:
                 ok = (price > anchor) and ((price - anchor) >= step) and ((price - anchor) <= span)
-                if not ok: return (side_out, "grid_out_of_range", "Grid SHORT fuera de [step,span]")
+                if not ok: reasons.append(("grid_out_of_range", "Grid SHORT fuera de [step,span]"))
 
-        return (side_out, "no_signal", "No pasó filtros / sin señal utilizable")
+        return reasons or [("no_signal", "No pasó filtros / sin señal utilizable")]
+
+    def get_rejection_reason(self, data: pd.DataFrame):
+        """Conveniencia: devuelve el primer motivo relevante."""
+        lst = self.get_rejection_reasons_all(data)
+        code, detail = lst[0]
+        # empaqueto también un resumen del resto por si querés mostrarlo
+        extras = "; ".join(f"{c}:{d}" for c, d in lst[1:]) if len(lst) > 1 else ""
+        return code, detail, extras
 
     def _decide_grid_side(self, row: pd.Series) -> str | None:
         side_cfg = str(self.config.get("grid_side", "auto")).lower()
