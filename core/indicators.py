@@ -10,6 +10,7 @@ def add_indicators(df_1h: pd.DataFrame, df_4h: pd.DataFrame) -> pd.DataFrame:
     """
     # Indicadores de 1 hora
     c, h, l = df_1h["close"], df_1h["high"], df_1h["low"]
+    df_1h["ema30"] = EMAIndicator(c, window=30).ema_indicator()
     df_1h["ema200"] = EMAIndicator(c, window=200).ema_indicator()
     df_1h["rsi"] = RSIIndicator(c, window=14).rsi()
     df_1h["adx"] = ADXIndicator(h, l, c, window=14).adx()

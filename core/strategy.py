@@ -144,8 +144,10 @@ class Strategy:
         rsi_gate = self.config.get("rsi4h_gate", None)
         if rsi_gate is not None and np.isfinite(rsi4h):
             g = float(rsi_gate)
-            if side_out == "LONG"  and not (rsi4h >= g):           reasons.append(("rsi4h_gate", f"RSI4h {rsi4h:.2f} < {g:.2f}"))
-            if side_out == "SHORT" and not (rsi4h <= (100.0 - g)): reasons.append(("rsi4h_gate", f"RSI4h {rsi4h:.2f} > {100.0 - g:.2f}"))
+            if side_out == "LONG" and not (rsi4h >= g):
+                reasons.append(("rsi4h_gate", f"RSI4h {rsi4h:.2f} < {g:.2f}"))
+            if side_out == "SHORT" and not (rsi4h <= (100.0 - g)):
+                reasons.append(("rsi4h_gate", f"RSI4h {rsi4h:.2f} > {100.0 - g:.2f}"))
 
         # 3) Confirmación EMA200 1h
         if bool(self.config.get("ema200_1h_confirm", False)) and np.isfinite(price) and np.isfinite(ema200_1h):
@@ -180,18 +182,28 @@ class Strategy:
             except Exception:
                 pass
 
-        # 7) Grid fuera de rango (pullback)
+        # 7) Grid / Anchor
         anchor_name = str(self.config.get("grid_anchor", "ema30")).lower()
-        anchor = float(row.get("ema30" if anchor_name == "ema30" else "ema200_4h", float("nan")))
-        step  = float(self.config.get("grid_step_atr", 0.32)) * (atr if np.isfinite(atr) else 0.0)
-        span  = float(self.config.get("grid_span_atr", 3.0))  * (atr if np.isfinite(atr) else 0.0)
-        if np.isfinite(price) and np.isfinite(anchor) and np.isfinite(step) and np.isfinite(span):
+        if anchor_name == "ema30":
+            anchor = float(row.get("ema30", float("nan")))
+        elif anchor_name == "ema200_4h":
+            anchor = float(row.get("ema200_4h", float("nan")))
+        else:
+            anchor = float(row.get(anchor_name, float("nan")))
+        step = float(self.config.get("grid_step_atr", 0.32)) * (atr if np.isfinite(atr) else 0.0)
+        span = float(self.config.get("grid_span_atr", 3.0)) * (atr if np.isfinite(atr) else 0.0)
+
+        if not np.isfinite(anchor):
+            reasons.append(("anchor_missing", f"Anchor '{anchor_name}' no disponible"))
+        elif np.isfinite(price) and np.isfinite(step) and np.isfinite(span):
             if side_out == "LONG":
                 ok = (price < anchor) and ((anchor - price) >= step) and ((anchor - price) <= span)
-                if not ok: reasons.append(("grid_out_of_range", "Grid LONG fuera de [step,span]"))
+                if not ok:
+                    reasons.append(("grid_out_of_range", "Grid LONG fuera de [step,span]"))
             else:
                 ok = (price > anchor) and ((price - anchor) >= step) and ((price - anchor) <= span)
-                if not ok: reasons.append(("grid_out_of_range", "Grid SHORT fuera de [step,span]"))
+                if not ok:
+                    reasons.append(("grid_out_of_range", "Grid SHORT fuera de [step,span]"))
 
         return reasons or [("no_signal", "No pasó filtros / sin señal utilizable")]
 
@@ -222,9 +234,12 @@ class Strategy:
 
     def _anchor_price(self, row: pd.Series) -> float | None:
         anchor = str(self.config.get("grid_anchor", "ema30")).lower()
-        if anchor == "ema30": return float(row.get("ema30", np.nan))
-        if anchor == "ema200_4h": return float(row.get("ema200_4h", np.nan))
-        return None
+        if anchor == "ema30":
+            return float(row.get("ema30", np.nan))
+        if anchor == "ema200_4h":
+            return float(row.get("ema200_4h", np.nan))
+        # intento devolver cualquier otra columna existente con ese nombre
+        return float(row.get(anchor, np.nan))
 
     # --- DEBUG: explica por qué no hay señal en la última vela ---
     def explain_signal(self, data: pd.DataFrame) -> None:
