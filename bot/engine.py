@@ -29,10 +29,24 @@ class TradingApp:
         self.notifier = Notifier(application=self.telegram_app, cfg=self.config)
         self.symbols = [self.config.get('symbol', 'BTC/USDT')]
         self.price_cache = {}
+        self._funding_series = None
+        self._daily_R: dict = {}
+        self._risk_usd_trade = 0.0
+        self._eq_on_open = 0.0
+        self._entry_ts = None
+        self._bars_in_position = 0
 
         schedule.every().day.at("08:00", "America/Argentina/Buenos_Aires").do(self._generate_daily_report)
         schedule.every().sunday.at("00:00", "America/Argentina/Buenos_Aires").do(self._generate_weekly_report)
         logging.info("Componentes y tareas de reporte inicializados.")
+
+        if str(self.config.get("trading_mode", "simulado")).lower() == "simulado":
+            funding_csv = self.config.get("funding_csv")
+            if funding_csv:
+                try:
+                    self._load_funding_series(funding_csv)
+                except Exception as exc:
+                    logging.warning("No se pudo cargar la serie de funding desde %s: %s", funding_csv, exc)
 
     async def trading_loop(self, context: ContextTypes.DEFAULT_TYPE):
         """Bucle principal de trading ejecutado por la JobQueue de Telegram."""
@@ -52,6 +66,16 @@ class TradingApp:
                     position.get('contracts'),
                     position.get('symbol'),
                 )
+                try:
+                    now_ts = pd.Timestamp.utcnow().tz_localize("UTC")
+                    last_price = await self.exchange.get_current_price(self.config.get('symbol'))
+                    side = (position.get('side') or '').upper()
+                    qty_raw = position.get('contracts') or position.get('size')
+                    qty = float(qty_raw) if qty_raw is not None else 0.0
+                    if last_price is not None and side and qty > 0:
+                        self._apply_funding_if_needed(now_ts, float(last_price), side, qty)
+                except Exception as exc:
+                    logging.debug("No se pudo aplicar funding a la posición abierta: %s", exc)
                 return
 
             if self.is_paused:
@@ -72,24 +96,35 @@ class TradingApp:
             df_1h.set_index('timestamp', inplace=True)
             df_4h.set_index('timestamp', inplace=True)
 
-            current_funding_bps = await self.exchange.get_current_funding_rate_bps(self.config.get('symbol'))
-            if current_funding_bps is not None:
-                self.config["_funding_rate_bps_now"] = current_funding_bps
-            else:
-                self.config.pop("_funding_rate_bps_now", None)
-
             data = add_indicators(df_1h, df_4h)
             last_candle = data.iloc[-1]
+            now_ts = data.index[-1]
+
+            if self._should_block_new_trade_today(now_ts):
+                logging.info("Daily stop alcanzado, no se abrirán nuevas operaciones hoy.")
+                return
+
+            if self.config.get("funding_interval_hours", 8) and self.config.get("funding_gate_bps") is not None:
+                try:
+                    current_rate_dec = await self.exchange.fetch_current_funding_rate(self.config.get('symbol'))
+                except Exception as exc:
+                    logging.debug("Fallo al obtener funding runtime: %s", exc)
+                    current_rate_dec = self._funding_rate_at(now_ts)
+                if current_rate_dec is not None:
+                    self.config["_funding_rate_now"] = float(current_rate_dec)
+                    self.config["_funding_rate_bps_now"] = float(current_rate_dec) * 10000.0
+                else:
+                    self.config.pop("_funding_rate_now", None)
+                    self.config.pop("_funding_rate_bps_now", None)
 
             signal = self.strategy.check_entry_signal(data)
             if not signal:
                 logging.info("No se encontraron señales de entrada válidas.")
                 return
 
-            # === equity al abrir (idéntico al simulador) ===
-            eq_on_open = await self.trader.get_balance(self.exchange)
+            eq_now = await self.trader.get_balance(self.exchange)
+            eq_on_open = eq_now
 
-            # === leverage dinámico x5/x10 por ADX ===
             leverage = self.strategy.dynamic_leverage(last_candle)
             await self.exchange.set_leverage(
                 leverage,
@@ -97,11 +132,12 @@ class TradingApp:
             )
 
             entry_price = await self.exchange.get_current_price()
-            # === sizing full_equity ===
+            if entry_price is None:
+                logging.warning("No se pudo obtener el precio de entrada actual.")
+                return
             entry_price = float(entry_price)
             qty = (eq_on_open * leverage) / max(entry_price, 1e-12)
 
-            # === SL / TP (TP único al 10% del equity al abrir, como el simulador) ===
             sl_price = self.strategy.calculate_sl(entry_price, last_candle, signal)
             tp_price = self.strategy.calculate_tp(entry_price, qty, eq_on_open, signal)
 
@@ -114,6 +150,10 @@ class TradingApp:
                     f"Apalancamiento: x{leverage}"
                 )
                 await self.trader.set_position(order_result)
+                self._risk_usd_trade = abs(entry_price - sl_price) * qty
+                self._eq_on_open = eq_on_open
+                self._entry_ts = now_ts
+                self._bars_in_position = 0
 
         except Exception as e:
             logging.error(f"Error grave en el trading_loop: {e}", exc_info=True)
@@ -159,3 +199,73 @@ class TradingApp:
 
     def _generate_weekly_report(self):
         pass
+
+    # ===== Funding helpers (modo simulado) =====
+    def _load_funding_series(self, path: str):
+        import pandas as pd
+
+        df = pd.read_csv(path)
+        df.columns = [c.lower() for c in df.columns]
+        ts_col = "timestamp" if "timestamp" in df.columns else ("time" if "time" in df.columns else "date")
+        rate_col = "rate" if "rate" in df.columns else ("funding_rate" if "funding_rate" in df.columns else None)
+        if rate_col is None:
+            raise ValueError("Funding CSV debe tener 'rate' o 'funding_rate'.")
+        ts = pd.to_datetime(df[ts_col], utc=True, errors="coerce")
+        ser = pd.Series(df[rate_col].astype(float).values, index=ts).dropna()
+        self._funding_series = ser.sort_index()
+
+    def _funding_rate_at(self, ts):
+        ser = getattr(self, "_funding_series", None)
+        if ser is None:
+            return float(self.config.get("funding_default", 0.0))
+        idx = ser.index.searchsorted(ts)
+        if idx == 0:
+            return float(ser.iloc[0])
+        if idx >= len(ser):
+            return float(ser.iloc[-1])
+        prev_idx = idx - 1 if ser.index[idx] != ts else idx
+        return float(ser.iloc[prev_idx])
+
+    def _is_funding_bar(self, ts):
+        interval = int(self.config.get("funding_interval_hours", 8))
+        return (interval > 0) and (getattr(ts, "minute", 0) == 0) and (getattr(ts, "hour", 0) % interval == 0)
+
+    def _apply_funding_if_needed(self, now_ts, last_price, side, qty):
+        if str(self.config.get("trading_mode", "simulado")).lower() != "simulado":
+            return 0.0
+        if not self._is_funding_bar(now_ts):
+            return 0.0
+        rate = self._funding_rate_at(now_ts)
+        notional = qty * last_price
+        sign = -1 if side == "LONG" else +1
+        funding_pnl = sign * rate * notional
+        if hasattr(self.trader, "_balance"):
+            self.trader._balance += funding_pnl
+        try:
+            self._log_trade_event(now_ts, "FUNDING", side, last_price, qty, funding_pnl, note=f"rate={rate:.6f}")
+        except Exception:
+            pass
+        return funding_pnl
+
+    # ===== Daily R tracking =====
+    def _day_key(self, ts):
+        if isinstance(ts, pd.Timestamp):
+            if ts.tzinfo is not None:
+                return ts.tz_convert("UTC").floor("D")
+            return ts.tz_localize("UTC").floor("D")
+        return pd.Timestamp(ts).tz_localize("UTC").floor("D")
+
+    def _should_block_new_trade_today(self, now_ts):
+        daily_stop_R = float(self.config.get("daily_stop_R", 0.0) or 0.0)
+        if daily_stop_R <= 0:
+            return False
+        dkey = self._day_key(now_ts)
+        return self._daily_R.get(dkey, 0.0) <= -daily_stop_R
+
+    def _register_close_R(self, now_ts, trade_pnl):
+        risk = max(1e-12, getattr(self, "_risk_usd_trade", 0.0))
+        if risk <= 0:
+            return
+        R = trade_pnl / risk
+        dkey = self._day_key(now_ts)
+        self._daily_R[dkey] = self._daily_R.get(dkey, 0.0) + R
