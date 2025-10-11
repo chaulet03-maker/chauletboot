@@ -392,9 +392,39 @@ async def estado_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def rendimiento_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    engine = _get_engine_from_context(context)
-    text = _build_rendimiento_text(engine)
-    await _reply_chunks(update, text)
+    """Calcula y envía las estadísticas de rendimiento desde la base de datos."""
+    engine = context.application.user_data['engine']
+    db_path = engine.db_path # Obtenemos la ruta de la DB desde el motor
+
+    try:
+        with sqlite3.connect(db_path) as conn:
+            cursor = conn.cursor()
+            # Hacemos una única consulta para obtener todos los datos
+            cursor.execute("SELECT COUNT(*), SUM(pnl), SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END) FROM trades")
+            total_trades, total_pnl, wins = cursor.fetchone()
+
+        if total_trades == 0:
+            reply_text = "Aún no hay operaciones completadas en el historial."
+        else:
+            total_pnl = total_pnl or 0
+            wins = wins or 0
+            losses = total_trades - wins
+            winrate = (wins / total_trades) * 100 if total_trades > 0 else 0
+
+            reply_text = (
+                f"**Rendimiento Histórico (Base de Datos)**\n"
+                f"----------------------------------\n"
+                f"📈 **Trades Totales:** {total_trades}\n"
+                f"✅ **Ganadas:** {wins}\n"
+                f"❌ **Perdidas:** {losses}\n"
+                f"🎯 **Winrate:** {winrate:.2f}%\n"
+                f"💰 **PNL Neto Total:** {total_pnl:+.2f} USD"
+            )
+
+    except Exception as e:
+        reply_text = f"Error al leer la base de datos de rendimiento: {e}"
+
+    await update.message.reply_text(reply_text, parse_mode='MarkdownV2')
 
 
 async def cerrar_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -555,6 +585,10 @@ def setup_telegram_bot(engine_instance):
         return None
 
     application.bot_data["engine"] = engine_instance
+    try:
+        application.user_data["engine"] = engine_instance
+    except Exception:
+        pass
 
     text_filter = filters.TEXT & (~filters.COMMAND)
 
