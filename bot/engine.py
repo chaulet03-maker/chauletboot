@@ -139,7 +139,8 @@ class TradingApp:
             qty = (eq_on_open * leverage) / max(entry_price, 1e-12)
 
             sl_price = self.strategy.calculate_sl(entry_price, last_candle, signal)
-            tp_price = self.strategy.calculate_tp(entry_price, qty, equity_on_open=eq_on_open, side=signal)
+            side = signal
+            tp_price = self.strategy.calculate_tp(entry_price, qty, eq_on_open, side)
 
             order_result = await self.exchange.create_order(signal, qty, sl_price, tp_price)
 
