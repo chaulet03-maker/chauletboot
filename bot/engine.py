@@ -140,42 +140,27 @@ class TradingApp:
 
             signal = self.strategy.check_entry_signal(data)
             if not signal:
-                # Registrar motivo estimado (ATR gate, tendencia, sesiones, etc.)
+                # Registrar motivo real (incluye ATR alto si aplica)
                 try:
-                    from core.strategy import check_all_filters
-                    last_row = data.iloc[-1]  # última vela con indicadores
-                    side_pref = str(self.config.get("grid_side", "auto")).upper()
-                    sides = (["LONG", "SHORT"] if side_pref == "AUTO" else [side_pref])
-
-                    reason = None
-                    side_used = ""
-                    for s in sides:
-                        try:
-                            r = check_all_filters(last_row, self.config, s)
-                            if r:  # si algún filtro falla, lo usamos
-                                reason = r
-                                side_used = s
-                                break
-                        except Exception:
-                            pass
-
-                    code = "atr_gate" if (reason and "ATR%" in reason) else "pre_open_checks"
+                    side_used, code, detail = self.strategy.get_rejection_reason(data)
                     self.record_rejection(
                         symbol=self.config.get("symbol", ""),
-                        side=side_used or (sides[0] if sides else ""),
-                        code=code,
-                        detail=reason or "Sin detalle"
+                        side=(side_used or "").upper(),
+                        code=code or "pre_open_checks",
+                        detail=detail or "Sin detalle"
                     )
                 except Exception:
-                    # no impide el flujo normal si algo falla en el diagnóstico
+                    # si falla, igual seguimos sin romper el ciclo
                     pass
 
-                logging.info("No se encontraron señales de entrada válidas.")
-                if self.config.get("debug_signals", False):
+                # Opcional: debug legible al log si activaste debug_signals
+                if bool(self.config.get("debug_signals", False)):
                     try:
                         self.strategy.explain_signal(data)
                     except Exception as e:
                         self.logger.info(f"SIGNAL DEBUG fallo: {e}")
+
+                logging.info("No se encontraron señales de entrada válidas.")
                 return
 
             eq_now = await self.trader.get_balance(self.exchange)
