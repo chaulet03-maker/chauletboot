@@ -6,36 +6,45 @@ trading_mode: "simulado"
 
 # Estrategia principal
 entry_mode: "pullback_grid"
-timeframe: "1h" # Timeframe de operación
+timeframe: "1h"     # Timeframe de operación
 symbol: "BTC/USDT"
-balance: 1000 # Balance inicial para el modo simulado
+balance: 1000       # Balance inicial (para modo simulado)
+
+# Fees
+taker_fee: 0.0002
+maker_fee: 0.0002
 
 # ---------------------------------------------------
-# PARÁMETROS DE LA ESTRATEGIA GANADORA
-# (Clonados del simulador del 2025-10-10)
+# PARÁMETROS CLAVES (clonados del simulador que enviaste)
 # ---------------------------------------------------
-# Apalancamiento base (para tendencias débiles)
-leverage: 5
-
-# Parámetros del Grid
+# Pullback grid
 grid_step_atr: 0.32
 grid_span_atr: 3.0
+grid_anchor: "ema30"         # podés cambiar a "ema200_4h"
+grid_side: "auto"            # auto | long | short
 
-# Filtros de Tendencia
+# Filtros de tendencia y momentum
 rsi4h_gate: 56
 trend_filter: "ema200_4h"
 ema200_1h_confirm: true
 
-# Filtros de Volatilidad y Horario
+# Filtros de Volatilidad / Horario / Funding
 atrp_gate_min: 0.25
 atrp_gate_max: 1.25
 funding_gate_bps: 160
-ban_hours: [1]
+ban_hours: [1]               # UTC
 
-# Gestión de Riesgo y Posición
+# Gestión de Riesgo y Posición (equivalentes a tu CLI)
 max_hold_bars: 15
 daily_stop_R: 2.5
 emerg_trade_stop_R: 1.65
 size_mode: "full_equity"
-target_eq_pnl_pct: 0.10
 sl_atr_mult: 1.3
+
+# TP único a 10% del equity en la apertura
+target_eq_pnl_pct: 0.10
+
+# Apalancamiento dinámico según ADX 1h (x5 base / x10 con tendencia)
+leverage_base: 5.0
+leverage_strong: 10.0
+adx_strong_threshold: 25.0
