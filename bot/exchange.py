@@ -112,7 +112,7 @@ class Exchange:
         candidates = [base_symbol]
         if base_symbol.endswith('/USDT') and ':USDT' not in base_symbol:
             candidates.append(f"{base_symbol}:USDT")
-        stripped = base_symbol.replace('/', '')
+        stripped = base_symbol
         if stripped not in candidates:
             candidates.append(stripped)
 
