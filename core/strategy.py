@@ -1,3 +1,5 @@
+import logging
+
 import numpy as np
 import pandas as pd
 
@@ -125,3 +127,111 @@ class Strategy:
         if anchor == "ema30": return float(row.get("ema30", np.nan))
         if anchor == "ema200_4h": return float(row.get("ema200_4h", np.nan))
         return None
+
+    # --- DEBUG: explica por qué no hay señal en la última vela ---
+    def explain_signal(self, data: pd.DataFrame) -> None:
+        """
+        Loguea un snapshot de condiciones y qué filtro(s) bloquearon la entrada.
+        Se activa desde el engine si config.debug_signals = True.
+        """
+        log = logging.getLogger(__name__)
+        if len(data) == 0:
+            log.info("SIGNAL DEBUG: sin datos."); return
+        row = data.iloc[-1]
+        ts = data.index[-1]
+
+        try:
+            price = float(row.get("close", float("nan")))
+            ema200_4h = float(row.get("ema200_4h", float("nan")))
+            ema200_1h = float(row.get("ema200", float("nan")))
+            rsi4h = float(row.get("rsi4h", float("nan")))
+            atr = float(row.get("atr", float("nan")))
+            adx = float(row.get("adx", float("nan")))
+        except Exception:
+            log.info("SIGNAL DEBUG: fila inválida."); return
+
+        # Lado preferido por tendencia
+        side_pref = None
+        gate = float(self.config.get("rsi4h_gate", 52.0))
+        if np.isfinite(price) and np.isfinite(ema200_4h) and np.isfinite(rsi4h):
+            if (price > ema200_4h) and (rsi4h >= gate):
+                side_pref = "LONG"
+            elif (price < ema200_4h) and (rsi4h <= (100.0 - gate)):
+                side_pref = "SHORT"
+
+        # Grid geometry
+        anchor_name = str(self.config.get("grid_anchor", "ema30")).lower()
+        anchor = float(row.get("ema30" if anchor_name == "ema30" else "ema200_4h", float("nan")))
+        step = float(self.config.get("grid_step_atr", 0.32)) * (atr if np.isfinite(atr) else 0.0)
+        span = float(self.config.get("grid_span_atr", 3.0)) * (atr if np.isfinite(atr) else 0.0)
+
+        # ATR%
+        atrp = (atr / price * 100.0) if (np.isfinite(atr) and np.isfinite(price) and price > 0) else float("nan")
+
+        # Funding gate runtime (si está presente)
+        gate_bps = self.config.get("funding_gate_bps", None)
+        r_dec = self.config.get("_funding_rate_now", None)
+        r_bps = self.config.get("_funding_rate_bps_now", None)
+        if r_dec is None and r_bps is not None:
+            try:
+                r_dec = float(r_bps) / 10000.0
+            except Exception:
+                r_dec = None
+        g_frac = (float(gate_bps) / 10000.0) if gate_bps is not None else None
+
+        reasons = []
+
+        # Reglas de filtros (mismas que _passes_filters, pero explicadas)
+        # Tendencia 4h
+        if str(self.config.get("trend_filter", "ema200_4h")) == "ema200_4h" and np.isfinite(price) and np.isfinite(ema200_4h):
+            if side_pref == "LONG" and not (price > ema200_4h): reasons.append("trend: price<=ema200_4h")
+            if side_pref == "SHORT" and not (price < ema200_4h): reasons.append("trend: price>=ema200_4h")
+
+        # Confirmación EMA200 1h
+        if bool(self.config.get("ema200_1h_confirm", False)) and np.isfinite(price) and np.isfinite(ema200_1h):
+            if side_pref == "LONG" and not (price > ema200_1h): reasons.append("confirm: price<=ema200_1h")
+            if side_pref == "SHORT" and not (price < ema200_1h): reasons.append("confirm: price>=ema200_1h")
+
+        # RSI4h gate
+        if np.isfinite(rsi4h):
+            if side_pref == "LONG" and not (rsi4h >= gate): reasons.append(f"rsi4h<{gate}")
+            if side_pref == "SHORT" and not (rsi4h <= (100.0 - gate)): reasons.append(f"rsi4h>{100.0 - gate}")
+
+        # ATR% gates
+        minp = self.config.get("atrp_gate_min", None)
+        maxp = self.config.get("atrp_gate_max", None)
+        if minp is not None and np.isfinite(atrp) and atrp < float(minp): reasons.append(f"atrp<{minp}")
+        if maxp is not None and np.isfinite(atrp) and atrp > float(maxp): reasons.append(f"atrp>{maxp}")
+
+        # Ban hour UTC
+        ban_hours = set(self.config.get("ban_hours", []) or [])
+        if len(ban_hours) and int(getattr(ts, "hour", 0)) in ban_hours:
+            reasons.append(f"ban_hour={int(getattr(ts, 'hour', 0))}UTC")
+
+        # Funding gate
+        if (g_frac is not None) and (r_dec is not None) and side_pref is not None:
+            if (side_pref == "LONG" and r_dec > +g_frac) or (side_pref == "SHORT" and r_dec < -g_frac):
+                reasons.append(f"funding_gate side={side_pref} rate={r_dec:.6f} gate={g_frac:.6f}")
+
+        # Geometría del pullback
+        if side_pref == "LONG" and np.isfinite(anchor) and np.isfinite(step) and np.isfinite(span) and np.isfinite(price):
+            ok = (price < anchor) and ((anchor - price) >= step) and ((anchor - price) <= span)
+            if not ok: reasons.append("grid LONG: fuera de rango [step,span]")
+        if side_pref == "SHORT" and np.isfinite(anchor) and np.isfinite(step) and np.isfinite(span) and np.isfinite(price):
+            ok = (price > anchor) and ((price - anchor) >= step) and ((price - anchor) <= span)
+            if not ok: reasons.append("grid SHORT: fuera de rango [step,span]")
+
+        log.info(
+            "SIGNAL DEBUG ts=%s side_pref=%s price=%.2f anchor=%s step=%.2f span=%.2f atr=%.2f atrp=%.2f rsi4h=%.2f adx=%.2f ema200_4h=%.2f ema200_1h=%.2f funding_dec=%s gate_bps=%s reasons=%s",
+            str(ts), side_pref, price, ("%.2f" % anchor) if np.isfinite(anchor) else "nan",
+            step if np.isfinite(step) else 0.0, span if np.isfinite(span) else 0.0,
+            atr if np.isfinite(atr) else float("nan"),
+            atrp if np.isfinite(atrp) else float("nan"),
+            rsi4h if np.isfinite(rsi4h) else float("nan"),
+            adx if np.isfinite(adx) else float("nan"),
+            ema200_4h if np.isfinite(ema200_4h) else float("nan"),
+            ema200_1h if np.isfinite(ema200_1h) else float("nan"),
+            ("%.6f" % r_dec) if (r_dec is not None) else "None",
+            str(gate_bps) if (gate_bps is not None) else "None",
+            reasons or ["OK (si no hay señal, probablemente grid no se activó)"]
+        )
