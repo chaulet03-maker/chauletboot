@@ -1,6 +1,7 @@
 import logging
 import asyncio
 from collections import deque
+from contextlib import suppress
 import pandas as pd
 import schedule
 from telegram.ext import ContextTypes
@@ -27,11 +28,12 @@ class TradingApp:
         self.rejection_log = deque(maxlen=10)
         self.telegram_app = setup_telegram_bot(self)
         self.notifier = Notifier(application=self.telegram_app, cfg=self.config)
+        self._fallback_task = None
         
         # La programación de reportes de 'schedule' se gestionará dentro del bucle principal
         logging.info("Componentes inicializados.")
 
-    async def trading_loop(self, context: ContextTypes.DEFAULT_TYPE):
+    async def trading_loop(self, context: ContextTypes.DEFAULT_TYPE | None = None):
         """
         El bucle principal de trading. Ahora es llamado periódicamente
         por la JobQueue del bot de Telegram.
@@ -63,17 +65,37 @@ class TradingApp:
         Inicia el bot de Telegram y programa el bucle de trading para que se
         ejecute repetidamente a través de la JobQueue de Telegram.
         """
-        job_queue = self.telegram_app.job_queue
-        
-        # Programamos el bucle de trading para que se ejecute cada 60 segundos
-        # 'first=1' hace que se ejecute casi inmediatamente la primera vez
-        job_queue.run_repeating(self.trading_loop, interval=60, first=1)
-        
-        logging.info("Bucle de trading programado en la JobQueue.")
+        job_queue = getattr(self.telegram_app, "job_queue", None)
+
+        if job_queue is not None:
+            # Programamos el bucle de trading para que se ejecute cada 60 segundos
+            # 'first=1' hace que se ejecute casi inmediatamente la primera vez
+            job_queue.run_repeating(self.trading_loop, interval=60, first=1)
+            logging.info("Bucle de trading programado en la JobQueue.")
+        else:
+            logging.warning(
+                "JobQueue no está disponible; se utilizará un lazo asincrónico "
+                "de respaldo para ejecutar el ciclo de trading."
+            )
+
+            async def _fallback_loop():
+                await asyncio.sleep(1)
+                while True:
+                    await self.trading_loop(None)
+                    await asyncio.sleep(60)
+
+            self._fallback_task = asyncio.create_task(_fallback_loop())
+
         await self.notifier.send("✅ **Bot iniciado y corriendo.**")
-        
-        # Inicia el bot de Telegram (esto bloquea el hilo principal y lo mantiene vivo)
-        await self.telegram_app.run_polling()
+
+        try:
+            # Inicia el bot de Telegram (esto bloquea el hilo principal y lo mantiene vivo)
+            await self.telegram_app.run_polling()
+        finally:
+            if self._fallback_task is not None:
+                self._fallback_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await self._fallback_task
 
     # Aquí van las demás funciones (_init_db, _persist_trade, reports, etc.)
     def _init_db(self):
