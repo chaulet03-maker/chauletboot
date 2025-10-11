@@ -17,6 +17,7 @@ from core.indicators import add_indicators
 class TradingApp:
     def __init__(self, cfg):
         self.config = cfg
+        self.logger = logging.getLogger(__name__)
         self._init_db()
         self.trader = Trader(cfg)
         self.exchange = Exchange(cfg)
@@ -120,6 +121,11 @@ class TradingApp:
             signal = self.strategy.check_entry_signal(data)
             if not signal:
                 logging.info("No se encontraron señales de entrada válidas.")
+                if self.config.get("debug_signals", False):
+                    try:
+                        self.strategy.explain_signal(data)
+                    except Exception as e:
+                        self.logger.info(f"SIGNAL DEBUG fallo: {e}")
                 return
 
             eq_now = await self.trader.get_balance(self.exchange)
