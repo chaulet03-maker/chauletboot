@@ -140,20 +140,18 @@ class TradingApp:
 
             signal = self.strategy.check_entry_signal(data)
             if not signal:
-                # Registrar motivo real (incluye ATR alto si aplica)
                 try:
-                    side_used, code, detail = self.strategy.get_rejection_reason(data)
+                    code, detail, extras = self.strategy.get_rejection_reason(data)
+                    item_detail = detail if not extras else f"{detail} | {extras}"
                     self.record_rejection(
                         symbol=self.config.get("symbol", ""),
-                        side=(side_used or "").upper(),
+                        side=str(self.config.get("grid_side", "auto")).upper(),
                         code=code or "pre_open_checks",
-                        detail=detail or "Sin detalle"
+                        detail=item_detail or "Sin detalle"
                     )
                 except Exception:
-                    # si falla, igual seguimos sin romper el ciclo
                     pass
 
-                # Opcional: debug legible al log si activaste debug_signals
                 if bool(self.config.get("debug_signals", False)):
                     try:
                         self.strategy.explain_signal(data)
