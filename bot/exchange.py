@@ -106,6 +106,39 @@ class Exchange:
         await asyncio.to_thread(self.client.set_leverage, leverage, sym)
         logging.info("Apalancamiento establecido en x%s para %s", leverage, sym)
 
+    async def get_current_funding_rate_bps(self, symbol: Optional[str] = None) -> Optional[float]:
+        """Obtiene el funding rate actual expresado en basis points."""
+        base_symbol = symbol or self.config.get('symbol', 'BTC/USDT')
+        candidates = [base_symbol]
+        if base_symbol.endswith('/USDT') and ':USDT' not in base_symbol:
+            candidates.append(f"{base_symbol}:USDT")
+        stripped = base_symbol.replace('/', '')
+        if stripped not in candidates:
+            candidates.append(stripped)
+
+        clients: List[Any] = []
+        if self.client is not None:
+            clients.append(self.client)
+        if self.public_client is not None and self.public_client is not self.client:
+            clients.append(self.public_client)
+
+        for candidate in candidates:
+            for client in clients:
+                try:
+                    fr = await asyncio.to_thread(client.fetch_funding_rate, candidate)
+                    if fr is None:
+                        continue
+                    rate = fr.get('fundingRate')
+                    if rate is None:
+                        continue
+                    rate = float(rate)
+                    return rate * 10000.0
+                except Exception:
+                    continue
+
+        logging.warning(f"No pude obtener funding rate para {base_symbol}")
+        return None
+
     async def create_order(self, side: str, quantity: float, sl_price: float, tp_price: float, symbol: Optional[str] = None) -> Dict[str, Any]:
         """Crea una nueva orden de mercado con SL y TP (simulada por ahora)."""
         if symbol is None:

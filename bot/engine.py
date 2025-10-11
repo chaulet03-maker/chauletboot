@@ -72,6 +72,12 @@ class TradingApp:
             df_1h.set_index('timestamp', inplace=True)
             df_4h.set_index('timestamp', inplace=True)
 
+            current_funding_bps = await self.exchange.get_current_funding_rate_bps(self.config.get('symbol'))
+            if current_funding_bps is not None:
+                self.config["_funding_rate_bps_now"] = current_funding_bps
+            else:
+                self.config.pop("_funding_rate_bps_now", None)
+
             data = add_indicators(df_1h, df_4h)
             last_candle = data.iloc[-1]
 
