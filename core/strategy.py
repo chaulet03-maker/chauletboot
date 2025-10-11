@@ -45,6 +45,7 @@ class Strategy:
         return entry_price - (atr * sl_mult) if side == "LONG" else entry_price + (atr * sl_mult)
 
     def calculate_tp(self, entry_price: float, quantity: float, equity_on_open: float, side: str) -> float:
+        # Idéntico al simulador:
         # move = (target_eq_pnl_pct * equity_on_open) / qty
         tp_pct = float(self.config.get("target_eq_pnl_pct", 0.10))
         pnl_target = equity_on_open * tp_pct
@@ -86,11 +87,19 @@ class Strategy:
         if len(ban_hours) and int(getattr(ts, "hour", 0)) in ban_hours: return False
 
         gate_bps = self.config.get("funding_gate_bps", None)
-        cur_bps = self.config.get("_funding_rate_bps_now", None)
-        if gate_bps is not None and cur_bps is not None:
-            g = float(gate_bps); r = float(cur_bps)
-            if side == "LONG" and not (r <= g): return False
-            if side == "SHORT" and not (r >= -g): return False
+        if gate_bps is not None:
+            g_frac = float(gate_bps) / 10000.0
+            rate_dec = self.config.get("_funding_rate_now", None)
+            rate_bps = self.config.get("_funding_rate_bps_now", None)
+            if rate_dec is None and rate_bps is not None:
+                try:
+                    rate_dec = float(rate_bps) / 10000.0
+                except Exception:
+                    rate_dec = None
+            if rate_dec is not None:
+                r = float(rate_dec)
+                if (side == "LONG" and r > +g_frac) or (side == "SHORT" and r < -g_frac):
+                    return False
 
         return True
 
