@@ -7,10 +7,11 @@ symbol: "BTC/USDT"
 taker_fee: 0.0002
 maker_fee: 0.0002
 
-# grid
+# Grid / anchor
 grid_step_atr: 0.32
 grid_span_atr: 3.0
 grid_anchor: "ema30"
+anchor_bias_frac: 0.5     # 50% hacia el close (1.0 = sin sesgo)
 grid_side: "auto"
 
 # filtros
