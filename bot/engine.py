@@ -1,6 +1,7 @@
 import logging
 import time
 import threading
+import sqlite3
 import pandas as pd
 from collections import deque
 import schedule
@@ -19,6 +20,7 @@ from core.indicators import add_indicators
 class TradingApp:
     def __init__(self, cfg):
         self.config = cfg
+        self._init_db()
         self.trader = Trader(cfg)
         self.exchange = Exchange(cfg)
         self.storage = Storage(cfg)
@@ -74,7 +76,14 @@ class TradingApp:
                 # 1. ¿Hay posición abierta? Si sí, gestionarla.
                 position = self.trader.check_open_position()
                 if position:
-                    self.strategy.manage_position(position)
+                    closed_trade = self.strategy.manage_position(position)
+                    if isinstance(closed_trade, dict) and {
+                        "close_timestamp",
+                        "side",
+                        "pnl",
+                        "note",
+                    }.issubset(closed_trade.keys()):
+                        self._persist_trade(closed_trade)
                     time.sleep(60) # Espera 1 minuto antes de volver a chequear
                     continue
 
@@ -130,7 +139,42 @@ class TradingApp:
                 logging.error(f"Error inesperado en el bucle principal: {e}")
                 self.notifier.send(f"💥 **Error inesperado en el bot:** {e}")
                 time.sleep(300) # Espera 5 minutos ante un error desconocido
-    
+
+    def _init_db(self):
+        """Crea la tabla de trades en la base de datos si no existe."""
+        self.db_path = "trades_history.db" # La DB se guardará en la carpeta raíz
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS trades (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    close_timestamp TEXT NOT NULL,
+                    side TEXT,
+                    pnl REAL,
+                    note TEXT
+                )
+                """
+            )
+            conn.commit()
+
+    def _persist_trade(self, trade_data):
+        """Guarda los detalles de una operación cerrada en la base de datos."""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                conn.execute(
+                    "INSERT INTO trades (close_timestamp, side, pnl, note) VALUES (?, ?, ?, ?)",
+                    (
+                        trade_data['close_timestamp'],
+                        trade_data['side'],
+                        trade_data['pnl'],
+                        trade_data['note'],
+                    )
+                )
+                conn.commit()
+            logging.info("Trade cerrado guardado en la base de datos.")
+        except Exception as e:
+            logging.error(f"Error al guardar trade en la base de datos: {e}")
+
     # Aquí irían las funciones _generate_daily_report y _generate_weekly_report
     def _generate_daily_report(self):
         # ... tu código para los reportes ...
