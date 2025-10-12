@@ -5,13 +5,16 @@ import sqlite3
 import re
 import inspect
 from collections import deque
-from datetime import datetime, timedelta, time as dtime
+from datetime import datetime, timedelta, time as dtime, timezone
 from zoneinfo import ZoneInfo
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import pandas as pd
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
+
+from logging_setup import LOG_DIR, LOG_FILE
+from time_fmt import fmt_ar
 
 logger = logging.getLogger("telegram")
 
@@ -87,8 +90,44 @@ def _engine_logs_path(engine) -> str:
     persistence = cfg.get("persistence", {}) if isinstance(cfg, dict) else {}
     path = persistence.get("logs_file")
     if path:
+        path = os.path.expanduser(str(path))
+        if not os.path.isabs(path):
+            return os.path.join(LOG_DIR, os.path.basename(path))
         return path
-    return os.path.join("logs", "bot.log")
+    return LOG_FILE
+
+
+def _tail_log_file(path: str, limit: int) -> List[str]:
+    with open(path, "rb") as fh:
+        return [
+            line.decode("utf-8", errors="ignore").rstrip("\n")
+            for line in deque(fh, maxlen=limit)
+        ]
+
+
+def _tail_memory_logs(limit: int) -> List[str]:
+    root_logger = logging.getLogger()
+    buffer = getattr(root_logger, "_memh", None)
+    if buffer and getattr(buffer, "buf", None):
+        return list(buffer.buf)[-limit:]
+    return []
+
+
+def _format_local_timestamp(value) -> str:
+    if isinstance(value, datetime):
+        return fmt_ar(value)
+    if isinstance(value, (int, float)):
+        return fmt_ar(datetime.fromtimestamp(value, tz=timezone.utc))
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return ""
+        try:
+            normalized = text.replace("Z", "+00:00") if text.endswith("Z") else text
+            return fmt_ar(datetime.fromisoformat(normalized))
+        except Exception:
+            return text
+    return str(value)
 
 
 def _chunk_text(text: str, max_len: int = 3800) -> List[str]:
@@ -274,18 +313,21 @@ def _build_config_text(engine) -> str:
 
 
 def _read_logs_text(engine, limit: int = 15) -> str:
+    try:
+        n = max(int(limit or 15), 1)
+    except (TypeError, ValueError):
+        n = 15
     path = _engine_logs_path(engine)
     try:
-        if not os.path.exists(path):
-            return f"No encontré el archivo de logs ({path})."
-        with open(path, encoding="utf-8", errors="ignore") as f:
-            lines = [line.rstrip("\n") for line in f.readlines()]
+        if os.path.exists(path):
+            lines = _tail_log_file(path, n)
+        else:
+            lines = _tail_memory_logs(n)
         if not lines:
-            return "El archivo de logs está vacío."
-        tail = lines[-limit:]
-        return "📄 Últimos logs:\n" + "\n".join(tail)
+            return "📄 Últimos logs:\n(sin logs disponibles)"
+        return "📄 Últimos logs:\n" + "\n".join(lines)
     except Exception as exc:
-        return f"No pude leer los logs ({path}): {exc}"
+        return f"No pude leer los logs ({path}): {type(exc).__name__}: {exc}"
 
 
 def _set_killswitch(engine, enabled: bool) -> bool:
@@ -473,6 +515,7 @@ async def estado_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         now = datetime.now()
+        now_local_str = fmt_ar(datetime.now(timezone.utc))
         start_of_day = now - timedelta(hours=24)
         start_of_week = now - timedelta(days=7)
 
@@ -511,6 +554,7 @@ async def estado_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_text = (
             "**Estado de Cuenta Rápido**\n"
             "---------------------------\n"
+            f"Hora local: {now_local_str}\n"
             f"PNL Hoy (24h): ${pnl_day:+.2f}\n"
             f"PNL Semana (7d): ${pnl_week:+.2f}\n"
             f"Balance Actual: ${balance:,.2f}"
@@ -712,7 +756,8 @@ async def motivos_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     }
     for item in list(reversed(log))[:10]:
         if isinstance(item, dict):
-            iso  = item.get("iso") or item.get("ts") or ""
+            raw_ts = item.get("iso") or item.get("ts") or ""
+            ts_txt = _format_local_timestamp(raw_ts) if raw_ts else ""
             sym  = item.get("symbol") or ""
             side = item.get("side") or ""
             code = item.get("code") or item.get("reason") or ""
@@ -723,7 +768,10 @@ async def motivos_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     extra.append(f"{k[6:]}={v}")
             extra_txt = (" [" + ", ".join(extra) + "]") if extra else ""
             title = friendly.get(code, code)
-            lines.append(f"• {iso} — {sym} {side}: {title}" + (f" ({det})" if det else "") + extra_txt)
+            prefix = ts_txt or raw_ts or "-"
+            lines.append(
+                f"• {prefix} — {sym} {side}: {title}" + (f" ({det})" if det else "") + extra_txt
+            )
         else:
             lines.append(f"• {str(item)}")
 
