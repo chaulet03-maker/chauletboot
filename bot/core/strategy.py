@@ -1,11 +1,19 @@
+import logging
 from dataclasses import dataclass
-from typing import Dict, Iterable, Optional
+from datetime import datetime, timedelta, timezone
+from typing import Dict, Iterable, Optional, cast
 import math
 import numpy as np
 import pandas as pd
+
+from anchor_freezer import Side
+from deps import FREEZER
 from .market_regime import infer_regime  # acepta DF completo o una fila
 
 __all__ = ["Signal", "generate_signal", "check_all_filters", "_check_all_filters"]
+
+_log = logging.getLogger(__name__)
+_LAST_SIDE_PREF: Dict[str, Optional[str]] = {}
 
 @dataclass
 class Signal:
@@ -162,18 +170,79 @@ def _anchor_price(row: pd.Series, conf: Dict) -> Optional[float]:
 
     return float(raw)
 
+
+def _apply_anchor_freeze(
+    symbol: str,
+    side: Optional[str],
+    price: float,
+    anchor: float,
+    step: float,
+    span: float,
+):
+    if not symbol or side not in ("LONG", "SHORT"):
+        return anchor, step, span, "none"
+
+    side_literal = cast(Side, side)
+    now = datetime.now(timezone.utc)
+    anchor_used, step_used, span_used, status = FREEZER.apply(
+        symbol=symbol,
+        side=side_literal,
+        price=price,
+        anchor=anchor,
+        step=step,
+        span=span,
+        now=now,
+    )
+
+    if status == "armed":
+        expires_iso = (now.replace(microsecond=0) + timedelta(seconds=FREEZER.freeze_secs)).isoformat()
+        _log.info(
+            (
+                "Anchor FREEZE armado: sym=%s side=%s price=%.2f ≥ anchor+%.2f*step=%.2f; "
+                "congelo anchor=%.2f step=%.2f span=%.2f hasta=%s (UTC)"
+            ),
+            symbol,
+            side_literal,
+            price,
+            FREEZER.approach_ratio,
+            anchor + FREEZER.approach_ratio * step,
+            anchor_used,
+            step_used,
+            span_used,
+            expires_iso,
+        )
+    elif status == "active":
+        expires = FREEZER.expires_at(symbol, side_literal)
+        expires_iso = expires.replace(microsecond=0).isoformat() if expires else "desconocido"
+        _log.debug("Anchor FREEZE activo: sym=%s side=%s hasta=%s", symbol, side_literal, expires_iso)
+
+    return anchor_used, step_used, span_used, status
+
 def _signal_pullback_grid(row: pd.Series, conf: Dict) -> Optional[str]:
     atr = float(row.get("atr", np.nan))
     if not (np.isfinite(atr) and atr > 0):
         return None
 
     grid_side = str(conf.get("grid_side", "auto")).lower()
+    symbol_cfg = conf.get("symbol")
+    symbol = str(symbol_cfg) if symbol_cfg else ""
+    prev_side = _LAST_SIDE_PREF.get(symbol) if symbol else None
     if grid_side in ("long", "short"):
         side_pref = "LONG" if grid_side == "long" else "SHORT"
     else:
         side_pref = _decide_grid_side(row, conf)
         if side_pref is None:
+            if symbol and prev_side is not None:
+                for s in ("LONG", "SHORT"):
+                    FREEZER.clear(symbol, cast(Side, s))
+            if symbol:
+                _LAST_SIDE_PREF[symbol] = None
             return None
+
+    if side_pref != prev_side and symbol:
+        for s in ("LONG", "SHORT"):
+            FREEZER.clear(symbol, cast(Side, s))
+        _LAST_SIDE_PREF[symbol] = side_pref
 
     anchor = _anchor_price(row, conf)
     if anchor is None:
@@ -184,14 +253,16 @@ def _signal_pullback_grid(row: pd.Series, conf: Dict) -> Optional[str]:
         return None
 
     step = float(conf.get("grid_step_atr", 0.6)) * atr
-    half_span = float(conf.get("grid_span_atr", 2.5)) * atr
+    span = float(conf.get("grid_span_atr", 2.5)) * atr
+
+    anchor_used, step_used, span_used, _ = _apply_anchor_freeze(symbol, side_pref, price, anchor, step, span)
 
     if side_pref == "LONG":
-        if (price < anchor) and (anchor - price >= step) and (anchor - price <= half_span):
+        if (price < anchor_used) and (anchor_used - price >= step_used) and (anchor_used - price <= span_used):
             row["_side_pref"] = "LONG"
             return "LONG"
     else:
-        if (price > anchor) and (price - anchor >= step) and (price - anchor <= half_span):
+        if (price > anchor_used) and (price - anchor_used >= step_used) and (price - anchor_used <= span_used):
             row["_side_pref"] = "SHORT"
             return "SHORT"
     return None

@@ -1,11 +1,20 @@
 import logging
+from datetime import datetime, timedelta, timezone
+from typing import cast
 
 import numpy as np
 import pandas as pd
 
+from anchor_freezer import Side
+from deps import FREEZER
+
 class Strategy:
     def __init__(self, cfg):
         self.config = cfg
+        self.log = logging.getLogger(__name__)
+        self._last_side_pref: str | None = None
+        symbol_cfg = self.config.get("symbol")
+        self._symbol = str(symbol_cfg) if symbol_cfg else ""
 
     # Señal de entrada (pullback_grid) + filtros
     def check_entry_signal(self, data: pd.DataFrame) -> str | None:
@@ -16,7 +25,16 @@ class Strategy:
 
         side_pref = self._decide_grid_side(row)
         if side_pref is None:
+            if self._last_side_pref is not None and self._symbol:
+                for s in ("LONG", "SHORT"):
+                    FREEZER.clear(self._symbol, cast(Side, s))
+            self._last_side_pref = None
             return None
+        if side_pref != self._last_side_pref:
+            if self._symbol:
+                for s in ("LONG", "SHORT"):
+                    FREEZER.clear(self._symbol, cast(Side, s))
+            self._last_side_pref = side_pref
         if not self._passes_filters(row, ts, side_pref):
             return None
 
@@ -30,13 +48,15 @@ class Strategy:
 
         price = float(row["close"])
         step = float(self.config.get("grid_step_atr", 0.32)) * atr
-        half_span = float(self.config.get("grid_span_atr", 3.0)) * atr
+        span = float(self.config.get("grid_span_atr", 3.0)) * atr
+
+        anchor_used, step_used, span_used, _ = self._apply_anchor_freeze(side_pref, price, anchor, step, span)
 
         if side_pref == "LONG":
-            if (price < anchor) and (anchor - price >= step) and (anchor - price <= half_span):
+            if (price < anchor_used) and (anchor_used - price >= step_used) and (anchor_used - price <= span_used):
                 return "LONG"
         else:
-            if (price > anchor) and (price - anchor >= step) and (price - anchor <= half_span):
+            if (price > anchor_used) and (price - anchor_used >= step_used) and (price - anchor_used <= span_used):
                 return "SHORT"
         return None
 
@@ -193,15 +213,23 @@ class Strategy:
         step = float(self.config.get("grid_step_atr", 0.32)) * (atr if np.isfinite(atr) else 0.0)
         span = float(self.config.get("grid_span_atr", 3.0)) * (atr if np.isfinite(atr) else 0.0)
 
+        anchor_used, step_used, span_used, _ = self._apply_anchor_freeze(
+            side_out if np.isfinite(anchor) and np.isfinite(step) and np.isfinite(span) else None,
+            price,
+            anchor,
+            step,
+            span,
+        )
+
         if not np.isfinite(anchor):
             reasons.append(("anchor_missing", f"Anchor '{anchor_name}' no disponible"))
-        elif np.isfinite(price) and np.isfinite(step) and np.isfinite(span):
+        elif np.isfinite(price) and np.isfinite(step_used) and np.isfinite(span_used):
             if side_out == "LONG":
-                ok = (price < anchor) and ((anchor - price) >= step) and ((anchor - price) <= span)
+                ok = (price < anchor_used) and ((anchor_used - price) >= step_used) and ((anchor_used - price) <= span_used)
                 if not ok:
                     reasons.append(("grid_out_of_range", "Grid LONG fuera de [step,span]"))
             else:
-                ok = (price > anchor) and ((price - anchor) >= step) and ((price - anchor) <= span)
+                ok = (price > anchor_used) and ((price - anchor_used) >= step_used) and ((price - anchor_used) <= span_used)
                 if not ok:
                     reasons.append(("grid_out_of_range", "Grid SHORT fuera de [step,span]"))
 
@@ -251,6 +279,58 @@ class Strategy:
             return float(price + k * (float(raw) - price))
 
         return float(raw)
+
+    def _apply_anchor_freeze(
+        self,
+        side: str | None,
+        price: float,
+        anchor: float,
+        step: float,
+        span: float,
+    ) -> tuple[float, float, float, str]:
+        if not self._symbol or side not in ("LONG", "SHORT"):
+            return anchor, step, span, "none"
+
+        side_literal = cast(Side, side)
+        now = datetime.now(timezone.utc)
+        anchor_used, step_used, span_used, status = FREEZER.apply(
+            symbol=self._symbol,
+            side=side_literal,
+            price=price,
+            anchor=anchor,
+            step=step,
+            span=span,
+            now=now,
+        )
+
+        if status == "armed":
+            expires_iso = (now.replace(microsecond=0) + timedelta(seconds=FREEZER.freeze_secs)).isoformat()
+            self.log.info(
+                (
+                    "Anchor FREEZE armado: sym=%s side=%s price=%.2f ≥ anchor+%.2f*step=%.2f; "
+                    "congelo anchor=%.2f step=%.2f span=%.2f hasta=%s (UTC)"
+                ),
+                self._symbol,
+                side_literal,
+                price,
+                FREEZER.approach_ratio,
+                anchor + FREEZER.approach_ratio * step,
+                anchor_used,
+                step_used,
+                span_used,
+                expires_iso,
+            )
+        elif status == "active":
+            expires = FREEZER.expires_at(self._symbol, side_literal)
+            expires_iso = expires.replace(microsecond=0).isoformat() if expires else "desconocido"
+            self.log.debug(
+                "Anchor FREEZE activo: sym=%s side=%s hasta=%s",
+                self._symbol,
+                side_literal,
+                expires_iso,
+            )
+
+        return anchor_used, step_used, span_used, status
 
     # --- DEBUG: explica por qué no hay señal en la última vela ---
     def explain_signal(self, data: pd.DataFrame) -> None:
@@ -303,6 +383,14 @@ class Strategy:
         step = float(self.config.get("grid_step_atr", 0.32)) * (atr if np.isfinite(atr) else 0.0)
         span = float(self.config.get("grid_span_atr", 3.0)) * (atr if np.isfinite(atr) else 0.0)
 
+        anchor_used, step_used, span_used, _ = self._apply_anchor_freeze(
+            side_pref if np.isfinite(anchor) and np.isfinite(step) and np.isfinite(span) else None,
+            price,
+            anchor,
+            step,
+            span,
+        )
+
         # ATR%
         atrp = (atr / price * 100.0) if (np.isfinite(atr) and np.isfinite(price) and price > 0) else float("nan")
 
@@ -352,19 +440,19 @@ class Strategy:
                 reasons.append(f"funding_gate side={side_pref} rate={r_dec:.6f} gate={g_frac:.6f}")
 
         # Geometría del pullback
-        if side_pref == "LONG" and np.isfinite(anchor) and np.isfinite(step) and np.isfinite(span) and np.isfinite(price):
-            ok = (price < anchor) and ((anchor - price) >= step) and ((anchor - price) <= span)
+        if side_pref == "LONG" and np.isfinite(anchor_used) and np.isfinite(step_used) and np.isfinite(span_used) and np.isfinite(price):
+            ok = (price < anchor_used) and ((anchor_used - price) >= step_used) and ((anchor_used - price) <= span_used)
             if not ok: reasons.append("grid LONG: fuera de rango [step,span]")
-        if side_pref == "SHORT" and np.isfinite(anchor) and np.isfinite(step) and np.isfinite(span) and np.isfinite(price):
-            ok = (price > anchor) and ((price - anchor) >= step) and ((price - anchor) <= span)
+        if side_pref == "SHORT" and np.isfinite(anchor_used) and np.isfinite(step_used) and np.isfinite(span_used) and np.isfinite(price):
+            ok = (price > anchor_used) and ((price - anchor_used) >= step_used) and ((price - anchor_used) <= span_used)
             if not ok: reasons.append("grid SHORT: fuera de rango [step,span]")
 
         log.info(
             "SIGNAL DEBUG ts=%s side_pref=%s price=%.2f anchor_raw=%s anchor=%s step=%.2f span=%.2f atr=%.2f atrp=%.2f rsi4h=%.2f adx=%.2f ema200_4h=%.2f ema200_1h=%.2f funding_dec=%s gate_bps=%s reasons=%s",
             str(ts), side_pref, price,
             ("%.2f" % anchor_raw) if np.isfinite(anchor_raw) else "nan",
-            ("%.2f" % anchor) if np.isfinite(anchor) else "nan",
-            step if np.isfinite(step) else 0.0, span if np.isfinite(span) else 0.0,
+            ("%.2f" % anchor_used) if np.isfinite(anchor_used) else "nan",
+            step_used if np.isfinite(step_used) else 0.0, span_used if np.isfinite(span_used) else 0.0,
             atr if np.isfinite(atr) else float("nan"),
             atrp if np.isfinite(atrp) else float("nan"),
             rsi4h if np.isfinite(rsi4h) else float("nan"),
