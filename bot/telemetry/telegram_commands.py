@@ -4,6 +4,7 @@ from telegram.ext import Application, MessageHandler, filters
 import unicodedata
 
 from trading import POSITION_SERVICE
+from config import S
 
 from .telegram_bot import (
     _build_config_text,
@@ -113,6 +114,27 @@ async def _cmd_positions_detail(engine, reply):
             )
             lines.append("")
     return await reply("\n".join(lines).strip())
+
+
+async def _cmd_precio(engine, reply, symbol: Optional[str] = None):
+    sym_default = "BTC/USDT"
+    cfg = getattr(engine, "config", None)
+    if isinstance(cfg, dict):
+        sym_default = cfg.get("symbol", sym_default)
+    sym = symbol or sym_default
+    try:
+        px = await engine.exchange.get_current_price(sym)
+    except Exception as exc:
+        log.debug("precio error para %s: %s", sym, exc)
+        px = None
+    if px is None:
+        return await reply("No pude obtener el precio.")
+    try:
+        if S.PAPER and POSITION_SERVICE:
+            POSITION_SERVICE.mark_to_market(float(px))
+    except Exception:
+        log.debug("No se pudo actualizar mark en PAPER desde /precio", exc_info=True)
+    return await reply(f"{sym}: ${float(px):,.2f}")
 
 
 async def _cmd_posicion(engine, reply):
@@ -464,17 +486,15 @@ class CommandBot:
         if msg.startswith("precio"):
             parts = msg.split()
             if len(parts) >= 2:
-                sym = parts[1].upper()
-                p = getattr(self.engine, "price_cache", {}).get(sym)
-                if p is not None:
-                    return await reply(f"{sym}: {_fmt_money(p)}")
-                return await reply(f"No tengo precio de {sym} todavía.")
-            # Sin símbolo: listar todos
-            cache = getattr(self.engine, "price_cache", {}) or {}
-            if not cache:
-                return await reply("Todavía no tengo precios en caché.")
-            listado = "\n".join(f"• {k}: {_fmt_money(v)}" for k, v in cache.items())
-            return await reply("Precios:\n" + listado)
+                token = parts[1].upper()
+                if token in {"TODO", "TODOS", "ALL"}:
+                    cache = getattr(self.engine, "price_cache", {}) or {}
+                    if not cache:
+                        return await reply("Todavía no tengo precios en caché.")
+                    listado = "\n".join(f"• {k}: {_fmt_money(v)}" for k, v in cache.items())
+                    return await reply("Precios:\n" + listado)
+                return await _cmd_precio(self.engine, reply, token)
+            return await _cmd_precio(self.engine, reply)
 
         if msg == "config":
             return await reply(_build_config_text(self.engine))
