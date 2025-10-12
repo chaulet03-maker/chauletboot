@@ -4,6 +4,8 @@ from typing import Any, Dict, List, Optional
 
 import ccxt
 
+from trading import place_order_safe
+
 
 class Exchange:
     def __init__(self, cfg):
@@ -146,19 +148,34 @@ class Exchange:
             return None
         return rate_dec * 10000.0
 
-    async def create_order(self, side: str, quantity: float, sl_price: float, tp_price: float, symbol: Optional[str] = None) -> Dict[str, Any]:
-        """Crea una nueva orden de mercado con SL y TP (simulada por ahora)."""
+    async def create_order(
+        self,
+        side: str,
+        quantity: float,
+        sl_price: float,
+        tp_price: float,
+        symbol: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Crea una orden pasando SIEMPRE por la ruta segura de trading."""
+
         if symbol is None:
             symbol = self.config.get('symbol', 'BTC/USDT')
 
-        logging.info("Creando orden %s para %s unidades de %s...", side, quantity, symbol)
-        # Aquí iría la lógica real de creación de orden con stop-loss y take-profit.
-        # Por ahora devolvemos una estructura simulada para mantener la compatibilidad.
-        return {
-            "status": "ok",
-            "side": side,
-            "quantity": quantity,
-            "symbol": symbol,
-            "sl": sl_price,
-            "tp": tp_price,
-        }
+        logging.info("Creando orden %s para %.6f unidades de %s...", side, quantity, symbol)
+
+        price = await self.get_current_price(symbol)
+        if price is None:
+            raise RuntimeError(f"No se pudo obtener precio para ejecutar la orden de {symbol}.")
+
+        order = await asyncio.to_thread(
+            place_order_safe,
+            side,
+            quantity,
+            float(price),
+            symbol=symbol,
+            sl=sl_price,
+            tp=tp_price,
+        )
+
+        logging.info("Orden ejecutada vía broker seguro: %s", order)
+        return order

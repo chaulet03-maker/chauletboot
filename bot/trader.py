@@ -2,15 +2,31 @@ import asyncio
 import logging
 from typing import Any, Dict, Optional
 
+from config import S
+from trading import BROKER
+
 
 class Trader:
     def __init__(self, cfg):
         self.config = cfg
-        self._balance = float(self.config.get('balance', 1000))
+        default_balance = float(self.config.get('balance', S.start_equity))
+        if S.PAPER:
+            try:
+                default_balance = float(getattr(BROKER, "equity", default_balance))
+            except Exception:
+                pass
+        self._balance = default_balance
         self._open_position: Optional[Dict[str, Any]] = None
 
     async def get_balance(self, exchange=None) -> float:
         """Devuelve el balance actual de la cuenta."""
+        if S.PAPER:
+            try:
+                self._balance = float(getattr(BROKER, "equity", self._balance))
+                return self._balance
+            except Exception:
+                pass
+
         if exchange and getattr(exchange, 'client', None):
             try:
                 balance = await asyncio.to_thread(exchange.client.fetch_balance)

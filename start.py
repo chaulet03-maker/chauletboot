@@ -1,22 +1,30 @@
 import os
-import yaml
 import logging
+from typing import Any, Dict
+
 from dotenv import load_dotenv
+
 from bot.engine import TradingApp
+from config import S, get_telegram_chat_id, get_telegram_token, load_raw_config
 from logging_setup import setup_logging
 
 def main():
     """Función principal que configura e inicia la aplicación."""
     load_dotenv()
-    with open('config.yaml', 'r') as f:
-        cfg = yaml.safe_load(f)
-        
-    cfg['telegram_token'] = os.getenv("TELEGRAM_TOKEN")
-    cfg['telegram_chat_id'] = os.getenv("TELEGRAM_CHAT_ID")
-    cfg['binance_api_key_real'] = os.getenv("BINANCE_API_KEY_REAL")
-    cfg['binance_api_secret_real'] = os.getenv("BINANCE_API_SECRET_REAL")
-    cfg['binance_api_key_test'] = os.getenv("BINANCE_API_KEY_TEST")
-    cfg['binance_api_secret_test'] = os.getenv("BINANCE_API_SECRET_TEST")
+    cfg: Dict[str, Any] = load_raw_config()
+    cfg.setdefault("trading_mode", S.trading_mode)
+    cfg.setdefault("mode", "paper" if S.PAPER else "real")
+    cfg.setdefault("start_equity", S.start_equity)
+
+    cfg["telegram_token"] = get_telegram_token(cfg.get("telegram_token"))
+    cfg["telegram_chat_id"] = get_telegram_chat_id(cfg.get("telegram_chat_id"))
+
+    if S.LIVE:
+        cfg["binance_api_key_real"] = S.binance_api_key or os.getenv("BINANCE_API_KEY_REAL")
+        cfg["binance_api_secret_real"] = S.binance_api_secret or os.getenv("BINANCE_API_SECRET_REAL")
+    else:
+        cfg["binance_api_key_test"] = os.getenv("BINANCE_API_KEY_TEST") or S.binance_api_key
+        cfg["binance_api_secret_test"] = os.getenv("BINANCE_API_SECRET_TEST") or S.binance_api_secret
     
     setup_logging()
 
