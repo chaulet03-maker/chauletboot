@@ -10,7 +10,20 @@ from paper_store import PaperStore
 
 logger = logging.getLogger(__name__)
 
-PAPER_STORE_PATH = Path(os.getenv("PAPER_STORE_PATH", "data/paper_state.json"))
+_RAW_DATA_DIR = Path(os.getenv("DATA_DIR", "/app/data")).expanduser()
+if not _RAW_DATA_DIR.is_absolute():
+    _RAW_DATA_DIR = (Path("/app") / _RAW_DATA_DIR).resolve()
+_RAW_DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+_raw_store_path = os.getenv("PAPER_STORE_PATH")
+if _raw_store_path:
+    candidate = Path(_raw_store_path)
+    if not candidate.is_absolute():
+        candidate = (_RAW_DATA_DIR / candidate).resolve()
+else:
+    candidate = (_RAW_DATA_DIR / "paper_state.json").resolve()
+
+PAPER_STORE_PATH = candidate
 
 ACTIVE_PAPER_STORE: PaperStore | None = None
 ACTIVE_LIVE_CLIENT: Any | None = None
