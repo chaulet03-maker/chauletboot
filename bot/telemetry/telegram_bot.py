@@ -4,6 +4,7 @@ import asyncio
 import sqlite3
 import re
 import inspect
+import time
 from collections import deque
 from datetime import datetime, timedelta, time as dtime, timezone
 from zoneinfo import ZoneInfo
@@ -12,11 +13,90 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 import pandas as pd
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
+from telegram.request import HTTPXRequest
 
 from logging_setup import LOG_DIR, LOG_FILE
 from time_fmt import fmt_ar
 
 logger = logging.getLogger("telegram")
+
+
+class TelegramLoggingRequest(HTTPXRequest):
+    def __init__(
+        self,
+        *args,
+        latency_warning_s: float = 1.0,
+        summary_interval_s: float = 60.0,
+        **kwargs,
+    ):
+        super().__init__(*args, **kwargs)
+        self._latency_warning_s = max(latency_warning_s, 0.0)
+        self._summary_interval_s = max(summary_interval_s, 0.0)
+        self._log = logging.getLogger("telegram.http")
+        self._ok_count = 0
+        self._err_count = 0
+        self._summary_started = time.monotonic()
+
+    @staticmethod
+    def _method_from_url(url: str) -> str:
+        if not url:
+            return ""
+        return url.rstrip("/").split("/")[-1]
+
+    def _bump_summary(self, ok: bool) -> None:
+        if ok:
+            self._ok_count += 1
+        else:
+            self._err_count += 1
+        if self._summary_interval_s <= 0:
+            return
+        now = time.monotonic()
+        if now - self._summary_started >= self._summary_interval_s:
+            self._log.info("tg_api/min ok=%d err=%d", self._ok_count, self._err_count)
+            self._ok_count = 0
+            self._err_count = 0
+            self._summary_started = now
+
+    def _log_response(self, method: str, status: int, elapsed_s: float) -> None:
+        latency_ms = elapsed_s * 1000
+        if status == 200 and elapsed_s <= self._latency_warning_s:
+            self._log.debug(
+                "tg_api method=%s status=%s latency_ms=%.0f", method, status, latency_ms
+            )
+            return
+
+        level = logging.WARNING
+        if status == 429 or status >= 500:
+            level = logging.ERROR
+
+        self._log.log(
+            level,
+            "tg_api method=%s status=%s latency_ms=%.0f",
+            method,
+            status,
+            latency_ms,
+        )
+
+    async def do_request(self, url: str, method: str, *args, **kwargs):  # type: ignore[override]
+        tg_method = self._method_from_url(url)
+        start = time.perf_counter()
+        try:
+            status, payload = await super().do_request(url, method, *args, **kwargs)
+        except Exception as exc:
+            elapsed = time.perf_counter() - start
+            self._log.error(
+                "tg_api method=%s error=%s latency_ms=%.0f",
+                tg_method,
+                exc.__class__.__name__,
+                elapsed * 1000,
+            )
+            self._bump_summary(False)
+            raise
+        elapsed = time.perf_counter() - start
+        self._log_response(tg_method, status, elapsed)
+        self._bump_summary(status == 200)
+        return status, payload
+
 
 # =========================
 # Utils de formato
@@ -24,6 +104,17 @@ logger = logging.getLogger("telegram")
 def _env(key, default=None):
     v = os.getenv(key, default)
     return v
+
+
+def _first_float(*candidates, default: float) -> float:
+    for value in candidates:
+        if value is None:
+            continue
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            continue
+    return default
 
 def _fmt_num(x, nd=2):
     try:
@@ -798,8 +889,27 @@ def setup_telegram_bot(engine_instance):
         logger.warning("No TELEGRAM_TOKEN provided; Telegram disabled")
         return None
 
+    latency_warn_s = _first_float(
+        tconf.get("latency_warn_s"),
+        tconf.get("latency_warn_seconds"),
+        _env("TELEGRAM_LATENCY_WARN_S"),
+        default=1.0,
+    )
+    summary_interval_s = _first_float(
+        tconf.get("log_summary_interval_s"),
+        tconf.get("log_summary_s"),
+        _env("TELEGRAM_LOG_SUMMARY_S"),
+        default=60.0,
+    )
+
+    request = TelegramLoggingRequest(
+        latency_warning_s=latency_warn_s,
+        summary_interval_s=summary_interval_s,
+    )
+
     try:
-        application = Application.builder().token(token).build()
+        builder = Application.builder().token(token).request(request)
+        application = builder.build()
     except Exception as exc:
         logger.warning("Telegram application init failed: %s", exc)
         return None
