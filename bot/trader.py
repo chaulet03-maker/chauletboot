@@ -3,7 +3,7 @@ import logging
 from typing import Any, Dict, Optional
 
 from config import S
-from trading import BROKER
+from trading import BROKER, POSITION_SERVICE
 
 
 class Trader:
@@ -40,10 +40,36 @@ class Trader:
         return self._balance
 
     async def check_open_position(self, exchange=None) -> Optional[Dict[str, Any]]:
-        """Revisa si hay una posición abierta."""
+        """
+        Devuelve la posición abierta (si la hay) y cachea el resultado.
+        En PAPER lee de PositionService (paper store). En LIVE consulta exchange/ccxt.
+        """
+
+        # 1) PAPER: leer del PositionService (persistente)
+        if S.PAPER and POSITION_SERVICE is not None:
+            try:
+                st = POSITION_SERVICE.get_status()
+                side = (st.get("side") or "FLAT").upper()
+                if side != "FLAT":
+                    self._open_position = {
+                        "symbol": st.get("symbol", self.config.get("symbol", "BTC/USDT")),
+                        "side": side,
+                        "contracts": st.get("qty") or st.get("size") or 0.0,
+                        "entryPrice": st.get("entry_price") or 0.0,
+                        "markPrice": st.get("mark") or 0.0,
+                    }
+                    return self._open_position
+                self._open_position = None
+            except Exception as exc:
+                logging.debug("PAPER check_open_position fallo: %s", exc)
+
+        # 2) LIVE: si tenemos exchange, tratemos de obtener la posición real
         if exchange and getattr(exchange, 'client', None):
             try:
-                positions = await asyncio.to_thread(exchange.client.fetch_positions, [self.config.get('symbol', 'BTC/USDT')])
+                positions = await asyncio.to_thread(
+                    exchange.client.fetch_positions,
+                    [self.config.get('symbol', 'BTC/USDT')]
+                )
                 if positions:
                     self._open_position = positions[0]
                     return self._open_position

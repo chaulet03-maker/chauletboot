@@ -18,7 +18,7 @@ from telegram.request import HTTPXRequest
 from logging_setup import LOG_DIR, LOG_FILE
 from time_fmt import fmt_ar
 from config import S
-from trading import BROKER
+from trading import BROKER, POSITION_SERVICE
 
 logger = logging.getLogger("telegram")
 
@@ -549,6 +549,39 @@ def _get_engine_from_context(context: ContextTypes.DEFAULT_TYPE):
     return app.bot_data.get("engine")
 
 
+def _default_symbol(engine) -> str:
+    try:
+        cfg = getattr(engine, "config", None)
+        if isinstance(cfg, dict):
+            return cfg.get("symbol", "BTC/USDT")
+    except Exception:
+        pass
+    return "BTC/USDT"
+
+
+def _position_status_message(engine) -> str:
+    symbol_default = _default_symbol(engine)
+    try:
+        st = POSITION_SERVICE.get_status() if POSITION_SERVICE else None
+    except Exception as exc:
+        logger.debug("posicion/status error: %s", exc)
+        st = None
+    if not st or (st.get("side", "FLAT").upper() == "FLAT"):
+        return f"Estado Actual: Sin posición\n----------------\nSímbolo: {symbol_default}"
+    side = (st.get("side") or "").upper()
+    symbol = st.get("symbol", symbol_default)
+    entry_price = float(st.get("entry_price", 0.0) or 0.0)
+    pnl = float(st.get("pnl", 0.0) or 0.0)
+    return (
+        "Estado Actual: Posición Abierta\n"
+        "----------------\n"
+        f"Símbolo: {symbol}\n"
+        f"Lado: {side}\n"
+        f"Precio de Entrada: ${entry_price:.2f}\n"
+        f"PNL Actual: ${pnl:+.2f}\n"
+    )
+
+
 async def posicion_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.effective_message
     if message is None:
@@ -559,40 +592,8 @@ async def posicion_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await message.reply_text("No pude acceder al engine para consultar la posición.")
         return
 
-    trader = getattr(engine, "trader", None)
-    if trader is None or not hasattr(trader, "check_open_position"):
-        await message.reply_text("No hay un trader disponible para consultar posiciones.")
-        return
-
-    try:
-        result = trader.check_open_position(getattr(engine, "exchange", None))
-        position = await result if inspect.isawaitable(result) else result
-    except Exception as exc:
-        await message.reply_text(f"Error al consultar la posición: {exc}")
-        return
-
-    if position:
-        pnl = float(position.get("unrealizedPnl", 0) or 0)
-        entry_price = float(position.get("entryPrice", 0) or 0)
-        side = (position.get("side") or "N/A").upper()
-        symbol = position.get("symbol", "N/A")
-
-        reply_text = (
-            "**Estado Actual: Posición Abierta**\n"
-            "---------------------------------\n"
-            f"Símbolo: {symbol}\n"
-            f"Lado: {side}\n"
-            f"Precio de Entrada: ${entry_price:,.2f}\n"
-            f"PNL Actual: ${pnl:+.2f}"
-        )
-    else:
-        reply_text = (
-            "**Estado Actual: Esperando Señal**\n"
-            "---------------------------------\n"
-            "No hay ninguna posición abierta en este momento."
-        )
-
-    await message.reply_text(reply_text, parse_mode="Markdown")
+    reply_text = _position_status_message(engine)
+    await message.reply_text(reply_text)
 
 
 async def estado_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -652,18 +653,21 @@ async def estado_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception:
                 balance = 0.0
 
-        reply_text = (
-            "**Estado de Cuenta Rápido**\n"
-            "---------------------------\n"
-            f"Hora local: {now_local_str}\n"
-            f"PNL Hoy (24h): ${pnl_day:+.2f}\n"
-            f"PNL Semana (7d): ${pnl_week:+.2f}\n"
-            f"Balance Actual: ${balance:,.2f}"
-        )
+        estado_lineas = [
+            _position_status_message(engine),
+            "",
+            "Estado de Cuenta Rápido",
+            "---------------------------",
+            f"Hora local: {now_local_str}",
+            f"PNL Hoy (24h): ${pnl_day:+.2f}",
+            f"PNL Semana (7d): ${pnl_week:+.2f}",
+            f"Balance Actual: ${balance:,.2f}",
+        ]
+        reply_text = "\n".join(estado_lineas)
     except Exception as exc:
         reply_text = f"Error al generar el estado: {exc}"
 
-    await message.reply_text(reply_text, parse_mode="Markdown")
+    await message.reply_text(reply_text)
 
 
 async def rendimiento_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
