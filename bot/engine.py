@@ -15,11 +15,16 @@ from bot.telemetry.notifier import Notifier
 from bot.telemetry.telegram_bot import setup_telegram_bot
 from core.strategy import Strategy
 from core.indicators import add_indicators
+from config import S
+from trading import BROKER
 
 
 class TradingApp:
     def __init__(self, cfg):
         self.config = cfg
+        self.config.setdefault("trading_mode", S.trading_mode)
+        self.config.setdefault("mode", "paper" if S.PAPER else "real")
+        self.config.setdefault("start_equity", S.start_equity)
         self.logger = logging.getLogger(__name__)
         self._init_db()
         self.trader = Trader(cfg)
@@ -230,10 +235,19 @@ class TradingApp:
         job_queue.run_repeating(self.trading_loop, interval=60, first=5)
 
         loop = asyncio.get_event_loop()
+        mode_msg = "🧪 Modo SIMULADO activo" if S.PAPER else "🔴 Modo REAL activo"
+        if S.PAPER:
+            try:
+                equity = float(getattr(BROKER, "equity"))
+                mode_msg += f"\nEquity sim: ${equity:.2f} USDT"
+            except Exception:
+                pass
+        boot_message = f"{mode_msg}\n✅ **Bot iniciado y corriendo.**"
+
         if loop.is_running():
-            loop.create_task(self.notifier.send("✅ **Bot iniciado y corriendo.**"))
+            loop.create_task(self.notifier.send(boot_message))
         else:
-            loop.run_until_complete(self.notifier.send("✅ **Bot iniciado y corriendo.**"))
+            loop.run_until_complete(self.notifier.send(boot_message))
 
         logging.info("Bucle de trading programado. Iniciando polling de Telegram.")
         self.telegram_app.run_polling()

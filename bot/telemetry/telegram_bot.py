@@ -17,6 +17,8 @@ from telegram.request import HTTPXRequest
 
 from logging_setup import LOG_DIR, LOG_FILE
 from time_fmt import fmt_ar
+from config import S
+from trading import BROKER
 
 logger = logging.getLogger("telegram")
 
@@ -317,12 +319,20 @@ def _build_estado_text(engine) -> str:
             ks = bool(trader.state.killswitch)
         except Exception:
             ks = False
+    mode_txt = "🧪 SIMULADO" if S.PAPER else "🔴 REAL"
     lines = [
         "📊 Estado del Bot",
+        f"Modo: {mode_txt}",
         f"Saldo actual: ${_fmt_num(equity, 2)}",
         f"PnL 24h: ${_fmt_num(d1, 2)} | PnL 7d: ${_fmt_num(w1, 2)}",
         f"Operaciones abiertas: {open_cnt}",
     ]
+    if S.PAPER:
+        try:
+            eq_sim = float(getattr(BROKER, "equity"))
+            lines.append(f"Equity sim: ${_fmt_num(eq_sim, 2)}")
+        except Exception:
+            pass
     if per_symbol:
         lines.append("Por símbolo: " + ", ".join(f"{sym}: {cnt}" for sym, cnt in per_symbol.items()))
     lines.append("Bot: OFF (killswitch ACTIVADO)" if ks else "Bot: ON (killswitch desactivado)")
