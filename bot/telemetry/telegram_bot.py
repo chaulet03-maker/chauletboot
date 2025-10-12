@@ -17,6 +17,7 @@ from telegram.request import HTTPXRequest
 
 from logging_setup import LOG_DIR, LOG_FILE
 from time_fmt import fmt_ar
+from motivos_simplificados import motivo_simplificado
 
 logger = logging.getLogger("telegram")
 
@@ -834,6 +835,12 @@ async def motivos_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # Formateo (acepta dicts o strings). Máximo 10 últimos motivos.
+    def _safe_float(val):
+        try:
+            return float(val)
+        except (TypeError, ValueError):
+            return None
+
     lines = []
     friendly = {
         "atr_gate": "ATR alto/bajo",
@@ -845,14 +852,45 @@ async def motivos_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "grid_out_of_range": "Fuera de rango de pullback",
         "no_signal": "Sin señal utilizable",
     }
+
     for item in list(reversed(log))[:10]:
         if isinstance(item, dict):
+            price = _safe_float(item.get("price"))
+            anchor = _safe_float(item.get("anchor_used", item.get("anchor")))
+            step = _safe_float(item.get("step_used", item.get("step")))
+            span = _safe_float(item.get("span_used", item.get("span")))
+            side_pref = (item.get("side_pref") or item.get("side") or "").upper()
+            gate_bps = _safe_float(item.get("gate_bps"))
+            ts_utc = item.get("ts_utc")
+
+            if (
+                side_pref
+                and price is not None
+                and anchor is not None
+                and step is not None
+                and span is not None
+            ):
+                try:
+                    line = motivo_simplificado(
+                        side=side_pref,
+                        price=price,
+                        anchor=anchor,
+                        step=step,
+                        span=span,
+                        gate_bps=gate_bps,
+                        ts_utc=ts_utc,
+                    )
+                    lines.append(f"• {line}")
+                    continue
+                except Exception:
+                    pass
+
             raw_ts = item.get("iso") or item.get("ts") or ""
             ts_txt = _format_local_timestamp(raw_ts) if raw_ts else ""
-            sym  = item.get("symbol") or ""
+            sym = item.get("symbol") or ""
             side = item.get("side") or ""
             code = item.get("code") or item.get("reason") or ""
-            det  = item.get("detail") or ""
+            det = item.get("detail") or ""
             extra = []
             for k, v in item.items():
                 if k.startswith("extra_"):
@@ -866,7 +904,7 @@ async def motivos_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             lines.append(f"• {str(item)}")
 
-    header = "🕒 Motivos recientes (últimas 10 oportunidades NO abiertas):\n"
+    header = "🕒 Motivos recientes (AR):\n"
     await _reply_chunks(update, header + "\n".join(lines))
 
 
@@ -1033,8 +1071,19 @@ class TelegramNotifier:
         self._schedule(self._send_reject(**kwargs))
 
     # Permite que el engine registre motivos para /motivos (o command-bot)
+    def log_reject_event(self, event: dict):
+        try:
+            self._rejections.appendleft(dict(event))
+        except Exception:
+            self._rejections.appendleft(event)
+
     def log_reject(self, symbol: str, side: str, code: str, detail: str = ""):
-        self._rejections.appendleft({"symbol": symbol, "side": side, "code": code, "detail": detail})
+        self.log_reject_event({
+            "symbol": symbol,
+            "side": side,
+            "code": code,
+            "detail": detail,
+        })
 
     # ----------- Internals -----------
     async def _safe_send(self, text: str):

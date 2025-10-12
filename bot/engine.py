@@ -50,21 +50,55 @@ class TradingApp:
                     logging.warning("No se pudo cargar la serie de funding desde %s: %s", funding_csv, exc)
 
     # === Rejection recording helpers ===
-    def record_rejection(self, symbol: str, side: str, code: str, detail: str = "", ts=None):
+    def record_rejection(self, symbol: str, side: str, code: str, detail: str = "", ts=None, meta=None):
         try:
             from datetime import datetime, timezone
             from collections import deque
+
             if not hasattr(self, "rejection_log"):
                 self.rejection_log = deque(maxlen=50)  # si no existe, lo creo
-            if ts is None:
-                ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")
-            item = {"iso": ts, "symbol": symbol, "side": side, "code": code, "detail": detail}
+
+            ts_dt = None
+            if isinstance(ts, datetime):
+                ts_dt = ts if ts.tzinfo else ts.replace(tzinfo=timezone.utc)
+            elif isinstance(ts, str):
+                try:
+                    ts_dt = datetime.fromisoformat(ts)
+                    if ts_dt.tzinfo is None:
+                        ts_dt = ts_dt.replace(tzinfo=timezone.utc)
+                except Exception:
+                    ts_dt = None
+
+            if ts_dt is None:
+                ts_dt = datetime.now(timezone.utc)
+
+            iso_txt = ts_dt.strftime("%Y-%m-%d %H:%M")
+            item = {
+                "iso": iso_txt,
+                "ts": iso_txt,
+                "ts_utc": ts_dt,
+                "symbol": symbol,
+                "side": side,
+                "code": code,
+                "detail": detail,
+            }
+
+            if isinstance(meta, dict):
+                for key, value in meta.items():
+                    if key in item and key not in {"detail"}:
+                        item[f"meta_{key}"] = value
+                    else:
+                        item[key] = value
+
             self.rejection_log.append(item)
 
             # Reflejá también en el notificador PRO si existe
             tg = getattr(self, "telegram", None) or getattr(self, "notifier", None)
-            if tg is not None and hasattr(tg, "log_reject"):
-                tg.log_reject(symbol=symbol, side=side, code=code, detail=detail)
+            if tg is not None:
+                if hasattr(tg, "log_reject_event"):
+                    tg.log_reject_event(item.copy())
+                elif hasattr(tg, "log_reject"):
+                    tg.log_reject(symbol=symbol, side=side, code=code, detail=detail)
         except Exception as e:
             import logging
             logging.debug(f"record_rejection failed: {e}")
@@ -141,13 +175,14 @@ class TradingApp:
             signal = self.strategy.check_entry_signal(data)
             if not signal:
                 try:
-                    code, detail, extras = self.strategy.get_rejection_reason(data)
+                    code, detail, extras, meta = self.strategy.get_rejection_reason(data)
                     item_detail = detail if not extras else f"{detail} | {extras}"
                     self.record_rejection(
                         symbol=self.config.get("symbol", ""),
                         side=str(self.config.get("grid_side", "auto")).upper(),
                         code=code or "pre_open_checks",
-                        detail=item_detail or "Sin detalle"
+                        detail=item_detail or "Sin detalle",
+                        meta=meta,
                     )
                 except Exception:
                     pass

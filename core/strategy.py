@@ -1,4 +1,5 @@
 import logging
+from datetime import datetime, timezone
 
 import numpy as np
 import pandas as pd
@@ -208,12 +209,51 @@ class Strategy:
         return reasons or [("no_signal", "No pasó filtros / sin señal utilizable")]
 
     def get_rejection_reason(self, data: pd.DataFrame):
-        """Conveniencia: devuelve el primer motivo relevante."""
+        """Conveniencia: devuelve el primer motivo relevante junto con metadatos."""
         lst = self.get_rejection_reasons_all(data)
         code, detail = lst[0]
         # empaqueto también un resumen del resto por si querés mostrarlo
         extras = "; ".join(f"{c}:{d}" for c, d in lst[1:]) if len(lst) > 1 else ""
-        return code, detail, extras
+
+        # Datos auxiliares para mostrar en /motivos
+        row = data.iloc[-1] if len(data) else None
+        price = float(row.get("close", float("nan"))) if row is not None else float("nan")
+        atr = float(row.get("atr", float("nan"))) if row is not None else float("nan")
+
+        anchor_val = self._anchor_price(row) if row is not None else None
+        try:
+            anchor = float(anchor_val) if anchor_val is not None else float("nan")
+        except Exception:
+            anchor = float("nan")
+
+        step = float(self.config.get("grid_step_atr", 0.32)) * (atr if np.isfinite(atr) else 0.0)
+        span = float(self.config.get("grid_span_atr", 3.0)) * (atr if np.isfinite(atr) else 0.0)
+
+        side_pref = self._decide_grid_side(row) if row is not None else None
+
+        ts_val = data.index[-1] if hasattr(data, "index") and len(data.index) else None
+        ts_dt: datetime | None = None
+        if isinstance(ts_val, datetime):
+            ts_dt = ts_val if ts_val.tzinfo else ts_val.replace(tzinfo=timezone.utc)
+        elif hasattr(ts_val, "to_pydatetime"):
+            try:
+                ts_dt = ts_val.to_pydatetime()
+                if ts_dt.tzinfo is None:
+                    ts_dt = ts_dt.replace(tzinfo=timezone.utc)
+            except Exception:
+                ts_dt = None
+
+        meta = {
+            "price": price if np.isfinite(price) else None,
+            "anchor": anchor if np.isfinite(anchor) else None,
+            "step": step if np.isfinite(step) else None,
+            "span": span if np.isfinite(span) else None,
+            "side_pref": side_pref,
+            "gate_bps": self.config.get("funding_gate_bps"),
+            "ts_utc": ts_dt,
+        }
+
+        return code, detail, extras, meta
 
     def _decide_grid_side(self, row: pd.Series) -> str | None:
         side_cfg = str(self.config.get("grid_side", "auto")).lower()
