@@ -3,6 +3,7 @@ import yaml
 import logging
 from dotenv import load_dotenv
 from bot.engine import TradingApp
+from logging_setup import setup_logging
 
 def main():
     """Función principal que configura e inicia la aplicación."""
@@ -17,9 +18,8 @@ def main():
     cfg['binance_api_key_test'] = os.getenv("BINANCE_API_KEY_TEST")
     cfg['binance_api_secret_test'] = os.getenv("BINANCE_API_SECRET_TEST")
     
-    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s',
-                        handlers=[logging.FileHandler("trading_bot.log"), logging.StreamHandler()])
-    
+    setup_logging()
+
     app = TradingApp(cfg)
     app.run()
 
