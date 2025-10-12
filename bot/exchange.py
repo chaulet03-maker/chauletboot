@@ -4,7 +4,11 @@ from typing import Any, Dict, List, Optional
 
 import ccxt
 
+from config import S
 from trading import place_order_safe
+
+
+logger = logging.getLogger(__name__)
 
 
 class Exchange:
@@ -41,15 +45,15 @@ class Exchange:
             # Intentamos verificar si las credenciales funcionan cargando mercados
             client.load_markets()
             self.is_authenticated = True
-            logging.info("Cliente de CCXT AUTENTICADO e inicializado correctamente.")
+            logger.info("Cliente de CCXT AUTENTICADO e inicializado correctamente.")
             return client
 
         except Exception as e:
             # 2. FALLBACK: Si las claves fallan, inicializar cliente PÚBLICO (solo lectura)
-            logging.warning(
+            logger.warning(
                 f"ADVERTENCIA: Fallo de autenticación. El bot operará en modo SÓLO LECTURA. Error: {e}"
             )
-            logging.warning("Verifique las claves de Testnet en su archivo .env.")
+            logger.warning("Verifique las claves de Testnet en su archivo .env.")
 
             # Creamos un cliente que NO necesita claves para obtener precios públicos
             public_client = ccxt.binance({
@@ -61,13 +65,13 @@ class Exchange:
     async def get_klines(self, timeframe: str = '1h', symbol: Optional[str] = None, limit: int = 300) -> List[List[Any]]:
         """Obtiene las velas (klines) de un par."""
         sym = symbol or self.config.get('symbol', 'BTC/USDT')
-        logging.debug("Solicitando klines %s para %s", timeframe, sym)
+        logger.debug("Solicitando klines %s para %s", timeframe, sym)
         try:
             return await asyncio.to_thread(self.client.fetch_ohlcv, sym, timeframe=timeframe, limit=limit)
         except Exception:
             if sym.endswith('/USDT') and ':USDT' not in sym:
                 fut_symbol = f"{sym}:USDT"
-                logging.debug("Fallo al obtener klines para %s, probando %s", sym, fut_symbol)
+                logger.debug("Fallo al obtener klines para %s, probando %s", sym, fut_symbol)
                 return await asyncio.to_thread(self.client.fetch_ohlcv, fut_symbol, timeframe=timeframe, limit=limit)
             raise
 
@@ -96,7 +100,7 @@ class Exchange:
                 except Exception:
                     continue
 
-        logging.warning(f"No pude obtener precio para {base_symbol}")
+        logger.warning(f"No pude obtener precio para {base_symbol}")
         return None
 
     async def set_leverage(self, leverage: float, symbol: Optional[str] = None) -> None:
@@ -105,8 +109,12 @@ class Exchange:
         if sym.endswith('/USDT') and ':USDT' not in sym:
             sym = f"{sym}:USDT"
 
+        if S.PAPER:
+            logger.info("PAPER: skipping private endpoint set_leverage(%s, %s)", leverage, sym)
+            return
+
         await asyncio.to_thread(self.client.set_leverage, leverage, sym)
-        logging.info("Apalancamiento establecido en x%s para %s", leverage, sym)
+        logger.info("Apalancamiento establecido en x%s para %s", leverage, sym)
 
     async def fetch_current_funding_rate(self, symbol: Optional[str] = None) -> Optional[float]:
         """Obtiene el funding rate actual en formato decimal (por intervalo de funding)."""
@@ -138,7 +146,7 @@ class Exchange:
                 except Exception:
                     continue
 
-        logging.warning(f"No pude obtener funding rate para {base_symbol}")
+        logger.warning(f"No pude obtener funding rate para {base_symbol}")
         return None
 
     async def get_current_funding_rate_bps(self, symbol: Optional[str] = None) -> Optional[float]:
@@ -161,7 +169,7 @@ class Exchange:
         if symbol is None:
             symbol = self.config.get('symbol', 'BTC/USDT')
 
-        logging.info("Creando orden %s para %.6f unidades de %s...", side, quantity, symbol)
+        logger.info("Creando orden %s para %.6f unidades de %s...", side, quantity, symbol)
 
         price = await self.get_current_price(symbol)
         if price is None:
@@ -177,5 +185,5 @@ class Exchange:
             tp=tp_price,
         )
 
-        logging.info("Orden ejecutada vía broker seguro: %s", order)
+        logger.info("Orden ejecutada vía broker seguro: %s", order)
         return order

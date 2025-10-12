@@ -173,10 +173,15 @@ class TradingApp:
             eq_on_open = eq_now
 
             leverage = self.strategy.dynamic_leverage(last_candle)
-            await self.exchange.set_leverage(
-                leverage,
-                self.config.get('symbol', 'BTC/USDT'),
-            )
+            if S.PAPER:
+                self.logger.info(
+                    "PAPER: leverage lógico=%s (no se setea en Binance)", leverage
+                )
+            else:
+                await self.exchange.set_leverage(
+                    leverage,
+                    self.config.get('symbol', 'BTC/USDT'),
+                )
 
             entry_price = await self.exchange.get_current_price()
             if entry_price is None:
