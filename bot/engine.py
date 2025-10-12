@@ -16,7 +16,7 @@ from bot.telemetry.telegram_bot import setup_telegram_bot
 from core.strategy import Strategy
 from core.indicators import add_indicators
 from config import S
-from trading import BROKER
+from trading import BROKER, POSITION_SERVICE
 
 
 class TradingApp:
@@ -88,18 +88,33 @@ class TradingApp:
             logging.info("Iniciando ciclo de análisis de mercado...")
 
             position = await self.trader.check_open_position(self.exchange)
+            if (position is None) and (POSITION_SERVICE is not None):
+                try:
+                    st = POSITION_SERVICE.get_status()
+                    side = (st.get("side") or "FLAT").upper()
+                    if side != "FLAT":
+                        position = {
+                            "symbol": st.get("symbol", self.config.get("symbol")),
+                            "side": side,
+                            "contracts": st.get("qty") or st.get("size") or 0.0,
+                            "entryPrice": st.get("entry_price") or 0.0,
+                            "markPrice": st.get("mark") or 0.0,
+                        }
+                        await self.trader.set_position(position)
+                except Exception as exc:
+                    logging.debug("PositionService fallback fail: %s", exc)
             if position:
                 logging.info(
-                    "Posición abierta detectada: %s %s %s",
-                    position.get('side'),
-                    position.get('contracts'),
-                    position.get('symbol'),
+                    "Posición abierta detectada: %s %.6f %s",
+                    (position.get('side') or '').upper(),
+                    float(position.get('contracts') or position.get('size') or 0.0),
+                    position.get('symbol') or self.config.get('symbol'),
                 )
                 try:
                     now_ts = pd.Timestamp.utcnow().tz_localize("UTC")
                     last_price = await self.exchange.get_current_price(self.config.get('symbol'))
                     side = (position.get('side') or '').upper()
-                    qty_raw = position.get('contracts') or position.get('size')
+                    qty_raw = position.get('contracts') or position.get('size') or 0.0
                     qty = float(qty_raw) if qty_raw is not None else 0.0
                     if last_price is not None and side and qty > 0:
                         self._apply_funding_if_needed(now_ts, float(last_price), side, qty)
@@ -202,7 +217,22 @@ class TradingApp:
                     f"Símbolo: {self.config['symbol']}\n"
                     f"Apalancamiento: x{leverage}"
                 )
-                await self.trader.set_position(order_result)
+                cached_position = order_result
+                if POSITION_SERVICE is not None:
+                    try:
+                        st = POSITION_SERVICE.get_status()
+                        side = (st.get("side") or "FLAT").upper()
+                        if side != "FLAT":
+                            cached_position = {
+                                "symbol": st.get("symbol", self.config.get("symbol")),
+                                "side": side,
+                                "contracts": st.get("qty") or 0.0,
+                                "entryPrice": st.get("entry_price") or 0.0,
+                                "markPrice": st.get("mark") or 0.0,
+                            }
+                    except Exception as e:
+                        logging.debug("post-open cache position fail: %s", e)
+                await self.trader.set_position(cached_position)
                 self._risk_usd_trade = abs(entry_price - sl_price) * qty
                 self._eq_on_open = eq_on_open
                 self._entry_ts = now_ts

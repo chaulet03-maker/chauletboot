@@ -3,6 +3,8 @@ from typing import Dict, Tuple, List, Optional
 from telegram.ext import Application, MessageHandler, filters
 import unicodedata
 
+from trading import POSITION_SERVICE
+
 from .telegram_bot import (
     _build_config_text,
     _build_estado_text,
@@ -111,6 +113,35 @@ async def _cmd_positions_detail(engine, reply):
             )
             lines.append("")
     return await reply("\n".join(lines).strip())
+
+
+async def _cmd_posicion(engine, reply):
+    try:
+        st = POSITION_SERVICE.get_status() if POSITION_SERVICE else None
+    except Exception as e:
+        st = None
+        log.debug("posicion/status error: %s", e)
+    cfg = getattr(engine, "config", None)
+    symbol_default = "BTC/USDT"
+    if isinstance(cfg, dict):
+        symbol_default = cfg.get("symbol", symbol_default)
+    if not st or (st.get("side", "FLAT").upper() == "FLAT"):
+        return await reply(
+            f"Estado Actual: Sin posición\n----------------\nSímbolo: {st.get('symbol', symbol_default) if st else symbol_default}"
+        )
+    side = (st.get("side") or "").upper()
+    symbol = st.get("symbol", symbol_default)
+    entry_price = float(st.get("entry_price", 0.0) or 0.0)
+    pnl = float(st.get("pnl", 0.0) or 0.0)
+    msg = (
+        "Estado Actual: Posición Abierta\n"
+        "----------------\n"
+        f"Símbolo: {symbol}\n"
+        f"Lado: {side}\n"
+        f"Precio de Entrada: ${entry_price:.2f}\n"
+        f"PNL Actual: ${pnl:+.2f}\n"
+    )
+    return await reply(msg)
 
 # ========= Stats / Reportes =========
 
@@ -376,7 +407,7 @@ class CommandBot:
 
         # --- POSICION DETALLE ---
         if norm_all in ('posicion','posiciones','position','positions'):
-            return await _cmd_positions_detail(self.engine, reply)
+            return await _cmd_posicion(self.engine, reply)
 
         # --- AYUDA ---
         if norm_all in ('ayuda','menu','comandos','help'):
@@ -427,39 +458,7 @@ class CommandBot:
 
         # --- POSICIONES (por símbolo) ---
         if msg in ("posicion", "posición", "posiciones"):
-            st = getattr(self.engine.trader.state, "positions", {}) if getattr(self.engine, "trader", None) else {}
-            if not st:
-                # fallback CSV
-                csv_dir = _csv_dir(self.engine)
-                path = os.path.join(csv_dir, "trades.csv")
-                abiertos = {}
-                if os.path.exists(path):
-                    try:
-                        with open(path, newline="", encoding="utf-8") as f:
-                            reader = csv.DictReader(f)
-                            for r in reader:
-                                sym = (r.get("symbol") or "").upper()
-                                note = (r.get("note") or "").upper()
-                                if not sym:
-                                    continue
-                                if note.startswith("OPEN"):
-                                    abiertos[sym] = abiertos.get(sym, 0) + 1
-                                elif note.startswith("CLOSE") and abiertos.get(sym, 0) > 0:
-                                    abiertos[sym] -= 1
-                                    if abiertos[sym] <= 0:
-                                        abiertos.pop(sym, None)
-                        if abiertos:
-                            listado = "\n".join(f"• {k}: {v}" for k, v in abiertos.items())
-                            return await reply(f"Posiciones abiertas (por símbolo):\n{listado}")
-                    except Exception:
-                        pass
-                return await reply("No hay posiciones abiertas.")
-
-            # Hay estado en memoria
-            lineas = []
-            for sym, lots in st.items():
-                lineas.append(f"• {sym}: {len(lots)}")
-            return await reply("Posiciones abiertas (por símbolo):\n" + "\n".join(lineas))
+            return await _cmd_posicion(self.engine, reply)
 
         # --- PRECIO ---
         if msg.startswith("precio"):
