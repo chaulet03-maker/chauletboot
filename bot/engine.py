@@ -87,6 +87,15 @@ class TradingApp:
 
             logging.info("Iniciando ciclo de análisis de mercado...")
 
+            # 0) Refrescar mark-to-market en paper utilizando el precio actual
+            if S.PAPER and POSITION_SERVICE is not None:
+                try:
+                    last_px = await self.exchange.get_current_price(self.config.get('symbol', 'BTC/USDT'))
+                    if last_px is not None:
+                        POSITION_SERVICE.mark_to_market(float(last_px))
+                except Exception as exc:
+                    logging.debug("No se pudo refrescar mark-to-market inicial: %s", exc)
+
             position = await self.trader.check_open_position(self.exchange)
             if (position is None) and (POSITION_SERVICE is not None):
                 try:
@@ -96,9 +105,9 @@ class TradingApp:
                         position = {
                             "symbol": st.get("symbol", self.config.get("symbol")),
                             "side": side,
-                            "contracts": st.get("qty") or st.get("size") or 0.0,
-                            "entryPrice": st.get("entry_price") or 0.0,
-                            "markPrice": st.get("mark") or 0.0,
+                            "contracts": float(st.get("qty") or st.get("size") or 0.0),
+                            "entryPrice": float(st.get("entry_price") or 0.0),
+                            "markPrice": float(st.get("mark") or 0.0),
                         }
                         await self.trader.set_position(position)
                 except Exception as exc:
@@ -226,9 +235,9 @@ class TradingApp:
                             cached_position = {
                                 "symbol": st.get("symbol", self.config.get("symbol")),
                                 "side": side,
-                                "contracts": st.get("qty") or 0.0,
-                                "entryPrice": st.get("entry_price") or 0.0,
-                                "markPrice": st.get("mark") or 0.0,
+                                "contracts": float(st.get("qty") or 0.0),
+                                "entryPrice": float(st.get("entry_price") or 0.0),
+                                "markPrice": float(st.get("mark") or 0.0),
                             }
                     except Exception as e:
                         logging.debug("post-open cache position fail: %s", e)

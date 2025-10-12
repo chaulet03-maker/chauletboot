@@ -156,6 +156,16 @@ class Exchange:
             return None
         return rate_dec * 10000.0
 
+    async def fetch_positions(self, symbol: str):
+        """Obtiene posiciones abiertas evitando llamadas privadas en paper."""
+        if S.PAPER or self.client is None:
+            return []
+        try:
+            return await asyncio.to_thread(self.client.fetch_positions, [symbol])
+        except Exception:
+            logger.debug("fetch_positions falló para %s", symbol, exc_info=True)
+            return []
+
     async def create_order(
         self,
         side: str,

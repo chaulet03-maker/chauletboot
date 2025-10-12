@@ -40,10 +40,10 @@ class Trader:
         return self._balance
 
     async def check_open_position(self, exchange=None) -> Optional[Dict[str, Any]]:
-        """
-        Devuelve la posición abierta (si la hay) y cachea el resultado.
-        En PAPER lee de PositionService (paper store). En LIVE consulta exchange/ccxt.
-        """
+        """Devuelve la posición abierta (si la hay) y cachea el resultado."""
+
+        if self._open_position:
+            return self._open_position
 
         # 1) PAPER: leer del PositionService (persistente)
         if S.PAPER and POSITION_SERVICE is not None:
@@ -54,22 +54,20 @@ class Trader:
                     self._open_position = {
                         "symbol": st.get("symbol", self.config.get("symbol", "BTC/USDT")),
                         "side": side,
-                        "contracts": st.get("qty") or st.get("size") or 0.0,
-                        "entryPrice": st.get("entry_price") or 0.0,
-                        "markPrice": st.get("mark") or 0.0,
+                        "contracts": float(st.get("qty") or st.get("size") or 0.0),
+                        "entryPrice": float(st.get("entry_price") or 0.0),
+                        "markPrice": float(st.get("mark") or 0.0),
                     }
                     return self._open_position
                 self._open_position = None
             except Exception as exc:
                 logging.debug("PAPER check_open_position fallo: %s", exc)
+            return self._open_position
 
         # 2) LIVE: si tenemos exchange, tratemos de obtener la posición real
-        if exchange and getattr(exchange, 'client', None):
+        if exchange and hasattr(exchange, "fetch_positions"):
             try:
-                positions = await asyncio.to_thread(
-                    exchange.client.fetch_positions,
-                    [self.config.get('symbol', 'BTC/USDT')]
-                )
+                positions = await exchange.fetch_positions(self.config.get('symbol', 'BTC/USDT'))
                 if positions:
                     self._open_position = positions[0]
                     return self._open_position

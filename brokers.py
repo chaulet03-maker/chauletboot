@@ -77,9 +77,9 @@ class SimBroker:
         payload: dict[str, Any] = {
             "orderId": oid,
             "status": "FILLED",
-            "price": price,
-            "executedQty": qty,
-            "side": side,
+            "price": float(price),
+            "executedQty": float(qty),
+            "side": str(side).upper(),
             "sim": True,
             "state": new_state,
         }
