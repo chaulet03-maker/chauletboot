@@ -1,10 +1,13 @@
 import logging
 import asyncio
 from collections import deque
+from typing import cast
 import pandas as pd
 import schedule
 from telegram.ext import ContextTypes
 
+from anchor_freezer import Side
+from deps import FREEZER
 from bot.exchange import Exchange
 from bot.trader import Trader
 from bot.storage import Storage
@@ -194,6 +197,10 @@ class TradingApp:
                 self._eq_on_open = eq_on_open
                 self._entry_ts = now_ts
                 self._bars_in_position = 0
+                symbol = str(self.config.get("symbol", ""))
+                if symbol:
+                    for s in ("LONG", "SHORT"):
+                        FREEZER.clear(symbol, cast(Side, s))
 
         except Exception as e:
             logging.error(f"Error grave en el trading_loop: {e}", exc_info=True)
