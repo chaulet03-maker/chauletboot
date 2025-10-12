@@ -273,12 +273,43 @@ class TradingApp:
         except Exception as e:
             logging.warning(f"No pude actualizar la cache de precios: {e}")
 
+    async def _preload_position_from_store(self) -> None:
+        if POSITION_SERVICE is None:
+            return
+        try:
+            status = POSITION_SERVICE.get_status()
+        except Exception as exc:
+            logging.debug("Preload posición falló: %s", exc)
+            return
+
+        side = (status.get("side") or "FLAT").upper()
+        if side == "FLAT":
+            return
+
+        symbol = status.get("symbol", self.config.get("symbol", "BTC/USDT"))
+        qty = float(status.get("qty") or status.get("size") or 0.0)
+        position = {
+            "symbol": symbol,
+            "side": side,
+            "contracts": qty,
+            "entryPrice": float(status.get("entry_price") or 0.0),
+            "markPrice": float(status.get("mark") or 0.0),
+        }
+        await self.trader.set_position(position)
+        logging.info("Posición precargada desde store: %s %.6f %s", side, qty, symbol)
+
     def run(self):
         job_queue = self.telegram_app.job_queue
         job_queue.run_repeating(self._update_price_cache_job, interval=10, first=1)
         job_queue.run_repeating(self.trading_loop, interval=60, first=5)
 
         loop = asyncio.get_event_loop()
+        preload_task = self._preload_position_from_store()
+        if loop.is_running():
+            loop.create_task(preload_task)
+        else:
+            loop.run_until_complete(preload_task)
+
         mode_msg = "🧪 Modo SIMULADO activo" if S.PAPER else "🔴 Modo REAL activo"
         if S.PAPER:
             try:
