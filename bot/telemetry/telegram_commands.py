@@ -607,9 +607,10 @@ class CommandBot:
             if not items:
                 return await reply("No hay rechazos recientes.")
             lines = ["🕒 Motivos recientes (últimas 10 oportunidades NO abiertas):"]
+            tz = getattr(S, "output_timezone", None) or "America/Argentina/Buenos_Aires"
             for it in items:
                 try:
-                    lines.append(it.human_line())
+                    lines.append(it.human_line(tz=tz))
                 except Exception:
                     lines.append(str(it))
             return await reply("\n".join(lines))

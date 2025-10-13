@@ -92,12 +92,15 @@ def load_settings(path: Optional[str] = None) -> Settings:
         or os.getenv("BINANCE_API_SECRET_TEST")
         or binance_cfg.get("api_secret")
     )
-    return Settings(
+    settings = Settings(
         trading_mode=trading_mode,
         start_equity=start_equity,
         binance_api_key=api_key,
         binance_api_secret=api_secret,
     )
+    output_timezone = cfg.get("output_timezone")
+    setattr(settings, "output_timezone", output_timezone)
+    return settings
 
 
 def _nested_get(data: Dict[str, Any], *keys: str, default: Any = None) -> Any:
