@@ -175,7 +175,7 @@ async def _cmd_motivos(engine, reply, n: int = 10):
     lines = ["🕒 Motivos recientes (últimas 10 oportunidades NO abiertas):"]
     for it in items:
         lines.append(it.human_line(tz=tz))
-    log.debug("TELEGRAM /motivos → %d items | 1a línea: %s", len(items), lines[1] if len(lines)>1 else "-")
+    log.debug("TELEGRAM /motivos → %d items | 1ra: %s", len(items), lines[1] if len(lines)>1 else "-")
     return await reply("\n".join(lines))
 
 # ========= Stats / Reportes =========

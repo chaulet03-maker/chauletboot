@@ -3,11 +3,11 @@ from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import List, Dict, Any, Optional
-import logging, os, json, time
+import logging, os, json
 log = logging.getLogger(__name__)
 
 try:
-    from zoneinfo import ZoneInfo  # py>=3.9
+    from zoneinfo import ZoneInfo
 except Exception:
     ZoneInfo = None
 
@@ -59,7 +59,7 @@ class MotiveItem:
         return f"• {t} — {self.symbol}: " + " · ".join(MSG[c] for c in ordered)
 
 class MotivesBuffer:
-    def __init__(self, maxlen:int=200, persist_path: Optional[str]=None):
+    def __init__(self, maxlen:int=400, persist_path: Optional[str]=None):
         self._buf=deque(maxlen=maxlen)
         self._persist_path=persist_path
         if self._persist_path:
@@ -67,13 +67,14 @@ class MotivesBuffer:
 
     def add(self, item:MotiveItem):
         self._buf.append(item)
-        log.debug("MOTIVES/ADD codes=%s ctx_keys=%s", item.codes, list(item.ctx.keys()))
+        log.debug("MOTIVES/ADD %s", item.codes)
         if self._persist_path:
             try:
                 with open(self._persist_path, "a", encoding="utf-8") as f:
                     f.write(json.dumps({
-                        "ts": item.ts, "symbol": item.symbol, "codes": item.codes,
-                        "side_pref": item.side_pref, "price": item.price
+                        "ts": item.ts, "symbol": item.symbol,
+                        "codes": item.codes, "side_pref": item.side_pref,
+                        "price": item.price
                     }, ensure_ascii=False) + "\n")
             except Exception as e:
                 log.debug("MOTIVES persist fail: %s", e)
@@ -81,16 +82,16 @@ class MotivesBuffer:
     def last(self, n:int=10) -> List[MotiveItem]:
         return list(self._buf)[-n:]
 
-# Persistencia opcional para multi-proceso
-PERSIST = os.getenv("MOTIVES_FILE") or os.path.join(os.getenv("DATA_DIR","/app/data"), "motives.jsonl")
-MOTIVES = MotivesBuffer(maxlen=400, persist_path=PERSIST)
+# persistimos por si hay 2 procesos (opcional)
+PERSIST_FILE = os.path.join(os.getenv("DATA_DIR","/app/data"), "motives.jsonl")
+MOTIVES = MotivesBuffer(persist_path=PERSIST_FILE)
 
 def compute_codes(ctx: Dict[str, Any]) -> List[str]:
     codes: List[str] = []
-    if ctx.get("has_open"): codes.append("pos_open")
-    if ctx.get("blackout"): codes.append("blackout")
-    if ctx.get("freeze_90"): codes.append("freeze_90")
-    if ctx.get("cooldown"): codes.append("cooldown")
+    if ctx.get("has_open"):   codes.append("pos_open")
+    if ctx.get("blackout"):   codes.append("blackout")
+    if ctx.get("freeze_90"):  codes.append("freeze_90")
+    if ctx.get("cooldown"):   codes.append("cooldown")
 
     price,anchor,step,span = ctx.get("price"),ctx.get("anchor"),ctx.get("step"),ctx.get("span")
     if None not in (price,anchor,step,span):
@@ -108,6 +109,7 @@ def compute_codes(ctx: Dict[str, Any]) -> List[str]:
 
     if ctx.get("gate_ok") is False: codes.append("gate_fail")
     if ctx.get("risk_ok") is False: codes.append("risk_block")
+
     atrp=ctx.get("atrp");  adx=ctx.get("adx"); adx_thr=float(ctx.get("adx_thr",25.0))
     if atrp is not None and atrp<0.006: codes.append("low_vol")
     if adx is not None and adx<adx_thr: codes.append("adx_low")

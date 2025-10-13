@@ -18,6 +18,7 @@ from telegram.request import HTTPXRequest
 from logging_setup import LOG_DIR, LOG_FILE
 from time_fmt import fmt_ar
 from config import S
+from bot.motives import MOTIVES
 from trading import BROKER, POSITION_SERVICE
 
 logger = logging.getLogger("telegram")
@@ -823,65 +824,25 @@ async def logs_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def motivos_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Envía los últimos motivos registrados por los filtros de entrada."""
-    engine = _get_engine_from_context(context)
-    if engine is None:
-        await _reply_chunks(update, "No pude acceder al engine para consultar motivos.")
+    items = MOTIVES.last(10)
+    if not items:
+        await _reply_chunks(update, "No hay rechazos recientes.")
         return
 
-    # 1) Preferí el buffer del engine si existe
-    log = list(getattr(engine, "rejection_log", []) or [])
-    # 2) Fallback: si está vacío, uso el ring buffer del notificador de Telegram
-    if not log:
-        tg = (
-            getattr(engine, "telegram", None)
-            or getattr(engine, "notifier", None)
-            or getattr(context.application, "notifier", None)
-        )
-        try:
-            if tg is not None:
-                log = list(getattr(tg, "_rejections", []) or [])
-        except Exception:
-            log = []
-
-    if not log:
-        await _reply_chunks(update, "No se ha registrado ningún rechazo de operación todavía.")
-        return
-
-    # Formateo (acepta dicts o strings). Máximo 10 últimos motivos.
-    lines = []
-    friendly = {
-        "atr_gate": "ATR alto/bajo",
-        "trend_4h": "Tendencia 4h contraria",
-        "ema200_1h_confirm": "Cruce/confirmación EMA200 1h fallida",
-        "rsi4h_gate": "RSI 4h fuera de umbral",
-        "ban_hours": "Horario bloqueado",
-        "funding_gate": "Funding desfavorable",
-        "grid_out_of_range": "Fuera de rango de pullback",
-        "no_signal": "Sin señal utilizable",
-    }
-    for item in list(reversed(log))[:10]:
-        if isinstance(item, dict):
-            raw_ts = item.get("iso") or item.get("ts") or ""
-            ts_txt = _format_local_timestamp(raw_ts) if raw_ts else ""
-            sym  = item.get("symbol") or ""
-            side = item.get("side") or ""
-            code = item.get("code") or item.get("reason") or ""
-            det  = item.get("detail") or ""
-            extra = []
-            for k, v in item.items():
-                if k.startswith("extra_"):
-                    extra.append(f"{k[6:]}={v}")
-            extra_txt = (" [" + ", ".join(extra) + "]") if extra else ""
-            title = friendly.get(code, code)
-            prefix = ts_txt or raw_ts or "-"
-            lines.append(
-                f"• {prefix} — {sym} {side}: {title}" + (f" ({det})" if det else "") + extra_txt
-            )
-        else:
-            lines.append(f"• {str(item)}")
-
-    header = "🕒 Motivos recientes (últimas 10 oportunidades NO abiertas):\n"
-    await _reply_chunks(update, header + "\n".join(lines))
+    tz = (
+        getattr(S, "output_timezone", "America/Argentina/Buenos_Aires")
+        if hasattr(S, "output_timezone")
+        else "America/Argentina/Buenos_Aires"
+    )
+    lines = ["🕒 Motivos recientes (últimas 10 oportunidades NO abiertas):"]
+    for it in items:
+        lines.append(it.human_line(tz=tz))
+    logger.debug(
+        "TELEGRAM /motivos → %d items | 1ra: %s",
+        len(items),
+        lines[1] if len(lines) > 1 else "-",
+    )
+    await _reply_chunks(update, "\n".join(lines))
 
 
 def setup_telegram_bot(engine_instance):

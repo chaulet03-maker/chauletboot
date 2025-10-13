@@ -22,85 +22,6 @@ from config import S
 from trading import BROKER, POSITION_SERVICE
 
 
-def _record_motive(
-    self,
-    base_ctx: Optional[Dict[str, Any]] = None,
-    overrides: Optional[Dict[str, Any]] = None,
-    price: Optional[float] = None,
-    side_pref: Optional[str] = None,
-):
-    ctx: Dict[str, Any] = {
-        "price": None,
-        "anchor": None,
-        "step": None,
-        "span": None,
-        "ema200_1h": None,
-        "ema200_4h": None,
-        "atrp": None,
-        "adx": None,
-        "rsi4h": None,
-        "gate_ok": None,
-        "risk_ok": None,
-        "has_open": False,
-        "cooldown": bool(getattr(self, "cooldown_active", False)),
-        "freeze_90": bool(getattr(self, "freeze_90_active", False)),
-        "blackout": bool(getattr(self, "blackout_active", False)),
-        "reasons": [],
-        "adx_thr": float(getattr(self, "adx_strong_threshold", 25.0)),
-    }
-
-    def _merge(src: Optional[Dict[str, Any]]):
-        if not src:
-            return
-        for key, value in src.items():
-            if key == "reasons":
-                if value is None:
-                    continue
-                if isinstance(value, (list, tuple, set)):
-                    ctx["reasons"].extend(str(v) for v in value if v is not None)
-                else:
-                    ctx["reasons"].append(str(value))
-            else:
-                ctx[key] = value
-
-    _merge(base_ctx)
-    _merge(overrides)
-
-    if ctx.get("price") is None and price is not None:
-        ctx["price"] = price
-
-    if not ctx["reasons"]:
-        ctx["reasons"] = []
-    else:
-        # Deduplicar manteniendo orden
-        seen = set()
-        deduped = []
-        for reason in ctx["reasons"]:
-            if reason not in seen:
-                deduped.append(reason)
-                seen.add(reason)
-        ctx["reasons"] = deduped
-
-    final_price = ctx.get("price")
-    try:
-        final_price = float(final_price) if final_price is not None else float(price or 0.0)
-    except Exception:
-        final_price = 0.0
-
-    codes = compute_codes(ctx)
-    MOTIVES.add(
-        MotiveItem(
-            ts=_now(),
-            symbol=self.config.get("symbol", "BTC/USDT"),
-            side_pref=str(side_pref) if side_pref is not None else None,
-            price=final_price,
-            codes=codes,
-            ctx=ctx,
-        )
-    )
-    self.logger.debug("MOTIVES/REC %s", codes)
-
-
 class TradingApp:
     def __init__(self, cfg):
         self.config = cfg
@@ -158,6 +79,81 @@ class TradingApp:
         except Exception as e:
             import logging
             logging.debug(f"record_rejection failed: {e}")
+
+    def _record_motive(self, ctx_overrides: Optional[Dict[str, Any]] = None):
+        try:
+            def _safe_float(value: Any) -> Optional[float]:
+                if value is None:
+                    return None
+                try:
+                    f = float(value)
+                except (TypeError, ValueError):
+                    return None
+                return f if math.isfinite(f) else None
+
+            ctx: Dict[str, Any] = {
+                "price": _safe_float(getattr(self, "last_price", None)),
+                "anchor": _safe_float(getattr(self, "anchor", None)),
+                "step": _safe_float(getattr(self, "step", None)),
+                "span": _safe_float(getattr(self, "span", None)),
+                "ema200_1h": _safe_float(getattr(self, "ema200_1h", None)),
+                "ema200_4h": _safe_float(getattr(self, "ema200_4h", None)),
+                "atrp": _safe_float(getattr(self, "atrp", None)),
+                "adx": _safe_float(getattr(self, "adx", None)),
+                "rsi4h": _safe_float(getattr(self, "rsi4h", None)),
+                "gate_ok": getattr(self, "gate_ok", None),
+                "risk_ok": getattr(self, "risk_ok", None),
+                "has_open": bool(getattr(self, "position_open", False)),
+                "cooldown": bool(getattr(self, "cooldown_active", False)),
+                "freeze_90": bool(getattr(self, "freeze_90_active", False)),
+                "blackout": bool(getattr(self, "blackout_active", False)),
+                "reasons": list(getattr(self, "reasons", []) or []),
+                "adx_thr": float(getattr(self, "adx_strong_threshold", 25.0)),
+            }
+
+            if ctx_overrides:
+                for key, value in ctx_overrides.items():
+                    if key == "reasons":
+                        if value is None:
+                            ctx["reasons"] = []
+                        elif isinstance(value, (list, tuple, set)):
+                            ctx["reasons"] = [str(v) for v in value if v is not None]
+                        else:
+                            ctx["reasons"] = [str(value)]
+                    else:
+                        ctx[key] = value
+
+            reasons = []
+            seen = set()
+            for item in ctx.get("reasons", []):
+                if item is None:
+                    continue
+                text = str(item)
+                if text not in seen:
+                    seen.add(text)
+                    reasons.append(text)
+            ctx["reasons"] = reasons
+
+            price_val = ctx.get("price")
+            try:
+                price_out = float(price_val) if price_val is not None else 0.0
+            except Exception:
+                price_out = 0.0
+
+            codes = compute_codes(ctx)
+            MOTIVES.add(
+                MotiveItem(
+                    ts=_now(),
+                    symbol=self.config.get("symbol", "BTC/USDT"),
+                    side_pref=str(getattr(self, "side_pref", None)) if getattr(self, "side_pref", None) is not None else None,
+                    price=price_out,
+                    codes=codes,
+                    ctx=ctx,
+                )
+            )
+            self.logger.debug("MOTIVES/REC %s", codes)
+        except Exception as e:
+            self.logger.debug("MOTIVES/REC fail: %s", e)
 
     async def trading_loop(self, context: ContextTypes.DEFAULT_TYPE):
         """Bucle principal de trading ejecutado por la JobQueue de Telegram."""
@@ -220,6 +216,68 @@ class TradingApp:
             }
             side_pref: Optional[str] = None
 
+            self.last_price = None
+            self.anchor = None
+            self.step = None
+            self.span = None
+            self.ema200_1h = None
+            self.ema200_4h = None
+            self.atrp = None
+            self.adx = None
+            self.rsi4h = None
+            self.gate_ok = None
+            self.risk_ok = None
+            self.reasons = []
+            self.side_pref = None
+            self.position_open = bool(position)
+            self.cooldown_active = cooldown_active
+            self.freeze_90_active = freeze_90_active
+            self.blackout_active = blackout_active
+
+            def _emit_motive(
+                overrides: Optional[Dict[str, Any]] = None,
+                price_value: Optional[float] = None,
+                side_value: Optional[str] = None,
+            ) -> None:
+                ctx_local = dict(base_ctx)
+                if overrides:
+                    if "reasons" in overrides:
+                        val = overrides["reasons"]
+                        if val is None:
+                            ctx_local["reasons"] = []
+                        elif isinstance(val, (list, tuple, set)):
+                            ctx_local["reasons"] = [str(v) for v in val if v is not None]
+                        else:
+                            ctx_local["reasons"] = [str(val)]
+                    for key, value in overrides.items():
+                        if key == "reasons":
+                            continue
+                        ctx_local[key] = value
+                if price_value is not None:
+                    ctx_local["price"] = price_value
+
+                local_side = side_value if side_value is not None else side_pref
+
+                self.last_price = ctx_local.get("price")
+                self.anchor = ctx_local.get("anchor")
+                self.step = ctx_local.get("step")
+                self.span = ctx_local.get("span")
+                self.ema200_1h = ctx_local.get("ema200_1h")
+                self.ema200_4h = ctx_local.get("ema200_4h")
+                self.atrp = ctx_local.get("atrp")
+                self.adx = ctx_local.get("adx")
+                self.rsi4h = ctx_local.get("rsi4h")
+                self.gate_ok = ctx_local.get("gate_ok")
+                self.risk_ok = ctx_local.get("risk_ok")
+                self.reasons = list(ctx_local.get("reasons") or [])
+                self.position_open = bool(ctx_local.get("has_open", self.position_open))
+                self.cooldown_active = bool(ctx_local.get("cooldown", self.cooldown_active))
+                self.freeze_90_active = bool(ctx_local.get("freeze_90", self.freeze_90_active))
+                self.blackout_active = bool(ctx_local.get("blackout", self.blackout_active))
+                self.side_pref = local_side
+
+                self._record_motive(ctx_local)
+
             if position:
                 logging.info(
                     "Posición abierta detectada: %s %.6f %s",
@@ -245,14 +303,8 @@ class TradingApp:
                 except Exception:
                     price_val = None
 
-                base_ctx.update({"price": price_val, "has_open": True})
-                _record_motive(
-                    self,
-                    base_ctx,
-                    overrides={},
-                    price=price_val,
-                    side_pref=position.get('side'),
-                )
+                ctx_overrides = {"has_open": True}
+                _emit_motive(ctx_overrides, price_value=price_val, side_value=position.get('side'))
                 return
 
             if blackout_active:
@@ -263,20 +315,20 @@ class TradingApp:
                     price_val = float(price_cached) if price_cached is not None else None
                 except Exception:
                     price_val = None
-                base_ctx.update({"price": price_val, "blackout": True})
-                _record_motive(self, base_ctx, overrides={"blackout": True}, price=price_val, side_pref=side_pref)
+                ctx_overrides = {"blackout": True}
+                _emit_motive(ctx_overrides, price_value=price_val)
                 return
 
             if freeze_90_active:
-                logging.info("Congelamiento 90%% activo, no se evaluarán nuevas entradas.")
+                logging.info("Congelamiento 90% activo, no se evaluarán nuevas entradas.")
                 price_val = None
                 try:
                     price_cached = self.price_cache.get(self.config.get('symbol', 'BTC/USDT'))
                     price_val = float(price_cached) if price_cached is not None else None
                 except Exception:
                     price_val = None
-                base_ctx.update({"price": price_val, "freeze_90": True})
-                _record_motive(self, base_ctx, overrides={"freeze_90": True}, price=price_val, side_pref=side_pref)
+                ctx_overrides = {"freeze_90": True}
+                _emit_motive(ctx_overrides, price_value=price_val)
                 return
 
             if cooldown_active:
@@ -287,13 +339,13 @@ class TradingApp:
                     price_val = float(price_cached) if price_cached is not None else None
                 except Exception:
                     price_val = None
-                base_ctx.update({"price": price_val, "cooldown": True})
-                _record_motive(self, base_ctx, overrides={"cooldown": True}, price=price_val, side_pref=side_pref)
+                ctx_overrides = {"cooldown": True}
+                _emit_motive(ctx_overrides, price_value=price_val)
                 return
 
             if self.is_paused:
                 logging.info("El bot está en pausa, no se buscan nuevas señales.")
-                _record_motive(self, base_ctx, overrides={"reasons": ["bot en pausa"]}, side_pref=side_pref)
+                _emit_motive({"reasons": ["bot en pausa"]})
                 return
 
             klines_1h = await self.exchange.get_klines('1h')
@@ -301,12 +353,7 @@ class TradingApp:
 
             if not klines_1h or not klines_4h:
                 logging.warning("No se pudieron obtener los datos de mercado en este ciclo.")
-                _record_motive(
-                    self,
-                    base_ctx,
-                    overrides={"reasons": ["exchange_error: sin datos de klines"]},
-                    side_pref=side_pref,
-                )
+                _emit_motive({"reasons": ["exchange_error: sin datos de klines"]})
                 return
 
             df_1h = pd.DataFrame(klines_1h, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
@@ -327,10 +374,8 @@ class TradingApp:
                     price_stop = float(price_stop) if price_stop is not None else None
                 except Exception:
                     price_stop = None
-                if price_stop is not None:
-                    base_ctx["price"] = price_stop
-                overrides = {"risk_ok": False, "reasons": ["Daily stop alcanzado"]}
-                _record_motive(self, base_ctx, overrides=overrides, price=price_stop, side_pref=side_pref)
+                ctx_overrides = {"risk_ok": False, "reasons": ["Daily stop alcanzado"]}
+                _emit_motive(ctx_overrides, price_value=price_stop)
                 return
 
             if self.config.get("funding_interval_hours", 8) and self.config.get("funding_gate_bps") is not None:
@@ -347,6 +392,9 @@ class TradingApp:
                     self.config.pop("_funding_rate_bps_now", None)
 
             signal = self.strategy.check_entry_signal(data)
+            if signal:
+                side_pref = signal
+                self.side_pref = signal
             base_ctx["reasons"] = []
             if not signal:
                 try:
@@ -379,18 +427,11 @@ class TradingApp:
                         return f if math.isfinite(f) else None
 
                     price = _safe_float(row.get("close")) if row is not None else None
-                    base_ctx["price"] = price
                     ema200_1h = _safe_float(row.get("ema200")) if row is not None else None
                     ema200_4h = _safe_float(row.get("ema200_4h")) if row is not None else None
                     rsi4h = _safe_float(row.get("rsi4h")) if row is not None else None
                     atr = _safe_float(row.get("atr")) if row is not None else None
                     adx = _safe_float(row.get("adx")) if row is not None else None
-                    base_ctx.update({
-                        "ema200_1h": ema200_1h,
-                        "ema200_4h": ema200_4h,
-                        "rsi4h": rsi4h,
-                        "adx": adx,
-                    })
 
                     side_pref = None
                     if row is not None:
@@ -465,17 +506,19 @@ class TradingApp:
                     except Exception:
                         reasons_list = []
                     reasons = [f"{c}: {d}" for c, d in reasons_list if c or d]
-                    base_ctx.update(
-                        {
-                            "anchor": anchor,
-                            "step": step,
-                            "span": span,
-                            "atrp": atrp,
-                            "gate_ok": gate_ok,
-                            "reasons": reasons,
-                        }
-                    )
-                    _record_motive(self, base_ctx, overrides={}, price=price, side_pref=side_pref)
+                    overrides_ctx = {
+                        "ema200_1h": ema200_1h,
+                        "ema200_4h": ema200_4h,
+                        "rsi4h": rsi4h,
+                        "adx": adx,
+                        "anchor": anchor,
+                        "step": step,
+                        "span": span,
+                        "atrp": atrp,
+                        "gate_ok": gate_ok,
+                        "reasons": reasons,
+                    }
+                    _emit_motive(overrides_ctx, price_value=price, side_value=side_pref)
                 except Exception as _e:
                     logging.debug("No se pudo registrar motivo: %s", _e)
                 return
@@ -497,12 +540,7 @@ class TradingApp:
             entry_price = await self.exchange.get_current_price()
             if entry_price is None:
                 logging.warning("No se pudo obtener el precio de entrada actual.")
-                _record_motive(
-                    self,
-                    base_ctx,
-                    overrides={"reasons": ["exchange_error: precio de entrada no disponible"]},
-                    side_pref=signal,
-                )
+                _emit_motive({"reasons": ["exchange_error: precio de entrada no disponible"]}, side_value=signal)
                 return
             entry_price = float(entry_price)
             qty = (eq_on_open * leverage) / max(entry_price, 1e-12)
