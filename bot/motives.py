@@ -2,7 +2,12 @@ from __future__ import annotations
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
+
+try:
+    from zoneinfo import ZoneInfo  # py>=3.9
+except Exception:  # pragma: no cover - fallback para entornos sin zoneinfo
+    ZoneInfo = None
 
 # Prioridad de motivos (orden de aparición)
 PRIORITY = [
@@ -22,7 +27,7 @@ MSG = {
     "grid_oob":          "No tocó la zona de pullback",
     "trend_block_long":  "LONG bloqueado (precio < EMA200)",
     "trend_block_short": "SHORT bloqueado (precio > EMA200)",
-    "gate_fail":         "Ventaja insuficiente vs comisiones (gate)",
+    "gate_fail":         "Gate insuficiente (comisiones > ventaja)",
     "risk_block":        "Bloqueado por riesgo/stop",
     "min_notional":      "Tamaño mínimo del exchange no alcanzado",
     "low_vol":           "Volatilidad insuficiente (ATR bajo)",
@@ -37,13 +42,19 @@ MSG = {
 class MotiveItem:
     ts: float
     symbol: str
-    side_pref: str | None
+    side_pref: Optional[str]
     price: float
     codes: List[str] = field(default_factory=list)
     ctx: Dict[str, Any] = field(default_factory=dict)
 
-    def human_line(self) -> str:
-        t = datetime.fromtimestamp(self.ts, tz=timezone.utc).strftime("%H:%M")
+    def human_line(self, tz: Optional[str] = None) -> str:
+        dt = datetime.fromtimestamp(self.ts, tz=timezone.utc)
+        if tz and ZoneInfo:
+            try:
+                dt = dt.astimezone(ZoneInfo(tz))
+            except Exception:
+                pass
+        t = dt.strftime("%H:%M")
         # ordená por prioridad y remové duplicados preservando orden
         seen = set()
         ordered = [c for c in PRIORITY if c in self.codes and (c not in seen and not seen.add(c))]
