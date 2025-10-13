@@ -5,6 +5,7 @@ import unicodedata
 
 from trading import POSITION_SERVICE
 from config import S
+from bot.motives import MOTIVES
 
 from .telegram_bot import (
     _build_config_text,
@@ -602,55 +603,16 @@ class CommandBot:
 
         # --- RECIENTES / MOTIVOS ---
         if norm_all in ("recientes", "motivos"):
-            rej = []
-            # 1) API del engine, si existe
-            try:
-                rej = self.engine.recent_rejections(n=10)
-            except Exception:
-                rej = []
-            # 2) Fallback al notificador de Telegram (ring buffer)
-            if not rej:
-                tg = getattr(self.engine, "telegram", None)
-                if tg is not None:
-                    try:
-                        rej = list(getattr(tg, "_rejections", []))[:10]
-                    except Exception:
-                        rej = []
-            if not rej:
-                return await reply(
-                    "No tengo motivos registrados aún.\n"
-                    "Tip: activá diagnóstico con 'diag on' para registrar próximas oportunidades."
-                )
-            lines = []
-            for r in rej:
-                iso = r.get("iso") or r.get("ts") or ""
-                sym = r.get("symbol") or ""
-                reason = r.get("code") or r.get("reason") or ""
-                det = r.get("detail") or ""
-                # Traducciones simples de razones
-                if reason == "killswitch":
-                    reason_es = "Bot OFF (killswitch activado)"
-                elif reason == "entries_disabled":
-                    reason_es = "Entradas deshabilitadas por configuración"
-                elif reason.startswith("REJECT_CLUSTER_SIDE_EXPOSURE"):
-                    reason_es = reason.replace("REJECT_CLUSTER_SIDE_EXPOSURE", "Límite de exposición por clúster")
-                elif reason == "funding_guard":
-                    reason_es = "Funding anualizado por encima del límite"
-                elif reason == "cooldown":
-                    reason_es = "En cooldown entre entradas"
-                elif reason == "pre_open_checks":
-                    reason_es = f"Guardas de riesgo: {det}"
-                    det = ""
-                else:
-                    reason_es = reason
-                extra = []
-                for k, v in r.items():
-                    if k.startswith("extra_"):
-                        extra.append(f"{k[6:]}={v}")
-                extra_txt = (" [" + ", ".join(extra) + "]") if extra else ""
-                line = f"• {iso} — {sym}: {reason_es}" + (f" ({det})" if det else "") + extra_txt
-                lines.append(line)
-            return await reply("🕒 Motivos recientes (últimas 10 oportunidades NO abiertas):\n" + "\n".join(lines))
+            items = MOTIVES.last(10)
+            if not items:
+                return await reply("No hay rechazos recientes.")
+            lines = ["🕒 Motivos recientes (últimas 10 oportunidades NO abiertas):"]
+            for it in items:
+                try:
+                    lines.append(it.human_line())
+                except Exception:
+                    lines.append(str(it))
+            return await reply("\n".join(lines))
 
         # Sin match → ayuda breve
         return await reply("No entendí. Escribí *ayuda* para ver comandos.")

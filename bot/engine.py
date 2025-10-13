@@ -1,7 +1,9 @@
 import logging
+import math
 import asyncio
 from collections import deque
 from typing import cast
+from time import time as _now
 import pandas as pd
 import schedule
 from telegram.ext import ContextTypes
@@ -13,6 +15,7 @@ from bot.trader import Trader
 from bot.storage import Storage
 from bot.telemetry.notifier import Notifier
 from bot.telemetry.telegram_bot import setup_telegram_bot
+from bot.motives import MOTIVES, MotiveItem, compute_codes
 from core.strategy import Strategy
 from core.indicators import add_indicators
 from config import S
@@ -191,6 +194,130 @@ class TradingApp:
                         self.logger.info(f"SIGNAL DEBUG fallo: {e}")
 
                 logging.info("No se encontraron señales de entrada válidas.")
+                try:
+                    row = data.iloc[-1] if len(data) else None
+
+                    def _safe_float(value):
+                        try:
+                            f = float(value)
+                        except (TypeError, ValueError):
+                            return None
+                        return f if math.isfinite(f) else None
+
+                    price = _safe_float(row.get("close")) if row is not None else None
+                    ema200_1h = _safe_float(row.get("ema200")) if row is not None else None
+                    ema200_4h = _safe_float(row.get("ema200_4h")) if row is not None else None
+                    rsi4h = _safe_float(row.get("rsi4h")) if row is not None else None
+                    atr = _safe_float(row.get("atr")) if row is not None else None
+                    adx = _safe_float(row.get("adx")) if row is not None else None
+
+                    side_pref = None
+                    if row is not None:
+                        try:
+                            side_pref = self.strategy._decide_grid_side(row)
+                        except Exception:
+                            side_pref = None
+
+                    anchor = None
+                    if row is not None:
+                        try:
+                            anchor_val = self.strategy._anchor_price(row)
+                        except Exception:
+                            anchor_val = None
+                        anchor = _safe_float(anchor_val)
+
+                    step = None
+                    span = None
+                    if atr is not None:
+                        step_mult = _safe_float(self.config.get("grid_step_atr", 0.32))
+                        span_mult = _safe_float(self.config.get("grid_span_atr", 3.0))
+                        if step_mult is not None:
+                            step = step_mult * atr
+                        if span_mult is not None:
+                            span = span_mult * atr
+
+                    if (
+                        price is not None
+                        and anchor is not None
+                        and step is not None
+                        and span is not None
+                    ):
+                        try:
+                            anchor_frozen, step_frozen, span_frozen, _ = self.strategy._apply_anchor_freeze(
+                                side_pref if side_pref in ("LONG", "SHORT") else None,
+                                price,
+                                anchor,
+                                step,
+                                span,
+                            )
+                            anchor = _safe_float(anchor_frozen)
+                            step = _safe_float(step_frozen)
+                            span = _safe_float(span_frozen)
+                        except Exception:
+                            pass
+
+                    atrp = None
+                    if atr is not None and price is not None and price != 0.0:
+                        atrp = atr / price
+
+                    gate_ok = None
+                    gate_bps = self.config.get("funding_gate_bps")
+                    rate_now = self.config.get("_funding_rate_now")
+                    if (
+                        gate_bps is not None
+                        and rate_now is not None
+                        and side_pref in ("LONG", "SHORT")
+                    ):
+                        try:
+                            g_frac = float(gate_bps) / 10000.0
+                            r_dec = float(rate_now)
+                            gate_ok = not (
+                                (side_pref == "LONG" and r_dec > g_frac)
+                                or (side_pref == "SHORT" and r_dec < -g_frac)
+                            )
+                        except (TypeError, ValueError):
+                            gate_ok = None
+
+                    reasons_list = []
+                    try:
+                        reasons_list = self.strategy.get_rejection_reasons_all(data)
+                    except Exception:
+                        reasons_list = []
+                    reasons = [f"{c}: {d}" for c, d in reasons_list if c or d]
+
+                    ctx = {
+                        "price": price,
+                        "anchor": anchor,
+                        "step": step,
+                        "span": span,
+                        "ema200_1h": ema200_1h,
+                        "ema200_4h": ema200_4h,
+                        "atrp": atrp,
+                        "adx": adx,
+                        "rsi4h": rsi4h,
+                        "gate_ok": gate_ok,
+                        "risk_ok": None,
+                        "has_open": bool(position),
+                        "cooldown": bool(getattr(self, "cooldown_active", False)),
+                        "freeze_90": bool(getattr(self, "freeze_90_active", False)),
+                        "blackout": bool(getattr(self, "blackout_active", False)),
+                        "reasons": reasons,
+                        "adx_thr": float(getattr(self, "adx_strong_threshold", 25.0)),
+                    }
+
+                    codes = compute_codes(ctx)
+                    MOTIVES.add(
+                        MotiveItem(
+                            ts=_now(),
+                            symbol=self.config.get("symbol", "BTC/USDT"),
+                            side_pref=str(side_pref) if side_pref is not None else None,
+                            price=price if price is not None else 0.0,
+                            codes=codes,
+                            ctx=ctx,
+                        )
+                    )
+                except Exception as _e:
+                    logging.debug("No se pudo registrar motivo: %s", _e)
                 return
 
             eq_now = await self.trader.get_balance(self.exchange)
