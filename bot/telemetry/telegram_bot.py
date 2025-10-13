@@ -20,6 +20,7 @@ from logging_setup import LOG_DIR, LOG_FILE
 from time_fmt import fmt_ar
 from config import S
 from bot.motives import MOTIVES
+from bot.mode_manager import get_mode
 from bot.telemetry.command_registry import CommandRegistry
 from trading import BROKER, POSITION_SERVICE, switch_mode
 
@@ -408,28 +409,103 @@ def _build_rendimiento_text(engine) -> str:
     return "\n".join(lines)
 
 
-def _build_config_text(engine) -> str:
-    cfg = _engine_config(engine)
-    risk = cfg.get("risk", {}) if isinstance(cfg, dict) else {}
-    strategy = cfg.get("strategy", {}) if isinstance(cfg, dict) else {}
-    order = cfg.get("order_sizing", {}) if isinstance(cfg, dict) else {}
-    execution = cfg.get("execution", {}) if isinstance(cfg, dict) else {}
-    leverage = cfg.get("leverage", {}) if isinstance(cfg, dict) else {}
-    lines = [
-        "⚙️ Configuración actual",
-        f"Modo: {cfg.get('mode', 'paper')} | Timeframe: {cfg.get('timeframe', '?')}",
-        "--- Riesgo ---",
-        f"Size mode: {risk.get('size_mode', 'desconocido')} | Max hold bars: {risk.get('max_hold_bars', 'N/A')}",
-        f"Equity USDT: {risk.get('equity_usdt', 'N/A')} | Max riesgo trade: {risk.get('max_risk_per_trade_pct', 'N/A')}",
-        "--- Estrategia ---",
-        f"Entry mode: {strategy.get('entry_mode', 'N/A')} | RSI gate: {strategy.get('rsi4h_gate', 'N/A')}",
-        f"Target EQ PnL %: {strategy.get('target_eq_pnl_pct', 'N/A')} | EMA200 1h confirm: {strategy.get('ema200_1h_confirm', 'N/A')}",
-        "--- Tamaños de orden ---",
-        f"Pct min/default/max: {order.get('min_pct', 'N/A')} / {order.get('default_pct', 'N/A')} / {order.get('max_pct', 'N/A')}",
-        "--- Ejecución ---",
-        f"Leverage set: {execution.get('leverage', leverage.get('default', 'N/A'))} | Slippage bps: {execution.get('slippage_bps', 'N/A')}",
+def _fmt_config_num(value, digits=2, suffix=""):
+    try:
+        if value is None:
+            return "N/A"
+        if isinstance(value, bool):
+            return "Sí" if value else "No"
+        return f"{float(value):.{digits}f}{suffix}"
+    except Exception:
+        return str(value) if value is not None else "N/A"
+
+
+async def _cmd_config(engine, reply):
+    modo = get_mode()
+    timeframe = getattr(S, "tf", None) or getattr(S, "timeframe", None) or "1h"
+
+    size_mode = getattr(S, "size_mode", None)
+    sl_atr_mult = getattr(S, "sl_atr_mult", None)
+    max_hold_bars = getattr(S, "max_hold_bars", None)
+    daily_stop_R = getattr(S, "daily_stop_R", None)
+    emerg_trade_stop_R = getattr(S, "emerg_trade_stop_R", None)
+    trail_to_be = getattr(S, "trail_to_be", None)
+
+    target_eq_pnl_pct = getattr(S, "target_eq_pnl_pct", None)
+    rsi_gate = getattr(S, "rsi_gate", None)
+    ema200_1h_confirm = getattr(S, "ema200_1h_confirm", None)
+    ema200_4h_confirm = getattr(S, "ema200_4h_confirm", None)
+    entry_mode = getattr(S, "entry_mode", None)
+
+    leverage_base = getattr(S, "leverage_base", None)
+    leverage_strong = getattr(S, "leverage_strong", None)
+    adx_strong_threshold = getattr(S, "adx_strong_threshold", None)
+
+    pct_min = getattr(S, "order_pct_min", None)
+    pct_def = getattr(S, "order_pct_default", None)
+    pct_max = getattr(S, "order_pct_max", None)
+
+    slippage_bps = getattr(S, "slippage_bps", None)
+    leverage_set_last = getattr(engine, "last_leverage", None) if engine else None
+
+    equity_line = "N/A"
+    try:
+        if modo == "simulado":
+            store = (
+                getattr(engine, "paper_store", None)
+                or getattr(engine, "STORE", None)
+                or getattr(POSITION_SERVICE, "paper_store", None)
+            )
+            if store and getattr(store, "state", None):
+                eq = store.state.get("equity")
+                equity_line = f"{_fmt_config_num(eq, 2)} USDT"
+        else:
+            if hasattr(POSITION_SERVICE, "get_balance"):
+                bal = POSITION_SERVICE.get_balance()
+                if isinstance(bal, dict):
+                    eq = bal.get("USDT") or bal.get("total") or bal.get("free")
+                    if eq is not None:
+                        equity_line = f"{_fmt_config_num(eq, 2)} USDT"
+    except Exception:
+        pass
+
+    target_pct = None
+    if target_eq_pnl_pct is not None:
+        try:
+            if target_eq_pnl_pct < 1:
+                target_pct = target_eq_pnl_pct * 100
+            else:
+                target_pct = target_eq_pnl_pct
+        except Exception:
+            target_pct = target_eq_pnl_pct
+
+    text = [
+        "⚙️ *Configuración actual*",
+        f"Modo: *{modo}* | Timeframe: *{timeframe}*",
+        "",
+        "— *Riesgo* —",
+        f"Size mode: {size_mode or 'desconocido'} | Max hold bars: {max_hold_bars or 'N/A'}",
+        f"SL ATR mult: {_fmt_config_num(sl_atr_mult)} | Stop diario (R): {_fmt_config_num(daily_stop_R)} | Emerg(R): {_fmt_config_num(emerg_trade_stop_R)}",
+        f"Trail to BE: {_fmt_config_num(trail_to_be, 0)}",
+        "",
+        "— *Estrategia* —",
+        f"Entry mode: {entry_mode or 'N/A'} | RSI gate: {rsi_gate if rsi_gate is not None else 'N/A'}",
+        f"Target EQ PnL %: {_fmt_config_num(target_pct, 2, '%')}",
+        f"EMA200 1h confirm: {_fmt_config_num(ema200_1h_confirm, 0)} | EMA200 4h confirm: {_fmt_config_num(ema200_4h_confirm, 0)}",
+        "",
+        "— *Tamaños de orden* —",
+        f"Pct min/default/max: {_fmt_config_num(pct_min, 2, '%')} / {_fmt_config_num(pct_def, 2, '%')} / {_fmt_config_num(pct_max, 2, '%')}",
+        "",
+        "— *Leverage* —",
+        f"Base: {_fmt_config_num(leverage_base, 1, 'x')} | Strong: {_fmt_config_num(leverage_strong, 1, 'x')} | ADX fuerte ≥ {_fmt_config_num(adx_strong_threshold, 0)}",
+        "",
+        "— *Ejecución* —",
+        f"Leverage set: {_fmt_config_num(leverage_set_last, 1, 'x')} | Slippage bps: {_fmt_config_num(slippage_bps, 0)}",
+        "",
+        f"Equity USDT: {equity_line}",
     ]
-    return "\n".join(lines)
+
+    return await reply("\n".join(text), parse_mode="Markdown")
 
 
 def _read_logs_text(engine, limit: int = 15) -> str:
@@ -796,8 +872,10 @@ async def precio_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def config_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     engine = _get_engine_from_context(context)
-    text = _build_config_text(engine)
-    await _reply_chunks(update, text)
+    message = update.effective_message
+    if message is None:
+        return
+    await _cmd_config(engine, message.reply_text)
 
 
 async def pausa_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
