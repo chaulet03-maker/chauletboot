@@ -166,6 +166,18 @@ async def _cmd_posicion(engine, reply):
     )
     return await reply(msg)
 
+
+async def _cmd_motivos(engine, reply, n: int = 10):
+    items = MOTIVES.last(n)
+    if not items:
+        return await reply("No hay rechazos recientes.")
+    tz = getattr(S, "output_timezone", "America/Argentina/Buenos_Aires") if hasattr(S, "output_timezone") else "America/Argentina/Buenos_Aires"
+    lines = ["🕒 Motivos recientes (últimas 10 oportunidades NO abiertas):"]
+    for it in items:
+        lines.append(it.human_line(tz=tz))
+    log.debug("MOTIVOS cmd: %d items. Ejemplo: %s", len(items), lines[1] if len(lines)>1 else "—")
+    return await reply("\n".join(lines))
+
 # ========= Stats / Reportes =========
 
 def _read_csv(path: str) -> Tuple[List[Dict], List[str]]:
@@ -603,17 +615,7 @@ class CommandBot:
 
         # --- RECIENTES / MOTIVOS ---
         if norm_all in ("recientes", "motivos"):
-            items = MOTIVES.last(10)
-            if not items:
-                return await reply("No hay rechazos recientes.")
-            lines = ["🕒 Motivos recientes (últimas 10 oportunidades NO abiertas):"]
-            tz = getattr(S, "output_timezone", None) or "America/Argentina/Buenos_Aires"
-            for it in items:
-                try:
-                    lines.append(it.human_line(tz=tz))
-                except Exception:
-                    lines.append(str(it))
-            return await reply("\n".join(lines))
+            return await _cmd_motivos(self.engine, reply, 10)
 
         # Sin match → ayuda breve
         return await reply("No entendí. Escribí *ayuda* para ver comandos.")
