@@ -21,6 +21,7 @@ from time_fmt import fmt_ar
 from config import S
 from bot.motives import MOTIVES
 from bot.mode_manager import get_mode
+from bot.settings_utils import get_val, read_config_raw
 from bot.telemetry.command_registry import CommandRegistry
 from trading import BROKER, POSITION_SERVICE, switch_mode
 
@@ -421,31 +422,32 @@ def _fmt_config_num(value, digits=2, suffix=""):
 
 
 async def _cmd_config(engine, reply):
+    cfg = read_config_raw()
     modo = get_mode()
-    timeframe = getattr(S, "tf", None) or getattr(S, "timeframe", None) or "1h"
+    timeframe = get_val(S, cfg, "tf", "timeframe", default="1h")
 
-    size_mode = getattr(S, "size_mode", None)
-    sl_atr_mult = getattr(S, "sl_atr_mult", None)
-    max_hold_bars = getattr(S, "max_hold_bars", None)
-    daily_stop_R = getattr(S, "daily_stop_R", None)
-    emerg_trade_stop_R = getattr(S, "emerg_trade_stop_R", None)
-    trail_to_be = getattr(S, "trail_to_be", None)
+    size_mode = get_val(S, cfg, "size_mode")
+    sl_atr_mult = get_val(S, cfg, "sl_atr_mult")
+    max_hold_bars = get_val(S, cfg, "max_hold_bars")
+    daily_stop_R = get_val(S, cfg, "daily_stop_R", "daily_stop_r")
+    emerg_trade_stop_R = get_val(S, cfg, "emerg_trade_stop_R", "emerg_trade_stop_r")
+    trail_to_be = get_val(S, cfg, "trail_to_be")
 
-    target_eq_pnl_pct = getattr(S, "target_eq_pnl_pct", None)
-    rsi_gate = getattr(S, "rsi_gate", None)
-    ema200_1h_confirm = getattr(S, "ema200_1h_confirm", None)
-    ema200_4h_confirm = getattr(S, "ema200_4h_confirm", None)
-    entry_mode = getattr(S, "entry_mode", None)
+    entry_mode = get_val(S, cfg, "entry_mode")
+    rsi_gate = get_val(S, cfg, "rsi_gate")
+    target_eq_pnl_pct = get_val(S, cfg, "target_eq_pnl_pct")
+    ema200_1h_confirm = get_val(S, cfg, "ema200_1h_confirm")
+    ema200_4h_confirm = get_val(S, cfg, "ema200_4h_confirm")
 
-    leverage_base = getattr(S, "leverage_base", None)
-    leverage_strong = getattr(S, "leverage_strong", None)
-    adx_strong_threshold = getattr(S, "adx_strong_threshold", None)
+    leverage_base = get_val(S, cfg, "leverage_base")
+    leverage_strong = get_val(S, cfg, "leverage_strong")
+    adx_strong_threshold = get_val(S, cfg, "adx_strong_threshold")
 
-    pct_min = getattr(S, "order_pct_min", None)
-    pct_def = getattr(S, "order_pct_default", None)
-    pct_max = getattr(S, "order_pct_max", None)
+    pct_min = get_val(S, cfg, "order_pct_min")
+    pct_def = get_val(S, cfg, "order_pct_default")
+    pct_max = get_val(S, cfg, "order_pct_max")
 
-    slippage_bps = getattr(S, "slippage_bps", None)
+    slippage_bps = get_val(S, cfg, "slippage_bps")
     leverage_set_last = getattr(engine, "last_leverage", None) if engine else None
 
     equity_line = "N/A"
@@ -458,7 +460,8 @@ async def _cmd_config(engine, reply):
             )
             if store and getattr(store, "state", None):
                 eq = store.state.get("equity")
-                equity_line = f"{_fmt_config_num(eq, 2)} USDT"
+                if eq is not None:
+                    equity_line = f"{_fmt_config_num(eq, 2)} USDT"
         else:
             if hasattr(POSITION_SERVICE, "get_balance"):
                 bal = POSITION_SERVICE.get_balance()
@@ -469,7 +472,7 @@ async def _cmd_config(engine, reply):
     except Exception:
         pass
 
-    target_pct = None
+    target_pct = target_eq_pnl_pct
     if target_eq_pnl_pct is not None:
         try:
             if target_eq_pnl_pct < 1:
@@ -480,7 +483,7 @@ async def _cmd_config(engine, reply):
             target_pct = target_eq_pnl_pct
 
     text = [
-        "⚙️ *Configuración actual*",
+        "🛠️ *Configuración actual*",
         f"Modo: *{modo}* | Timeframe: *{timeframe}*",
         "",
         "— *Riesgo* —",
