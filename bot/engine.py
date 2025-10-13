@@ -132,6 +132,149 @@ class TradingApp:
                         self._apply_funding_if_needed(now_ts, float(last_price), side, qty)
                 except Exception as exc:
                     logging.debug("No se pudo aplicar funding a la posición abierta: %s", exc)
+                price = float(last_price) if 'last_price' in locals() and last_price is not None else None
+                try:
+                    ctx = {
+                        "price": price,
+                        "anchor": None,
+                        "step": None,
+                        "span": None,
+                        "ema200_1h": None,
+                        "ema200_4h": None,
+                        "atrp": None,
+                        "adx": None,
+                        "rsi4h": None,
+                        "gate_ok": None,
+                        "risk_ok": None,
+                        "has_open": bool(position),
+                        "cooldown": bool(getattr(self, "cooldown_active", False)),
+                        "freeze_90": bool(getattr(self, "freeze_90_active", False)),
+                        "blackout": bool(getattr(self, "blackout_active", False)),
+                        "reasons": None,
+                        "adx_thr": float(getattr(self, "adx_strong_threshold", 25.0)),
+                    }
+                    codes = compute_codes(ctx)
+                    MOTIVES.add(MotiveItem(
+                        ts=_now(),
+                        symbol=self.config.get("symbol", "BTC/USDT"),
+                        side_pref=str(position.get('side')) if position else None,
+                        price=float(price) if price is not None else 0.0,
+                        codes=codes, ctx=ctx
+                    ))
+                    logging.debug("MOTIVES: registrado %s", codes)
+                except Exception as _e:
+                    logging.debug("MOTIVES: fallo al registrar: %s", _e)
+                return
+
+            blackout_active = getattr(self, "blackout_active", False)
+            if blackout_active:
+                logging.info("Blackout activo, no se evaluarán nuevas entradas.")
+                price = self.price_cache.get(self.config.get('symbol', 'BTC/USDT')) if hasattr(self, 'price_cache') else None
+                try:
+                    ctx = {
+                        "price": float(price) if price is not None else None,
+                        "anchor": None,
+                        "step": None,
+                        "span": None,
+                        "ema200_1h": None,
+                        "ema200_4h": None,
+                        "atrp": None,
+                        "adx": None,
+                        "rsi4h": None,
+                        "gate_ok": None,
+                        "risk_ok": None,
+                        "has_open": bool(position),
+                        "cooldown": bool(getattr(self, "cooldown_active", False)),
+                        "freeze_90": bool(getattr(self, "freeze_90_active", False)),
+                        "blackout": bool(blackout_active),
+                        "reasons": None,
+                        "adx_thr": float(getattr(self, "adx_strong_threshold", 25.0)),
+                    }
+                    codes = compute_codes(ctx)
+                    MOTIVES.add(MotiveItem(
+                        ts=_now(),
+                        symbol=self.config.get("symbol", "BTC/USDT"),
+                        side_pref=None,
+                        price=float(ctx.get("price") or 0.0),
+                        codes=codes, ctx=ctx
+                    ))
+                    logging.debug("MOTIVES: registrado %s", codes)
+                except Exception as _e:
+                    logging.debug("MOTIVES: fallo al registrar: %s", _e)
+                return
+
+            freeze_90_active = getattr(self, "freeze_90_active", False)
+            if freeze_90_active:
+                logging.info("Congelamiento 90%% activo, no se evaluarán nuevas entradas.")
+                price = self.price_cache.get(self.config.get('symbol', 'BTC/USDT')) if hasattr(self, 'price_cache') else None
+                try:
+                    ctx = {
+                        "price": float(price) if price is not None else None,
+                        "anchor": None,
+                        "step": None,
+                        "span": None,
+                        "ema200_1h": None,
+                        "ema200_4h": None,
+                        "atrp": None,
+                        "adx": None,
+                        "rsi4h": None,
+                        "gate_ok": None,
+                        "risk_ok": None,
+                        "has_open": bool(position),
+                        "cooldown": bool(getattr(self, "cooldown_active", False)),
+                        "freeze_90": bool(freeze_90_active),
+                        "blackout": bool(blackout_active),
+                        "reasons": None,
+                        "adx_thr": float(getattr(self, "adx_strong_threshold", 25.0)),
+                    }
+                    codes = compute_codes(ctx)
+                    MOTIVES.add(MotiveItem(
+                        ts=_now(),
+                        symbol=self.config.get("symbol", "BTC/USDT"),
+                        side_pref=None,
+                        price=float(ctx.get("price") or 0.0),
+                        codes=codes, ctx=ctx
+                    ))
+                    logging.debug("MOTIVES: registrado %s", codes)
+                except Exception as _e:
+                    logging.debug("MOTIVES: fallo al registrar: %s", _e)
+                return
+
+            cooldown_active = getattr(self, "cooldown_active", False)
+            if cooldown_active:
+                logging.info("Cooldown activo, no se evaluarán nuevas entradas.")
+                price = self.price_cache.get(self.config.get('symbol', 'BTC/USDT')) if hasattr(self, 'price_cache') else None
+                try:
+                    ctx = {
+                        "price": float(price) if price is not None else None,
+                        "anchor": None,
+                        "step": None,
+                        "span": None,
+                        "ema200_1h": None,
+                        "ema200_4h": None,
+                        "atrp": None,
+                        "adx": None,
+                        "rsi4h": None,
+                        "gate_ok": None,
+                        "risk_ok": None,
+                        "has_open": bool(position),
+                        "cooldown": bool(cooldown_active),
+                        "freeze_90": bool(freeze_90_active),
+                        "blackout": bool(blackout_active),
+                        "reasons": None,
+                        "adx_thr": float(getattr(self, "adx_strong_threshold", 25.0)),
+                    }
+                    codes = compute_codes(ctx)
+                    MOTIVES.add(MotiveItem(
+                        ts=_now(),
+                        symbol=self.config.get("symbol", "BTC/USDT"),
+                        side_pref=None,
+                        price=float(ctx.get("price") or 0.0),
+                        codes=codes, ctx=ctx
+                    ))
+                    logging.debug("MOTIVES: registrado %s", codes)
+                except Exception as _e:
+                    logging.debug("MOTIVES: fallo al registrar: %s", _e)
                 return
 
             if self.is_paused:
@@ -310,8 +453,8 @@ class TradingApp:
                         MotiveItem(
                             ts=_now(),
                             symbol=self.config.get("symbol", "BTC/USDT"),
-                            side_pref=str(side_pref) if side_pref is not None else None,
-                            price=price if price is not None else 0.0,
+                            side_pref=str(side_pref) if 'side_pref' in locals() and side_pref is not None else None,
+                            price=float(price) if price is not None else 0.0,
                             codes=codes,
                             ctx=ctx,
                         )
