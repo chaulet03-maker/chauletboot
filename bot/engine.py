@@ -2,7 +2,7 @@ import logging
 import math
 import asyncio
 from collections import deque
-from typing import cast
+from typing import Any, Dict, Optional, cast
 from time import time as _now
 import pandas as pd
 import schedule
@@ -20,6 +20,85 @@ from core.strategy import Strategy
 from core.indicators import add_indicators
 from config import S
 from trading import BROKER, POSITION_SERVICE
+
+
+def _record_motive(
+    self,
+    base_ctx: Optional[Dict[str, Any]] = None,
+    overrides: Optional[Dict[str, Any]] = None,
+    price: Optional[float] = None,
+    side_pref: Optional[str] = None,
+):
+    ctx: Dict[str, Any] = {
+        "price": None,
+        "anchor": None,
+        "step": None,
+        "span": None,
+        "ema200_1h": None,
+        "ema200_4h": None,
+        "atrp": None,
+        "adx": None,
+        "rsi4h": None,
+        "gate_ok": None,
+        "risk_ok": None,
+        "has_open": False,
+        "cooldown": bool(getattr(self, "cooldown_active", False)),
+        "freeze_90": bool(getattr(self, "freeze_90_active", False)),
+        "blackout": bool(getattr(self, "blackout_active", False)),
+        "reasons": [],
+        "adx_thr": float(getattr(self, "adx_strong_threshold", 25.0)),
+    }
+
+    def _merge(src: Optional[Dict[str, Any]]):
+        if not src:
+            return
+        for key, value in src.items():
+            if key == "reasons":
+                if value is None:
+                    continue
+                if isinstance(value, (list, tuple, set)):
+                    ctx["reasons"].extend(str(v) for v in value if v is not None)
+                else:
+                    ctx["reasons"].append(str(value))
+            else:
+                ctx[key] = value
+
+    _merge(base_ctx)
+    _merge(overrides)
+
+    if ctx.get("price") is None and price is not None:
+        ctx["price"] = price
+
+    if not ctx["reasons"]:
+        ctx["reasons"] = []
+    else:
+        # Deduplicar manteniendo orden
+        seen = set()
+        deduped = []
+        for reason in ctx["reasons"]:
+            if reason not in seen:
+                deduped.append(reason)
+                seen.add(reason)
+        ctx["reasons"] = deduped
+
+    final_price = ctx.get("price")
+    try:
+        final_price = float(final_price) if final_price is not None else float(price or 0.0)
+    except Exception:
+        final_price = 0.0
+
+    codes = compute_codes(ctx)
+    MOTIVES.add(
+        MotiveItem(
+            ts=_now(),
+            symbol=self.config.get("symbol", "BTC/USDT"),
+            side_pref=str(side_pref) if side_pref is not None else None,
+            price=final_price,
+            codes=codes,
+            ctx=ctx,
+        )
+    )
+    self.logger.debug("MOTIVES/REC %s", codes)
 
 
 class TradingApp:
@@ -115,6 +194,32 @@ class TradingApp:
                         await self.trader.set_position(position)
                 except Exception as exc:
                     logging.debug("PositionService fallback fail: %s", exc)
+
+            cooldown_active = bool(getattr(self, "cooldown_active", False))
+            freeze_90_active = bool(getattr(self, "freeze_90_active", False))
+            blackout_active = bool(getattr(self, "blackout_active", False))
+
+            base_ctx: Dict[str, Any] = {
+                "price": None,
+                "anchor": None,
+                "step": None,
+                "span": None,
+                "ema200_1h": None,
+                "ema200_4h": None,
+                "atrp": None,
+                "adx": None,
+                "rsi4h": None,
+                "gate_ok": None,
+                "risk_ok": None,
+                "has_open": bool(position),
+                "cooldown": cooldown_active,
+                "freeze_90": freeze_90_active,
+                "blackout": blackout_active,
+                "reasons": [],
+                "adx_thr": float(getattr(self, "adx_strong_threshold", 25.0)),
+            }
+            side_pref: Optional[str] = None
+
             if position:
                 logging.info(
                     "Posición abierta detectada: %s %.6f %s",
@@ -122,6 +227,7 @@ class TradingApp:
                     float(position.get('contracts') or position.get('size') or 0.0),
                     position.get('symbol') or self.config.get('symbol'),
                 )
+                last_price = None
                 try:
                     now_ts = pd.Timestamp.utcnow().tz_localize("UTC")
                     last_price = await self.exchange.get_current_price(self.config.get('symbol'))
@@ -132,153 +238,62 @@ class TradingApp:
                         self._apply_funding_if_needed(now_ts, float(last_price), side, qty)
                 except Exception as exc:
                     logging.debug("No se pudo aplicar funding a la posición abierta: %s", exc)
-                price = float(last_price) if 'last_price' in locals() and last_price is not None else None
+
+                price_val = None
                 try:
-                    ctx = {
-                        "price": price,
-                        "anchor": None,
-                        "step": None,
-                        "span": None,
-                        "ema200_1h": None,
-                        "ema200_4h": None,
-                        "atrp": None,
-                        "adx": None,
-                        "rsi4h": None,
-                        "gate_ok": None,
-                        "risk_ok": None,
-                        "has_open": bool(position),
-                        "cooldown": bool(getattr(self, "cooldown_active", False)),
-                        "freeze_90": bool(getattr(self, "freeze_90_active", False)),
-                        "blackout": bool(getattr(self, "blackout_active", False)),
-                        "reasons": None,
-                        "adx_thr": float(getattr(self, "adx_strong_threshold", 25.0)),
-                    }
-                    codes = compute_codes(ctx)
-                    MOTIVES.add(MotiveItem(
-                        ts=_now(),
-                        symbol=self.config.get("symbol", "BTC/USDT"),
-                        side_pref=str(position.get('side')) if position else None,
-                        price=float(price) if price is not None else 0.0,
-                        codes=codes, ctx=ctx
-                    ))
-                    logging.debug("MOTIVES: registrado %s", codes)
-                except Exception as _e:
-                    logging.debug("MOTIVES: fallo al registrar: %s", _e)
+                    price_val = float(last_price) if last_price is not None else None
+                except Exception:
+                    price_val = None
+
+                base_ctx.update({"price": price_val, "has_open": True})
+                _record_motive(
+                    self,
+                    base_ctx,
+                    overrides={},
+                    price=price_val,
+                    side_pref=position.get('side'),
+                )
                 return
 
-            blackout_active = getattr(self, "blackout_active", False)
             if blackout_active:
                 logging.info("Blackout activo, no se evaluarán nuevas entradas.")
-                price = self.price_cache.get(self.config.get('symbol', 'BTC/USDT')) if hasattr(self, 'price_cache') else None
+                price_val = None
                 try:
-                    ctx = {
-                        "price": float(price) if price is not None else None,
-                        "anchor": None,
-                        "step": None,
-                        "span": None,
-                        "ema200_1h": None,
-                        "ema200_4h": None,
-                        "atrp": None,
-                        "adx": None,
-                        "rsi4h": None,
-                        "gate_ok": None,
-                        "risk_ok": None,
-                        "has_open": bool(position),
-                        "cooldown": bool(getattr(self, "cooldown_active", False)),
-                        "freeze_90": bool(getattr(self, "freeze_90_active", False)),
-                        "blackout": bool(blackout_active),
-                        "reasons": None,
-                        "adx_thr": float(getattr(self, "adx_strong_threshold", 25.0)),
-                    }
-                    codes = compute_codes(ctx)
-                    MOTIVES.add(MotiveItem(
-                        ts=_now(),
-                        symbol=self.config.get("symbol", "BTC/USDT"),
-                        side_pref=None,
-                        price=float(ctx.get("price") or 0.0),
-                        codes=codes, ctx=ctx
-                    ))
-                    logging.debug("MOTIVES: registrado %s", codes)
-                except Exception as _e:
-                    logging.debug("MOTIVES: fallo al registrar: %s", _e)
+                    price_cached = self.price_cache.get(self.config.get('symbol', 'BTC/USDT'))
+                    price_val = float(price_cached) if price_cached is not None else None
+                except Exception:
+                    price_val = None
+                base_ctx.update({"price": price_val, "blackout": True})
+                _record_motive(self, base_ctx, overrides={"blackout": True}, price=price_val, side_pref=side_pref)
                 return
 
-            freeze_90_active = getattr(self, "freeze_90_active", False)
             if freeze_90_active:
                 logging.info("Congelamiento 90%% activo, no se evaluarán nuevas entradas.")
-                price = self.price_cache.get(self.config.get('symbol', 'BTC/USDT')) if hasattr(self, 'price_cache') else None
+                price_val = None
                 try:
-                    ctx = {
-                        "price": float(price) if price is not None else None,
-                        "anchor": None,
-                        "step": None,
-                        "span": None,
-                        "ema200_1h": None,
-                        "ema200_4h": None,
-                        "atrp": None,
-                        "adx": None,
-                        "rsi4h": None,
-                        "gate_ok": None,
-                        "risk_ok": None,
-                        "has_open": bool(position),
-                        "cooldown": bool(getattr(self, "cooldown_active", False)),
-                        "freeze_90": bool(freeze_90_active),
-                        "blackout": bool(blackout_active),
-                        "reasons": None,
-                        "adx_thr": float(getattr(self, "adx_strong_threshold", 25.0)),
-                    }
-                    codes = compute_codes(ctx)
-                    MOTIVES.add(MotiveItem(
-                        ts=_now(),
-                        symbol=self.config.get("symbol", "BTC/USDT"),
-                        side_pref=None,
-                        price=float(ctx.get("price") or 0.0),
-                        codes=codes, ctx=ctx
-                    ))
-                    logging.debug("MOTIVES: registrado %s", codes)
-                except Exception as _e:
-                    logging.debug("MOTIVES: fallo al registrar: %s", _e)
+                    price_cached = self.price_cache.get(self.config.get('symbol', 'BTC/USDT'))
+                    price_val = float(price_cached) if price_cached is not None else None
+                except Exception:
+                    price_val = None
+                base_ctx.update({"price": price_val, "freeze_90": True})
+                _record_motive(self, base_ctx, overrides={"freeze_90": True}, price=price_val, side_pref=side_pref)
                 return
 
-            cooldown_active = getattr(self, "cooldown_active", False)
             if cooldown_active:
                 logging.info("Cooldown activo, no se evaluarán nuevas entradas.")
-                price = self.price_cache.get(self.config.get('symbol', 'BTC/USDT')) if hasattr(self, 'price_cache') else None
+                price_val = None
                 try:
-                    ctx = {
-                        "price": float(price) if price is not None else None,
-                        "anchor": None,
-                        "step": None,
-                        "span": None,
-                        "ema200_1h": None,
-                        "ema200_4h": None,
-                        "atrp": None,
-                        "adx": None,
-                        "rsi4h": None,
-                        "gate_ok": None,
-                        "risk_ok": None,
-                        "has_open": bool(position),
-                        "cooldown": bool(cooldown_active),
-                        "freeze_90": bool(freeze_90_active),
-                        "blackout": bool(blackout_active),
-                        "reasons": None,
-                        "adx_thr": float(getattr(self, "adx_strong_threshold", 25.0)),
-                    }
-                    codes = compute_codes(ctx)
-                    MOTIVES.add(MotiveItem(
-                        ts=_now(),
-                        symbol=self.config.get("symbol", "BTC/USDT"),
-                        side_pref=None,
-                        price=float(ctx.get("price") or 0.0),
-                        codes=codes, ctx=ctx
-                    ))
-                    logging.debug("MOTIVES: registrado %s", codes)
-                except Exception as _e:
-                    logging.debug("MOTIVES: fallo al registrar: %s", _e)
+                    price_cached = self.price_cache.get(self.config.get('symbol', 'BTC/USDT'))
+                    price_val = float(price_cached) if price_cached is not None else None
+                except Exception:
+                    price_val = None
+                base_ctx.update({"price": price_val, "cooldown": True})
+                _record_motive(self, base_ctx, overrides={"cooldown": True}, price=price_val, side_pref=side_pref)
                 return
 
             if self.is_paused:
                 logging.info("El bot está en pausa, no se buscan nuevas señales.")
+                _record_motive(self, base_ctx, overrides={"reasons": ["bot en pausa"]}, side_pref=side_pref)
                 return
 
             klines_1h = await self.exchange.get_klines('1h')
@@ -286,6 +301,12 @@ class TradingApp:
 
             if not klines_1h or not klines_4h:
                 logging.warning("No se pudieron obtener los datos de mercado en este ciclo.")
+                _record_motive(
+                    self,
+                    base_ctx,
+                    overrides={"reasons": ["exchange_error: sin datos de klines"]},
+                    side_pref=side_pref,
+                )
                 return
 
             df_1h = pd.DataFrame(klines_1h, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
@@ -301,6 +322,15 @@ class TradingApp:
 
             if self._should_block_new_trade_today(now_ts):
                 logging.info("Daily stop alcanzado, no se abrirán nuevas operaciones hoy.")
+                price_stop = last_candle.get('close')
+                try:
+                    price_stop = float(price_stop) if price_stop is not None else None
+                except Exception:
+                    price_stop = None
+                if price_stop is not None:
+                    base_ctx["price"] = price_stop
+                overrides = {"risk_ok": False, "reasons": ["Daily stop alcanzado"]}
+                _record_motive(self, base_ctx, overrides=overrides, price=price_stop, side_pref=side_pref)
                 return
 
             if self.config.get("funding_interval_hours", 8) and self.config.get("funding_gate_bps") is not None:
@@ -317,6 +347,7 @@ class TradingApp:
                     self.config.pop("_funding_rate_bps_now", None)
 
             signal = self.strategy.check_entry_signal(data)
+            base_ctx["reasons"] = []
             if not signal:
                 try:
                     code, detail, extras = self.strategy.get_rejection_reason(data)
@@ -348,11 +379,18 @@ class TradingApp:
                         return f if math.isfinite(f) else None
 
                     price = _safe_float(row.get("close")) if row is not None else None
+                    base_ctx["price"] = price
                     ema200_1h = _safe_float(row.get("ema200")) if row is not None else None
                     ema200_4h = _safe_float(row.get("ema200_4h")) if row is not None else None
                     rsi4h = _safe_float(row.get("rsi4h")) if row is not None else None
                     atr = _safe_float(row.get("atr")) if row is not None else None
                     adx = _safe_float(row.get("adx")) if row is not None else None
+                    base_ctx.update({
+                        "ema200_1h": ema200_1h,
+                        "ema200_4h": ema200_4h,
+                        "rsi4h": rsi4h,
+                        "adx": adx,
+                    })
 
                     side_pref = None
                     if row is not None:
@@ -427,38 +465,17 @@ class TradingApp:
                     except Exception:
                         reasons_list = []
                     reasons = [f"{c}: {d}" for c, d in reasons_list if c or d]
-
-                    ctx = {
-                        "price": price,
-                        "anchor": anchor,
-                        "step": step,
-                        "span": span,
-                        "ema200_1h": ema200_1h,
-                        "ema200_4h": ema200_4h,
-                        "atrp": atrp,
-                        "adx": adx,
-                        "rsi4h": rsi4h,
-                        "gate_ok": gate_ok,
-                        "risk_ok": None,
-                        "has_open": bool(position),
-                        "cooldown": bool(getattr(self, "cooldown_active", False)),
-                        "freeze_90": bool(getattr(self, "freeze_90_active", False)),
-                        "blackout": bool(getattr(self, "blackout_active", False)),
-                        "reasons": reasons,
-                        "adx_thr": float(getattr(self, "adx_strong_threshold", 25.0)),
-                    }
-
-                    codes = compute_codes(ctx)
-                    MOTIVES.add(
-                        MotiveItem(
-                            ts=_now(),
-                            symbol=self.config.get("symbol", "BTC/USDT"),
-                            side_pref=str(side_pref) if 'side_pref' in locals() and side_pref is not None else None,
-                            price=float(price) if price is not None else 0.0,
-                            codes=codes,
-                            ctx=ctx,
-                        )
+                    base_ctx.update(
+                        {
+                            "anchor": anchor,
+                            "step": step,
+                            "span": span,
+                            "atrp": atrp,
+                            "gate_ok": gate_ok,
+                            "reasons": reasons,
+                        }
                     )
+                    _record_motive(self, base_ctx, overrides={}, price=price, side_pref=side_pref)
                 except Exception as _e:
                     logging.debug("No se pudo registrar motivo: %s", _e)
                 return
@@ -480,6 +497,12 @@ class TradingApp:
             entry_price = await self.exchange.get_current_price()
             if entry_price is None:
                 logging.warning("No se pudo obtener el precio de entrada actual.")
+                _record_motive(
+                    self,
+                    base_ctx,
+                    overrides={"reasons": ["exchange_error: precio de entrada no disponible"]},
+                    side_pref=signal,
+                )
                 return
             entry_price = float(entry_price)
             qty = (eq_on_open * leverage) / max(entry_price, 1e-12)
