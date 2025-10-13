@@ -1,6 +1,7 @@
 import logging
 import math
 import asyncio
+import os
 from collections import deque
 from typing import Any, Dict, Optional, cast
 from time import time as _now
@@ -29,6 +30,12 @@ class TradingApp:
         self.config.setdefault("mode", "paper" if S.PAPER else "real")
         self.config.setdefault("start_equity", S.start_equity)
         self.logger = logging.getLogger(__name__)
+        storage_cfg = cfg.get("storage", {}) if isinstance(cfg, dict) else {}
+        self.db_path = (
+            storage_cfg.get("db_path")
+            or os.getenv("PERF_DB_PATH")
+            or "data/perf.db"
+        )
         self._init_db()
         self.trader = Trader(cfg)
         self.exchange = Exchange(cfg)
