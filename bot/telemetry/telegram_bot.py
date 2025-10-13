@@ -7,6 +7,7 @@ import inspect
 import time
 from collections import deque
 from datetime import datetime, timedelta, time as dtime, timezone
+from pathlib import Path
 from zoneinfo import ZoneInfo
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -22,6 +23,28 @@ from bot.motives import MOTIVES
 from trading import BROKER, POSITION_SERVICE
 
 logger = logging.getLogger("telegram")
+
+
+async def _on_error(update: Optional[Update], context: ContextTypes.DEFAULT_TYPE):
+    error = getattr(context, "error", None)
+    if error:
+        logger.error(
+            "Telegram handler error: %s",
+            error,
+            exc_info=(type(error), error, error.__traceback__),
+        )
+    else:
+        logger.exception("Telegram handler error")
+
+    chat = None
+    if update is not None:
+        chat = getattr(update, "effective_chat", None)
+    if chat is None:
+        return
+    try:
+        await chat.send_message("Ocurrió un error procesando el comando. Revisá los logs.")
+    except Exception:
+        pass
 
 
 class TelegramLoggingRequest(HTTPXRequest):
@@ -673,17 +696,36 @@ async def estado_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def rendimiento_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Calcula y envía las estadísticas de rendimiento desde la base de datos."""
-    engine = context.application.user_data['engine']
-    db_path = engine.db_path # Obtenemos la ruta de la DB desde el motor
+    chat = update.effective_chat if update else None
+    if chat is None:
+        return
+
+    application = getattr(context, "application", None)
+    engine = application.bot_data.get("engine") if application else None
+    if engine is None:
+        await chat.send_message("No pude acceder al motor (engine).")
+        return
+
+    db_path = (
+        getattr(engine, "db_path", None)
+        or getattr(engine, "metrics_db_path", None)
+        or os.getenv("PERF_DB_PATH")
+        or "data/perf.db"
+    )
+    path = Path(db_path)
+    if not path.exists():
+        await chat.send_message("No encuentro la base de rendimiento (data/perf.db).")
+        return
 
     try:
-        with sqlite3.connect(db_path) as conn:
+        with sqlite3.connect(str(path)) as conn:
             cursor = conn.cursor()
-            # Hacemos una única consulta para obtener todos los datos
-            cursor.execute("SELECT COUNT(*), SUM(pnl), SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END) FROM trades")
+            cursor.execute(
+                "SELECT COUNT(*), SUM(pnl), SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END) FROM trades"
+            )
             total_trades, total_pnl, wins = cursor.fetchone()
 
-        if total_trades == 0:
+        if not total_trades:
             reply_text = "Aún no hay operaciones completadas en el historial."
         else:
             total_pnl = total_pnl or 0
@@ -692,19 +734,18 @@ async def rendimiento_command(update: Update, context: ContextTypes.DEFAULT_TYPE
             winrate = (wins / total_trades) * 100 if total_trades > 0 else 0
 
             reply_text = (
-                f"**Rendimiento Histórico (Base de Datos)**\n"
-                f"----------------------------------\n"
+                "**Rendimiento Histórico (Base de Datos)**\n"
+                "----------------------------------\n"
                 f"📈 **Trades Totales:** {total_trades}\n"
                 f"✅ **Ganadas:** {wins}\n"
                 f"❌ **Perdidas:** {losses}\n"
                 f"🎯 **Winrate:** {winrate:.2f}%\n"
                 f"💰 **PNL Neto Total:** {total_pnl:+.2f} USD"
             )
+    except Exception as exc:
+        reply_text = f"Error al leer la base de datos de rendimiento: {exc}"
 
-    except Exception as e:
-        reply_text = f"Error al leer la base de datos de rendimiento: {e}"
-
-    await update.message.reply_text(reply_text, parse_mode='MarkdownV2')
+    await chat.send_message(reply_text, parse_mode="Markdown")
 
 
 async def cerrar_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -889,6 +930,7 @@ def setup_telegram_bot(engine_instance):
         logger.warning("Telegram application init failed: %s", exc)
         return None
 
+    application.add_error_handler(_on_error)
     application.bot_data["engine"] = engine_instance
     try:
         application.user_data["engine"] = engine_instance
