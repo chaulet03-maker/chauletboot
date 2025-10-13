@@ -2,6 +2,7 @@ import sqlite3
 import logging
 import pandas as pd
 from datetime import datetime, timedelta
+from typing import Optional
 
 class Storage:
     def __init__(self, cfg):
@@ -22,6 +23,19 @@ class Storage:
                         side TEXT,
                         pnl REAL,
                         note TEXT
+                    )
+                    """
+                )
+                conn.commit()
+            with sqlite3.connect(self.db_path) as conn:
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS entry_locks (
+                        symbol TEXT NOT NULL,
+                        side TEXT NOT NULL,
+                        anchor_epoch INTEGER NOT NULL,
+                        created_at TEXT NOT NULL,
+                        PRIMARY KEY (symbol, side, anchor_epoch)
                     )
                     """
                 )
@@ -69,5 +83,57 @@ class Storage:
                 trades = [dict(row) for row in cursor.fetchall()]
         except Exception as e:
             logging.error(f"Error al obtener trades de la base de datos: {e}")
-        
+
         return trades
+
+    def acquire_entry_lock(
+        self,
+        symbol: str,
+        side: str,
+        anchor_epoch: Optional[int],
+        *,
+        ttl_seconds: int = 12 * 60 * 60,
+    ) -> bool:
+        """Idempotentemente registra un lock para una señal de entrada.
+
+        Devuelve ``True`` si el lock fue adquirido (no existía) y ``False``
+        si ya había un registro previo dentro de la ventana de tiempo.
+        """
+
+        if not symbol or not side or anchor_epoch is None:
+            return True
+
+        symbol_u = str(symbol).upper().strip()
+        side_u = str(side).upper().strip()
+        try:
+            anchor_epoch_i = int(anchor_epoch)
+        except (TypeError, ValueError):
+            return True
+
+        ttl = max(int(ttl_seconds), 60)
+        cutoff = anchor_epoch_i - ttl
+
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                conn.execute(
+                    "DELETE FROM entry_locks WHERE anchor_epoch < ?",
+                    (cutoff,),
+                )
+                cur = conn.execute(
+                    """
+                    INSERT OR IGNORE INTO entry_locks
+                        (symbol, side, anchor_epoch, created_at)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (
+                        symbol_u,
+                        side_u,
+                        anchor_epoch_i,
+                        datetime.utcnow().isoformat(),
+                    ),
+                )
+                conn.commit()
+                return cur.rowcount > 0
+        except Exception as exc:
+            logging.debug(f"Error al registrar entry_lock: {exc}")
+        return True
