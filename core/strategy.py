@@ -407,6 +407,26 @@ class Strategy:
 
         reasons = []
 
+        short_lo = float("nan")
+        short_hi = float("nan")
+        long_lo = float("nan")
+        long_hi = float("nan")
+        in_short = False
+        in_long = False
+        if np.isfinite(anchor_used) and np.isfinite(step_used) and np.isfinite(span_used) and np.isfinite(price):
+            short_lo = anchor_used - span_used
+            short_hi = anchor_used - step_used
+            long_lo = anchor_used + step_used
+            long_hi = anchor_used + span_used
+            in_short = short_lo <= price <= short_hi
+            in_long = long_lo <= price <= long_hi
+
+        long_allowed = None
+        short_allowed = None
+        if np.isfinite(price) and np.isfinite(ema200_1h) and np.isfinite(ema200_4h):
+            long_allowed = (price > ema200_1h) and (price > ema200_4h)
+            short_allowed = (price < ema200_1h) and (price < ema200_4h)
+
         # Reglas de filtros (mismas que _passes_filters, pero explicadas)
         # Tendencia 4h
         if str(self.config.get("trend_filter", "ema200_4h")) == "ema200_4h" and np.isfinite(price) and np.isfinite(ema200_4h):
@@ -448,17 +468,31 @@ class Strategy:
             if not ok: reasons.append("grid SHORT: fuera de rango [step,span]")
 
         log.info(
-            "SIGNAL DEBUG ts=%s side_pref=%s price=%.2f anchor_raw=%s anchor=%s step=%.2f span=%.2f atr=%.2f atrp=%.2f rsi4h=%.2f adx=%.2f ema200_4h=%.2f ema200_1h=%.2f funding_dec=%s gate_bps=%s reasons=%s",
-            str(ts), side_pref, price,
-            ("%.2f" % anchor_raw) if np.isfinite(anchor_raw) else "nan",
-            ("%.2f" % anchor_used) if np.isfinite(anchor_used) else "nan",
-            step_used if np.isfinite(step_used) else 0.0, span_used if np.isfinite(span_used) else 0.0,
+            "SIGNAL DEBUG ts=%s side_pref=%s price=%.2f anchor_raw=%.2f anchor=%.2f step=%.2f span=%.2f "
+            "atr=%.2f atrp=%.2f rsi4h=%.2f adx=%.2f ema200_4h=%.2f ema200_1h=%.2f "
+            "grid_SHORT=[%.2f,%.2f] in_short=%s grid_LONG=[%.2f,%.2f] in_long=%s "
+            "long_allowed=%s short_allowed=%s funding_dec=%s gate_bps=%s reasons=%s",
+            str(ts),
+            side_pref,
+            price,
+            anchor_raw if np.isfinite(anchor_raw) else float("nan"),
+            anchor_used if np.isfinite(anchor_used) else float("nan"),
+            step_used if np.isfinite(step_used) else 0.0,
+            span_used if np.isfinite(span_used) else 0.0,
             atr if np.isfinite(atr) else float("nan"),
             atrp if np.isfinite(atrp) else float("nan"),
             rsi4h if np.isfinite(rsi4h) else float("nan"),
             adx if np.isfinite(adx) else float("nan"),
             ema200_4h if np.isfinite(ema200_4h) else float("nan"),
             ema200_1h if np.isfinite(ema200_1h) else float("nan"),
+            short_lo,
+            short_hi,
+            in_short,
+            long_lo,
+            long_hi,
+            in_long,
+            long_allowed,
+            short_allowed,
             ("%.6f" % r_dec) if (r_dec is not None) else "None",
             str(gate_bps) if (gate_bps is not None) else "None",
             reasons or ["OK (si no hay señal, probablemente grid no se activó)"]
