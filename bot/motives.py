@@ -3,7 +3,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import List, Dict, Any, Optional
-import logging
+import logging, os, json, time
 log = logging.getLogger(__name__)
 
 try:
@@ -59,13 +59,31 @@ class MotiveItem:
         return f"• {t} — {self.symbol}: " + " · ".join(MSG[c] for c in ordered)
 
 class MotivesBuffer:
-    def __init__(self, maxlen:int=200): self._buf=deque(maxlen=maxlen)
+    def __init__(self, maxlen:int=200, persist_path: Optional[str]=None):
+        self._buf=deque(maxlen=maxlen)
+        self._persist_path=persist_path
+        if self._persist_path:
+            os.makedirs(os.path.dirname(self._persist_path), exist_ok=True)
+
     def add(self, item:MotiveItem):
         self._buf.append(item)
-        log.debug("MOTIVES: agregado %s", item.codes)
-    def last(self, n:int=10) -> List[MotiveItem]: return list(self._buf)[-n:]
+        log.debug("MOTIVES/ADD codes=%s ctx_keys=%s", item.codes, list(item.ctx.keys()))
+        if self._persist_path:
+            try:
+                with open(self._persist_path, "a", encoding="utf-8") as f:
+                    f.write(json.dumps({
+                        "ts": item.ts, "symbol": item.symbol, "codes": item.codes,
+                        "side_pref": item.side_pref, "price": item.price
+                    }, ensure_ascii=False) + "\n")
+            except Exception as e:
+                log.debug("MOTIVES persist fail: %s", e)
 
-MOTIVES = MotivesBuffer()
+    def last(self, n:int=10) -> List[MotiveItem]:
+        return list(self._buf)[-n:]
+
+# Persistencia opcional para multi-proceso
+PERSIST = os.getenv("MOTIVES_FILE") or os.path.join(os.getenv("DATA_DIR","/app/data"), "motives.jsonl")
+MOTIVES = MotivesBuffer(maxlen=400, persist_path=PERSIST)
 
 def compute_codes(ctx: Dict[str, Any]) -> List[str]:
     codes: List[str] = []
@@ -106,4 +124,5 @@ def compute_codes(ctx: Dict[str, Any]) -> List[str]:
     out,seen=[],set()
     for c in codes:
         if c not in seen: out.append(c); seen.add(c)
+    if not out: out=["no_signal"]
     return out
