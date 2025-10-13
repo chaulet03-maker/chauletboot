@@ -581,6 +581,10 @@ class TradingApp:
                 if symbol:
                     for s in ("LONG", "SHORT"):
                         FREEZER.clear(symbol, cast(Side, s))
+                return
+
+            _emit_motive({}, side_value=signal)
+            return
 
         except Exception as e:
             logging.error(f"Error grave en el trading_loop: {e}", exc_info=True)

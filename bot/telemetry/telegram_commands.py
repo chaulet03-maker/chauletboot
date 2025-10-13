@@ -3,7 +3,7 @@ from typing import Dict, Tuple, List, Optional
 from telegram.ext import Application, MessageHandler, filters
 import unicodedata
 
-from trading import POSITION_SERVICE
+from trading import POSITION_SERVICE, switch_mode
 from config import S
 from bot.motives import MOTIVES
 
@@ -18,6 +18,78 @@ from .telegram_bot import (
 )
 
 log = logging.getLogger("tg")
+
+
+def _normalize_alias(txt: str) -> str:
+    if not txt:
+        return ""
+    t = unicodedata.normalize("NFD", txt)
+    t = "".join(c for c in t if unicodedata.category(c) != "Mn")
+    t = t.lower().strip()
+    t = re.sub(r"\s+", " ", t)
+    return t
+
+
+ALIASES = {
+    "precio": [
+        "precio",
+        "price",
+        "precio actual",
+        "btc",
+        "cotizacion",
+        "cotización",
+    ],
+    "estado": ["estado", "status", "pnl", "balance"],
+    "posicion": [
+        "posicion",
+        "posición",
+        "posiciones",
+        "position",
+        "pos",
+        "posicion actual",
+        "posición actual",
+    ],
+    "motivos": [
+        "motivos",
+        "razones",
+        "por que no entro",
+        "porque no entro",
+        "por qué no entro",
+    ],
+    "config": ["config", "configuracion", "configuración"],
+    "pausa": ["pausa", "pausar"],
+    "reanudar": ["reanudar", "resume", "continuar"],
+    "cerrar": ["cerrar", "close", "cerrar todo"],
+    "killswitch": ["killswitch", "panic"],
+    "logs": ["logs", "log", "ver logs"],
+    "modo_real": [
+        "modo real",
+        "poner modo real",
+        "real",
+        "activar real",
+        "usar real",
+    ],
+    "modo_simulado": [
+        "modo simulado",
+        "poner modo simulado",
+        "simulado",
+        "activar simulado",
+        "paper",
+        "demo",
+        "test",
+    ],
+}
+
+
+def resolve_command(txt: str) -> Optional[str]:
+    normalized = _normalize_alias(txt)
+    if not normalized:
+        return None
+    for command, variants in ALIASES.items():
+        for variant in variants:
+            if normalized == _normalize_alias(variant):
+                return command
+    return None
 
 # ========= Helpers de texto / formato =========
 
@@ -430,6 +502,52 @@ class CommandBot:
 
         def reply(text):
             return update.message.reply_text(text)
+
+        cmd_alias = resolve_command(msg_raw)
+        if cmd_alias:
+            if cmd_alias in ("modo_real", "modo_simulado"):
+                new_mode = "real" if cmd_alias == "modo_real" else "simulado"
+                res = switch_mode(new_mode)
+                if res.ok:
+                    return await reply(
+                        f"✅ Modo cambiado a **{new_mode.upper()}**.\nEl bot ya opera en {new_mode}."
+                    )
+                return await reply(f"❌ No pude cambiar el modo: {res.msg}")
+
+            if cmd_alias == "precio":
+                return await _cmd_precio(self.engine, reply)
+
+            if cmd_alias == "estado":
+                return await reply(_build_estado_text(self.engine))
+
+            if cmd_alias == "posicion":
+                return await _cmd_posicion(self.engine, reply)
+
+            if cmd_alias == "motivos":
+                return await _cmd_motivos(self.engine, reply)
+
+            if cmd_alias == "config":
+                return await reply(_build_config_text(self.engine))
+
+            if cmd_alias == "pausa":
+                _set_killswitch(self.engine, True)
+                return await reply("⛔ Bot OFF: bloqueadas nuevas operaciones (killswitch ACTIVADO).")
+
+            if cmd_alias == "reanudar":
+                _set_killswitch(self.engine, False)
+                return await reply("✅ Bot ON: habilitadas nuevas operaciones (killswitch desactivado).")
+
+            if cmd_alias == "cerrar":
+                ok = await self.engine.close_all()
+                if ok:
+                    return await reply("Cerré todas las posiciones.")
+                return await reply("No pude cerrar todo.")
+
+            if cmd_alias == "killswitch":
+                return await reply("Usá 'bot on' / 'bot off' para controlar el killswitch.")
+
+            if cmd_alias == "logs":
+                return await reply(_read_logs_text(self.engine, 15))
 
         # --- BOT ON / OFF (killswitch inverso) ---
         if norm in ("bot on", "prender bot", "activar bot", "bot prender", "reanudar"):
