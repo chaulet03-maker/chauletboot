@@ -54,6 +54,13 @@ class TradingApp:
         self._eq_on_open = 0.0
         self._entry_ts = None
         self._bars_in_position = 0
+        self._entry_locks: Dict[tuple[str, str, int], float] = {}
+        self._entry_lock_gc_last = 0.0
+        try:
+            ttl_cfg = cfg.get("entry_lock_ttl_seconds", 12 * 60 * 60)
+            self._entry_lock_ttl_s = max(int(float(ttl_cfg)), 60)
+        except Exception:
+            self._entry_lock_ttl_s = 12 * 60 * 60
 
         schedule.every().day.at("08:00", "America/Argentina/Buenos_Aires").do(self._generate_daily_report)
         schedule.every().sunday.at("00:00", "America/Argentina/Buenos_Aires").do(self._generate_weekly_report)
@@ -161,6 +168,49 @@ class TradingApp:
             self.logger.debug("MOTIVES/REC %s", codes)
         except Exception as e:
             self.logger.debug("MOTIVES/REC fail: %s", e)
+
+    def _cleanup_entry_locks(self, now: float, ttl: int) -> None:
+        if not self._entry_locks:
+            return
+        if (now - self._entry_lock_gc_last) < 60.0:
+            return
+        cutoff = now - ttl
+        stale = [key for key, ts in self._entry_locks.items() if ts < cutoff]
+        for key in stale:
+            self._entry_locks.pop(key, None)
+        self._entry_lock_gc_last = now
+
+    def _acquire_entry_lock(
+        self,
+        symbol: Optional[str],
+        side: Optional[str],
+        anchor_epoch: Optional[int],
+    ) -> bool:
+        if not symbol or not side or anchor_epoch is None:
+            return True
+
+        ttl = getattr(self, "_entry_lock_ttl_s", 12 * 60 * 60)
+        storage = getattr(self, "storage", None)
+        if storage is not None and hasattr(storage, "acquire_entry_lock"):
+            try:
+                acquired = storage.acquire_entry_lock(
+                    symbol,
+                    side,
+                    anchor_epoch,
+                    ttl_seconds=ttl,
+                )
+                if not acquired:
+                    return False
+            except Exception as exc:  # pragma: no cover - defensivo
+                self.logger.debug("entry_lock storage error: %s", exc)
+
+        key = (str(symbol).upper(), str(side).upper(), int(anchor_epoch))
+        now = _now()
+        self._cleanup_entry_locks(now, ttl)
+        if key in self._entry_locks:
+            return False
+        self._entry_locks[key] = now
+        return True
 
     async def trading_loop(self, context: ContextTypes.DEFAULT_TYPE):
         """Bucle principal de trading ejecutado por la JobQueue de Telegram."""
@@ -285,6 +335,15 @@ class TradingApp:
 
                 self._record_motive(ctx_local)
 
+            def _safe_float_local(value: Any) -> Optional[float]:
+                if value is None:
+                    return None
+                try:
+                    f = float(value)
+                except (TypeError, ValueError):
+                    return None
+                return f if math.isfinite(f) else None
+
             if position:
                 logging.info(
                     "Posición abierta detectada: %s %.6f %s",
@@ -403,6 +462,100 @@ class TradingApp:
                 side_pref = signal
                 self.side_pref = signal
             base_ctx["reasons"] = []
+
+            price_signal = _safe_float_local(last_candle.get("close"))
+            ema200_1h_val = _safe_float_local(last_candle.get("ema200"))
+            ema200_4h_val = _safe_float_local(last_candle.get("ema200_4h"))
+            rsi4h_val = _safe_float_local(last_candle.get("rsi4h"))
+            atr_val = _safe_float_local(last_candle.get("atr"))
+            adx_val = _safe_float_local(last_candle.get("adx"))
+
+            anchor_val = None
+            try:
+                anchor_raw = self.strategy._anchor_price(last_candle)
+            except Exception:
+                anchor_raw = None
+            anchor_val = _safe_float_local(anchor_raw)
+
+            step_val = None
+            span_val = None
+            if atr_val is not None:
+                step_mult_cfg = _safe_float_local(self.config.get("grid_step_atr", 0.32))
+                span_mult_cfg = _safe_float_local(self.config.get("grid_span_atr", 3.0))
+                if step_mult_cfg is not None:
+                    step_val = step_mult_cfg * atr_val
+                if span_mult_cfg is not None:
+                    span_val = span_mult_cfg * atr_val
+                if (
+                    signal in ("LONG", "SHORT")
+                    and price_signal is not None
+                    and anchor_val is not None
+                    and step_val is not None
+                    and span_val is not None
+                ):
+                    try:
+                        anchor_adj, step_adj, span_adj, _ = self.strategy._apply_anchor_freeze(
+                            signal,
+                            price_signal,
+                            anchor_val,
+                            step_val,
+                            span_val,
+                        )
+                        anchor_val = _safe_float_local(anchor_adj)
+                        step_val = _safe_float_local(step_adj)
+                        span_val = _safe_float_local(span_adj)
+                    except Exception:
+                        pass
+
+            atrp_val = None
+            if (
+                atr_val is not None
+                and price_signal is not None
+                and price_signal != 0.0
+            ):
+                try:
+                    atrp_val = atr_val / price_signal
+                except Exception:
+                    atrp_val = None
+
+            gate_ok_val = None
+            gate_bps_cfg = self.config.get("funding_gate_bps")
+            rate_now_val = self.config.get("_funding_rate_now")
+            if (
+                gate_bps_cfg is not None
+                and rate_now_val is not None
+                and signal in ("LONG", "SHORT")
+            ):
+                try:
+                    g_frac = float(gate_bps_cfg) / 10000.0
+                    r_dec = float(rate_now_val)
+                    gate_ok_val = not (
+                        (signal == "LONG" and r_dec > g_frac)
+                        or (signal == "SHORT" and r_dec < -g_frac)
+                    )
+                except (TypeError, ValueError):
+                    gate_ok_val = None
+
+            base_ctx.update(
+                {
+                    "price": price_signal,
+                    "ema200_1h": ema200_1h_val,
+                    "ema200_4h": ema200_4h_val,
+                    "rsi4h": rsi4h_val,
+                    "atrp": atrp_val,
+                    "adx": adx_val,
+                    "anchor": anchor_val,
+                    "step": step_val,
+                    "span": span_val,
+                    "gate_ok": gate_ok_val,
+                }
+            )
+
+            anchor_epoch = None
+            try:
+                anchor_epoch = int(now_ts.value // 1_000_000_000)
+            except Exception:
+                anchor_epoch = None
             if not signal:
                 try:
                     code, detail, extras = self.strategy.get_rejection_reason(data)
@@ -426,19 +579,12 @@ class TradingApp:
                 try:
                     row = data.iloc[-1] if len(data) else None
 
-                    def _safe_float(value):
-                        try:
-                            f = float(value)
-                        except (TypeError, ValueError):
-                            return None
-                        return f if math.isfinite(f) else None
-
-                    price = _safe_float(row.get("close")) if row is not None else None
-                    ema200_1h = _safe_float(row.get("ema200")) if row is not None else None
-                    ema200_4h = _safe_float(row.get("ema200_4h")) if row is not None else None
-                    rsi4h = _safe_float(row.get("rsi4h")) if row is not None else None
-                    atr = _safe_float(row.get("atr")) if row is not None else None
-                    adx = _safe_float(row.get("adx")) if row is not None else None
+                    price = _safe_float_local(row.get("close")) if row is not None else None
+                    ema200_1h = _safe_float_local(row.get("ema200")) if row is not None else None
+                    ema200_4h = _safe_float_local(row.get("ema200_4h")) if row is not None else None
+                    rsi4h = _safe_float_local(row.get("rsi4h")) if row is not None else None
+                    atr = _safe_float_local(row.get("atr")) if row is not None else None
+                    adx = _safe_float_local(row.get("adx")) if row is not None else None
 
                     side_pref = None
                     if row is not None:
@@ -453,13 +599,13 @@ class TradingApp:
                             anchor_val = self.strategy._anchor_price(row)
                         except Exception:
                             anchor_val = None
-                        anchor = _safe_float(anchor_val)
+                        anchor = _safe_float_local(anchor_val)
 
                     step = None
                     span = None
                     if atr is not None:
-                        step_mult = _safe_float(self.config.get("grid_step_atr", 0.32))
-                        span_mult = _safe_float(self.config.get("grid_span_atr", 3.0))
+                        step_mult = _safe_float_local(self.config.get("grid_step_atr", 0.32))
+                        span_mult = _safe_float_local(self.config.get("grid_span_atr", 3.0))
                         if step_mult is not None:
                             step = step_mult * atr
                         if span_mult is not None:
@@ -479,9 +625,9 @@ class TradingApp:
                                 step,
                                 span,
                             )
-                            anchor = _safe_float(anchor_frozen)
-                            step = _safe_float(step_frozen)
-                            span = _safe_float(span_frozen)
+                            anchor = _safe_float_local(anchor_frozen)
+                            step = _safe_float_local(step_frozen)
+                            span = _safe_float_local(span_frozen)
                         except Exception:
                             pass
 
@@ -528,6 +674,22 @@ class TradingApp:
                     _emit_motive(overrides_ctx, price_value=price, side_value=side_pref)
                 except Exception as _e:
                     logging.debug("No se pudo registrar motivo: %s", _e)
+                return
+
+            symbol_name = str(self.config.get("symbol", "BTC/USDT"))
+            if not self._acquire_entry_lock(symbol_name, signal, anchor_epoch):
+                logging.info(
+                    "Entrada duplicada bloqueada por entry_lock (symbol=%s side=%s anchor_epoch=%s)",
+                    symbol_name,
+                    signal,
+                    anchor_epoch,
+                )
+                reason_msg = (
+                    f"entry_lock activo (anchor_epoch={anchor_epoch})"
+                    if anchor_epoch is not None
+                    else "entry_lock activo"
+                )
+                _emit_motive({"reasons": [reason_msg]}, price_value=price_signal, side_value=signal)
                 return
 
             eq_now = await self.trader.get_balance(self.exchange)
