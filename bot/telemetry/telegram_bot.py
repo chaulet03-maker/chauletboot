@@ -13,16 +13,19 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import pandas as pd
 from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
+from telegram.ext import Application, ContextTypes, MessageHandler, filters
 from telegram.request import HTTPXRequest
 
 from logging_setup import LOG_DIR, LOG_FILE
 from time_fmt import fmt_ar
 from config import S
 from bot.motives import MOTIVES
-from trading import BROKER, POSITION_SERVICE
+from bot.telemetry.command_registry import CommandRegistry
+from trading import BROKER, POSITION_SERVICE, switch_mode
 
 logger = logging.getLogger("telegram")
+
+REGISTRY = CommandRegistry()
 
 
 async def _on_error(update: Optional[Update], context: ContextTypes.DEFAULT_TYPE):
@@ -282,24 +285,16 @@ async def _reply_chunks(update: Update, text: str):
 
 
 async def ayuda_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Muestra la lista de comandos disponibles para interactuar con el bot."""
-    ayuda_texto = (
-        "**Lista de Comandos Disponibles**\n\n"
-        "**Monitoreo:**\n"
-        "`posicion` - Muestra el estado de la operación actual.\n"
-        "`estado` - Muestra el PNL del día/semana y balance.\n"
-        "`rendimiento` - Muestra estadísticas históricas completas.\n"
-        "`precio` - Devuelve el precio actual de BTC/USDT.\n"
-        "`motivos` - Muestra los últimos 10 rechazos de señales.\n"
-        "`config` - Muestra los parámetros actuales del bot.\n"
-        "`logs [N]` - Muestra las últimas N líneas del log.\n\n"
-        "**Control:**\n"
-        "`pausa` - Detiene la apertura de nuevas operaciones.\n"
-        "`reanudar` - Reanuda la apertura de operaciones.\n"
-        "`cerrar` - Cierra la posición actual.\n"
-        "`killswitch` - Cierra la posición y pausa el bot."
-    )
-    await update.effective_message.reply_text(ayuda_texto, parse_mode='Markdown')
+    """Genera dinámicamente la lista de comandos disponibles."""
+
+    lines = ["📋 *Lista de Comandos*"]
+    for name, desc in REGISTRY.help_lines():
+        lines.append(f"- *{name}*: {desc}")
+    text = "\n".join(lines)
+    message = update.effective_message
+    if message is None:
+        return
+    await message.reply_text(text, parse_mode="Markdown")
 
 
 def _calc_equity_stats(engine) -> Tuple[float, float, float]:
@@ -831,6 +826,51 @@ async def bot_off_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await pausa_command(update, context)
 
 
+async def _modo_command(update: Update, context: ContextTypes.DEFAULT_TYPE, new_mode: str):
+    result = switch_mode("real" if new_mode == "real" else "simulado")
+    if result.ok:
+        base_msg = f"✅ Modo cambiado a *{new_mode.upper()}*. El bot ya opera en {new_mode}."
+        msg = f"{base_msg}\n{result.msg}" if result.msg else base_msg
+    else:
+        msg = f"❌ No pude cambiar el modo: {result.msg}"
+    message = update.effective_message
+    if message is None:
+        return
+    await message.reply_text(msg, parse_mode="Markdown")
+
+
+async def modo_simulado_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _modo_command(update, context, "simulado")
+
+
+async def modo_real_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _modo_command(update, context, "real")
+
+
+async def killswitch_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    engine = _get_engine_from_context(context)
+    if engine is None:
+        await _reply_chunks(update, "Engine no disponible para killswitch.")
+        return
+    close_error: Optional[str] = None
+    try:
+        await engine.close_all()
+    except Exception as exc:  # pragma: no cover - defensivo
+        close_error = str(exc)
+    _set_killswitch(engine, True)
+    if close_error:
+        await _reply_chunks(
+            update,
+            "⚠️ Activé el killswitch pero no pude cerrar todas las posiciones: "
+            f"{close_error}",
+        )
+    else:
+        await _reply_chunks(
+            update,
+            "🛑 Killswitch ACTIVADO: se cerró la posición actual y se pausó el bot.",
+        )
+
+
 async def ajustar_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     engine = _get_engine_from_context(context)
     if engine is None:
@@ -886,6 +926,208 @@ async def motivos_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _reply_chunks(update, "\n".join(lines))
 
 
+def _populate_registry() -> None:
+    REGISTRY.register(
+        "ayuda",
+        ayuda_command,
+        aliases=["help", "comandos"],
+        help_text="Muestra esta ayuda",
+    )
+    REGISTRY.register(
+        "precio",
+        precio_command,
+        aliases=["price", "precio actual", "cotizacion", "cotización", "btc"],
+        help_text="Muestra el precio actual de BTC/USDT",
+    )
+    REGISTRY.register(
+        "estado",
+        estado_command,
+        aliases=["status", "balance", "pnl"],
+        help_text="Muestra PnL del día/semana y balance",
+    )
+    REGISTRY.register(
+        "posicion",
+        posicion_command,
+        aliases=[
+            "posición",
+            "posiciones",
+            "position",
+            "pos",
+            "posicion actual",
+            "posición actual",
+        ],
+        help_text="Muestra el estado de la posición abierta (si existe)",
+    )
+    REGISTRY.register(
+        "rendimiento",
+        rendimiento_command,
+        aliases=["performance", "estadisticas", "estadísticas"],
+        help_text="Muestra estadísticas históricas completas",
+    )
+    REGISTRY.register(
+        "motivos",
+        motivos_command,
+        aliases=[
+            "razones",
+            "motivo",
+            "por que no entro",
+            "por qué no entro",
+            "porque no entro",
+        ],
+        help_text="Últimos rechazos y motivos claros",
+    )
+    REGISTRY.register(
+        "config",
+        config_command,
+        aliases=["configuracion", "configuración", "parametros", "parámetros"],
+        help_text="Muestra los parámetros actuales del bot",
+    )
+    REGISTRY.register(
+        "logs",
+        logs_command,
+        aliases=["log", "ver logs", "log tail"],
+        help_text="Muestra las últimas N líneas del log",
+    )
+    REGISTRY.register(
+        "pausa",
+        pausa_command,
+        aliases=["pausar", "bot off", "bot apagar", "desactivar bot", "botoff"],
+        help_text="Detiene la apertura de nuevas operaciones",
+    )
+    REGISTRY.register(
+        "reanudar",
+        reanudar_command,
+        aliases=[
+            "resume",
+            "continuar",
+            "bot on",
+            "bot prender",
+            "activar bot",
+            "boton",
+            "botón",
+        ],
+        help_text="Reanuda la apertura de operaciones",
+    )
+    REGISTRY.register(
+        "cerrar",
+        cerrar_command,
+        aliases=["close", "cerrar posicion", "cerrar posición"],
+        help_text="Cierra la posición actual",
+        show_in_help=False,
+    )
+    REGISTRY.register(
+        "killswitch",
+        killswitch_command,
+        aliases=["panic", "cerrar todo", "panic button"],
+        help_text="Cierra posición y pausa el bot",
+        show_in_help=False,
+    )
+    REGISTRY.register(
+        "ajustar",
+        ajustar_command,
+        aliases=["ajuste", "set", "config set"],
+        help_text="Ajusta parámetros en caliente",
+        show_in_help=False,
+    )
+    REGISTRY.register(
+        "modo simulado",
+        modo_simulado_command,
+        aliases=[
+            "simulado",
+            "paper",
+            "demo",
+            "test",
+            "modo demo",
+            "activar simulado",
+            "poner modo simulado",
+        ],
+        help_text="Cambia el bot a modo SIMULADO",
+    )
+    REGISTRY.register(
+        "modo real",
+        modo_real_command,
+        aliases=["real", "live", "activar real", "poner modo real", "usar real"],
+        help_text="Cambia el bot a modo REAL (requiere API keys y sin posición abierta)",
+    )
+
+
+async def _dispatch_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    unknown_message: str,
+) -> None:
+    message = update.effective_message
+    text = (message.text or "").strip() if message else ""
+    if not text:
+        return
+    chat = update.effective_chat
+    notifier = None
+    application = getattr(context, "application", None)
+    if application is not None:
+        notifier = application.bot_data.get("notifier")
+    if notifier and getattr(notifier, "default_chat_id", None) is None and chat is not None:
+        try:
+            notifier.set_default_chat(chat.id)
+        except Exception:
+            logger.debug("No se pudo fijar default_chat_id automáticamente", exc_info=True)
+    command = REGISTRY.resolve(text)
+    logger.debug("Resolve: '%s' -> %s", text, command)
+    if not command:
+        if message is not None:
+            await message.reply_text(unknown_message, parse_mode="Markdown")
+        return
+    handler = REGISTRY.handler_for(command)
+    if handler is None:
+        if message is not None:
+            await message.reply_text(
+                "Comando no disponible. Escribí *ayuda*.", parse_mode="Markdown"
+            )
+        return
+    await handler(update, context)
+
+
+def _prepare_args_for_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    args: List[str] = []
+    if message and message.text:
+        parts = message.text.strip().split()
+        if parts:
+            args = parts[1:]
+    setattr(context, "args", args)
+
+
+async def _slash_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await _dispatch_command(
+        update,
+        context,
+        unknown_message="Comando no reconocido. Escribí *ayuda*.",
+    )
+
+
+async def _text_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    _prepare_args_for_text(update, context)
+    await _dispatch_command(
+        update,
+        context,
+        unknown_message="No entendí. Escribí *ayuda* para ver comandos.",
+    )
+
+
+def register_commands(application: Application) -> None:
+    _populate_registry()
+    if getattr(application, "_chaulet_router_registered", False):
+        return
+
+    application.add_handler(MessageHandler(filters.COMMAND, _slash_router))
+    application.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), _text_router))
+    setattr(application, "_chaulet_router_registered", True)
+    logger.info(
+        "Router central de comandos registrado (%d comandos).",
+        len(REGISTRY),
+    )
+
+
 def setup_telegram_bot(engine_instance):
     """Configura y devuelve la aplicación de Telegram con TODOS los handlers."""
     cfg = _engine_config(engine_instance)
@@ -937,47 +1179,7 @@ def setup_telegram_bot(engine_instance):
     except Exception:
         pass
 
-    text_filter = filters.TEXT & (~filters.COMMAND)
-
-    application.add_handler(CommandHandler("ayuda", ayuda_command))
-    application.add_handler(MessageHandler(text_filter & filters.Regex(r"(?i)^ayuda$"), ayuda_command))
-
-    application.add_handler(CommandHandler("posicion", posicion_command))
-    application.add_handler(MessageHandler(text_filter & filters.Regex(r"(?i)^posicion$"), posicion_command))
-
-    application.add_handler(CommandHandler("estado", estado_command))
-    application.add_handler(MessageHandler(text_filter & filters.Regex(r"(?i)^estado$"), estado_command))
-
-    application.add_handler(CommandHandler("rendimiento", rendimiento_command))
-    application.add_handler(MessageHandler(text_filter & filters.Regex(r"(?i)^rendimiento$"), rendimiento_command))
-
-    application.add_handler(CommandHandler("cerrar", cerrar_command))
-    application.add_handler(MessageHandler(text_filter & filters.Regex(r"(?i)^cerrar$"), cerrar_command))
-
-    application.add_handler(CommandHandler("precio", precio_command))
-    application.add_handler(MessageHandler(text_filter & filters.Regex(r"(?i)^precio(?:\s+\S+)?$"), precio_command))
-
-    application.add_handler(CommandHandler("config", config_command))
-    application.add_handler(MessageHandler(text_filter & filters.Regex(r"(?i)^config$"), config_command))
-
-    application.add_handler(CommandHandler("boton", bot_on_command))
-    application.add_handler(MessageHandler(text_filter & filters.Regex(r"(?i)^bot\s+on$"), bot_on_command))
-    application.add_handler(MessageHandler(text_filter & filters.Regex(r"(?i)^reanudar$"), bot_on_command))
-
-    application.add_handler(CommandHandler("botoff", bot_off_command))
-    application.add_handler(MessageHandler(text_filter & filters.Regex(r"(?i)^bot\s+off$"), bot_off_command))
-    application.add_handler(MessageHandler(text_filter & filters.Regex(r"(?i)^pausa$"), bot_off_command))
-
-    application.add_handler(CommandHandler("ajustar", ajustar_command))
-    application.add_handler(MessageHandler(text_filter & filters.Regex(r"(?i)^ajustar\b.*"), ajustar_command))
-
-    application.add_handler(CommandHandler("logs", logs_command))
-    application.add_handler(MessageHandler(text_filter & filters.Regex(r"(?i)^logs(?:\s+\d+)?$"), logs_command))
-
-    application.add_handler(CommandHandler("motivos", motivos_command))
-    application.add_handler(MessageHandler(text_filter & filters.Regex(r"(?i)^motivos$"), motivos_command))
-
-    logging.info("Todos los comandos de Telegram han sido registrados correctamente.")
+    register_commands(application)
     return application
 
 
@@ -1147,51 +1349,15 @@ async def start_telegram_bot(app, config):
             notifier.set_default_chat(default_chat_id)
 
     setattr(app, "telegram", notifier)
+    application.bot_data["notifier"] = notifier
 
     # ============ (opcional) comandos inline ============
-    if inline_commands and not getattr(application, "_chaulet_inline_handler_added", False):
-        async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-            try:
-                text = (update.message.text or "").strip()
-                low = text.lower()
-                chat_id = update.effective_chat.id
-
-                current_notifier = getattr(app, "notifier", notifier)
-                if current_notifier and current_notifier.default_chat_id is None:
-                    current_notifier.set_default_chat(chat_id)
-
-                if re.match(r"(?i)^precio", low):
-                    await precio_command(update, context)
-                elif low == "posicion":
-                    await posicion_command(update, context)
-                elif low == "estado":
-                    await estado_command(update, context)
-                elif low == "rendimiento":
-                    await rendimiento_command(update, context)
-                elif low == "config":
-                    await config_command(update, context)
-                elif low in ("bot on", "prender bot", "activar bot", "reanudar", "bot prender"):
-                    await bot_on_command(update, context)
-                elif low in ("bot off", "apagar bot", "desactivar bot", "pausa", "bot apagar"):
-                    await bot_off_command(update, context)
-                elif low == "cerrar":
-                    await cerrar_command(update, context)
-                elif re.match(r"(?i)^ajustar\b", text):
-                    await ajustar_command(update, context)
-                elif re.match(r"(?i)^logs", text):
-                    await logs_command(update, context)
-                else:
-                    await context.bot.send_message(
-                        chat_id,
-                        "Comandos: posicion | estado | rendimiento | precio [SIMBOLO] | config | bot on/off | cerrar | logs [n] | ajustar parametro valor",
-                    )
-            except Exception as e:
-                logger.exception("telegram msg error: %s", e)
-
-        application.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), on_message))
-        setattr(application, "_chaulet_inline_handler_added", True)
-    elif not inline_commands:
-        logger.info("Inline commands deshabilitados (usando telegram_commands.py)")
+    if inline_commands:
+        logger.info(
+            "Inline commands habilitados: el router central procesa texto libre con alias normalizados."
+        )
+    else:
+        logger.info("Inline commands deshabilitados (router central activo).")
 
     # ============ (opcional) reportes diarios/semanales en ESTE bot ============
     if reports_in_bot and not getattr(application, "_chaulet_reports_scheduled", False):
