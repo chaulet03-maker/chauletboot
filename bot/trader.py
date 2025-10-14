@@ -3,16 +3,17 @@ import logging
 from typing import Any, Dict, Optional
 
 from config import S
-from trading import BROKER, POSITION_SERVICE
+import trading
 
 
 class Trader:
     def __init__(self, cfg):
         self.config = cfg
+        trading.ensure_initialized()
         default_balance = float(self.config.get('balance', S.start_equity))
         if S.PAPER:
             try:
-                default_balance = float(getattr(BROKER, "equity", default_balance))
+                default_balance = float(getattr(trading.BROKER, "equity", default_balance))
             except Exception:
                 pass
         self._balance = default_balance
@@ -22,7 +23,7 @@ class Trader:
         """Devuelve el balance actual de la cuenta."""
         if S.PAPER:
             try:
-                self._balance = float(getattr(BROKER, "equity", self._balance))
+                self._balance = float(getattr(trading.BROKER, "equity", self._balance))
                 return self._balance
             except Exception:
                 pass
@@ -46,9 +47,9 @@ class Trader:
             return self._open_position
 
         # 1) PAPER: leer del PositionService (persistente)
-        if S.PAPER and POSITION_SERVICE is not None:
+        if S.PAPER and trading.POSITION_SERVICE is not None:
             try:
-                st = POSITION_SERVICE.get_status()
+                st = trading.POSITION_SERVICE.get_status()
                 side = (st.get("side") or "FLAT").upper()
                 if side != "FLAT":
                     self._open_position = {

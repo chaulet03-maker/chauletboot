@@ -23,7 +23,7 @@ from bot.motives import MOTIVES
 from bot.mode_manager import get_mode
 from bot.settings_utils import get_val, read_config_raw
 from bot.telemetry.command_registry import CommandRegistry
-from trading import BROKER, POSITION_SERVICE, switch_mode
+import trading
 
 logger = logging.getLogger("telegram")
 
@@ -350,7 +350,7 @@ def _build_estado_text(engine) -> str:
     ]
     if S.PAPER:
         try:
-            eq_sim = float(getattr(BROKER, "equity"))
+            eq_sim = float(getattr(trading.BROKER, "equity"))
             lines.append(f"Equity sim: ${_fmt_num(eq_sim, 2)}")
         except Exception:
             pass
@@ -456,15 +456,15 @@ async def _cmd_config(engine, reply):
             store = (
                 getattr(engine, "paper_store", None)
                 or getattr(engine, "STORE", None)
-                or getattr(POSITION_SERVICE, "paper_store", None)
+                or getattr(trading.POSITION_SERVICE, "paper_store", None)
             )
             if store and getattr(store, "state", None):
                 eq = store.state.get("equity")
                 if eq is not None:
                     equity_line = f"{_fmt_config_num(eq, 2)} USDT"
         else:
-            if hasattr(POSITION_SERVICE, "get_balance"):
-                bal = POSITION_SERVICE.get_balance()
+            if hasattr(trading.POSITION_SERVICE, "get_balance"):
+                bal = trading.POSITION_SERVICE.get_balance()
                 if isinstance(bal, dict):
                     eq = bal.get("USDT") or bal.get("total") or bal.get("free")
                     if eq is not None:
@@ -660,7 +660,7 @@ def _default_symbol(engine) -> str:
 def _position_status_message(engine) -> str:
     symbol_default = _default_symbol(engine)
     try:
-        st = POSITION_SERVICE.get_status() if POSITION_SERVICE else None
+        st = trading.POSITION_SERVICE.get_status() if trading.POSITION_SERVICE else None
     except Exception as exc:
         logger.debug("posicion/status error: %s", exc)
         st = None
@@ -908,7 +908,7 @@ async def bot_off_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def _modo_command(update: Update, context: ContextTypes.DEFAULT_TYPE, new_mode: str):
-    result = switch_mode("real" if new_mode == "real" else "simulado")
+    result = trading.switch_mode("real" if new_mode == "real" else "simulado")
     if result.ok:
         base_msg = f"✅ Modo cambiado a *{new_mode.upper()}*. El bot ya opera en {new_mode}."
         msg = f"{base_msg}\n{result.msg}" if result.msg else base_msg
