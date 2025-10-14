@@ -25,6 +25,12 @@ ban_hours: [1]
 # pausas por shock
 shock_move_threshold_pct: 7.0
 shock_pause_hours: 10.0
+risk:
+  guards:
+    shock:
+      move_threshold_pct: 7.0
+      pause_hours: 10.0
+      message_template: "Operación temporalmente suspendida por {hours} horas debido a volatilidad extrema (Δ24h={delta_pct:.2f}%, rango24h={range_pct:.2f}%). Se detectó una pérdida previa; se reanudará automáticamente al finalizar la pausa o con el comando /reanudar."
 
 # funding (igual que el sim)
 funding_gate_bps: 160

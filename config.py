@@ -11,10 +11,13 @@ import yaml
 def _candidate_paths(path: Optional[str]) -> list[Path]:
     candidates: list[str] = []
     env_path = os.getenv("CONFIG_PATH")
+    chaulet_env_path = os.getenv("CHAULET_CONFIG")
     if path:
         candidates.append(path)
     if env_path:
         candidates.append(env_path)
+    if chaulet_env_path:
+        candidates.append(chaulet_env_path)
     candidates.extend([
         "config.yaml",
         "config.yml",

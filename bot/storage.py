@@ -86,6 +86,23 @@ class Storage:
 
         return trades
 
+    def get_last_trade(self) -> Optional[dict]:
+        """Obtiene el trade más reciente persistido, si existe."""
+
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                conn.row_factory = sqlite3.Row
+                cur = conn.execute(
+                    "SELECT * FROM trades ORDER BY datetime(close_timestamp) DESC, id DESC LIMIT 1"
+                )
+                row = cur.fetchone()
+                if row is None:
+                    return None
+                return dict(row)
+        except Exception as exc:
+            logging.error(f"Error al obtener último trade: {exc}")
+        return None
+
     def acquire_entry_lock(
         self,
         symbol: str,

@@ -46,6 +46,16 @@ class ShockPauseManager:
             return False
         return datetime.now(timezone.utc) < self.pause_until
 
+    def is_paused_now(self) -> bool:
+        """Compat helper to expose a more explicit check name."""
+
+        return self.is_paused()
+
+    def get_pause_until(self) -> Optional[datetime]:
+        """Devuelve el instante hasta el cual la pausa permanece activa."""
+
+        return self.pause_until
+
     def remaining(self) -> Optional[timedelta]:
         if not self.pause_until:
             return None
