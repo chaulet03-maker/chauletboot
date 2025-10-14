@@ -5,6 +5,8 @@ from typing import cast
 import numpy as np
 import pandas as pd
 
+from risk_guards import dyn_leverage_from_adx
+
 from anchor_freezer import Side
 from deps import FREEZER
 
@@ -76,9 +78,27 @@ class Strategy:
 
     # Apalancamiento dinámico por ADX (x5 base / x10 fuerte)
     def dynamic_leverage(self, last_candle: pd.Series) -> float:
-        adx = float(last_candle.get("adx", np.nan))
+        adx_raw = last_candle.get("adx", np.nan)
+        adx = float(adx_raw) if np.isfinite(adx_raw) else np.nan
         thr = float(self.config.get("adx_strong_threshold", 25.0))
-        return float(self.config.get("leverage_strong", 10.0)) if (np.isfinite(adx) and adx >= thr) else float(self.config.get("leverage_base", 5.0))
+        weak = float(
+            self.config.get(
+                "lev_weak",
+                self.config.get("leverage_base", 5.0),
+            )
+        )
+        strong = float(
+            self.config.get(
+                "lev_strong",
+                self.config.get("leverage_strong", 10.0),
+            )
+        )
+        adx_for_calc: float | None
+        if np.isfinite(adx):
+            adx_for_calc = float(adx)
+        else:
+            adx_for_calc = None
+        return float(dyn_leverage_from_adx(adx_for_calc, weak_thr=thr, strong_x=strong, weak_x=weak))
 
     # Filtros auxiliares
     def _passes_filters(self, row: pd.Series, ts: pd.Timestamp, side: str) -> bool:

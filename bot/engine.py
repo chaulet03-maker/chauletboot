@@ -21,6 +21,11 @@ from core.strategy import Strategy
 from core.indicators import add_indicators
 from config import S
 from trading import BROKER, POSITION_SERVICE
+from risk_guards import (
+    clear_pause_if_expired,
+    in_ban_hours,
+    is_paused_now,
+)
 
 
 class TradingApp:
@@ -216,6 +221,8 @@ class TradingApp:
         """Bucle principal de trading ejecutado por la JobQueue de Telegram."""
         try:
             schedule.run_pending()
+            clear_pause_if_expired()
+            self.is_paused = bool(is_paused_now())
             if self.connection_lost:
                 await self.notifier.send("✅ **Conexión Reestablecida.**")
                 self.connection_lost = False
@@ -412,6 +419,24 @@ class TradingApp:
             if self.is_paused:
                 logging.info("El bot está en pausa, no se buscan nuevas señales.")
                 _emit_motive({"reasons": ["bot en pausa"]})
+                return
+
+            ban_hours_cfg = self.config.get("ban_hours", "")
+            if isinstance(ban_hours_cfg, (list, tuple, set)):
+                try:
+                    ban_hours_str = ",".join(
+                        str(int(h))
+                        for h in ban_hours_cfg
+                        if h is not None and str(h).strip() != ""
+                    )
+                except Exception:
+                    ban_hours_str = ""
+            else:
+                ban_hours_str = str(ban_hours_cfg or "")
+
+            if ban_hours_str and in_ban_hours(ban_hours_str):
+                logging.info("[RISK] Hora baneada (UTC). No se abre nueva posición.")
+                _emit_motive({"reasons": ["hora baneada"]})
                 return
 
             klines_1h = await self.exchange.get_klines('1h')
