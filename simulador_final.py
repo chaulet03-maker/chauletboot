@@ -854,7 +854,7 @@ class RiskSizingBacktester:
                             qty = self._qty_from_risk(entry_fill, sl_tmp, risk_u)
 
                         # Cap por liquidez
-                        qty = self._cap_qty_by_liquidez(qty, entry_fill, row)
+                        qty = self._cap_qty_by_liquidity(qty, entry_fill, row)
                         self.qty = qty
                         if self.qty <= 0:
                             self.pending_order = None
