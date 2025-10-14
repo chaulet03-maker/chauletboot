@@ -5,7 +5,7 @@ Backtester con:
 - Position sizing: modo "risk" (por R) o "full_equity" (usa todo el equity como margen * lev)
 - TP / SL reales (por % o ATR)
 - TP objetivo como % del equity al abrir (fijo) o dinámico en rango [min,max] según fuerza de señal
-- Filtros de tendencia (EMA200 4h + confirmación 1h), gate de RSI 4h
+- Filtros de tendencia (EMA50 1h o EMA200 4h + confirmaciones 1h), gate de RSI 4h
 - Filtros de volatilidad (ATR%), sesiones baneadas, funding gate y cobro de funding
 - Time stop, daily stop en R, stop de emergencia en R, trailing a BE
 - Entradas: rsi_cross | pullback_grid (grid de una pierna, disparo por distancia ATR a ancla)
@@ -138,6 +138,7 @@ def leer_archivo_smart(path: str) -> pd.DataFrame:
 def indicators(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     c, h, l = df["close"], df["high"], df["low"]
+    df["ema50"] = EMAIndicator(c, window=50).ema_indicator()
     df["ema10"] = EMAIndicator(c, window=10).ema_indicator()
     df["ema30"] = EMAIndicator(c, window=30).ema_indicator()
     df["ema200"] = EMAIndicator(c, window=200).ema_indicator()  # 1h
@@ -198,10 +199,11 @@ class RiskSizingBacktester:
         funding_default: float = 0.0001,
         funding_interval_hours: int = 8,
         funding_gate_bps: int = 80,
-        # Filtros tendencia 4h + confirmación 1h
-        trend_filter: str = "ema200_4h",
+        # Filtros de tendencia
+        trend_filter: str = "ema50_1h",
         rsi4h_gate: Optional[float] = 52.0,
         ema200_1h_confirm: bool = False,
+        ema50_1h_confirm: bool = False,
         # Volatilidad & horario
         atrp_gate_min: Optional[float] = 0.15,
         atrp_gate_max: Optional[float] = 1.20,
@@ -216,7 +218,7 @@ class RiskSizingBacktester:
         # Pullback grid
         grid_span_atr: float = 2.5,
         grid_step_atr: float = 0.6,
-        grid_anchor: str = "ema30",
+        grid_anchor: str = "ema50",
         grid_side: str = "auto",
         anchor_bias_frac: float = 1.0,
         grid_short_mode: str = "pullback",
@@ -295,6 +297,7 @@ class RiskSizingBacktester:
         self.trend_filter = trend_filter.lower() if trend_filter else "none"
         self.rsi4h_gate = rsi4h_gate
         self.ema200_1h_confirm = bool(ema200_1h_confirm)
+        self.ema50_1h_confirm = bool(ema50_1h_confirm)
         self.atrp_gate_min = atrp_gate_min
         self.atrp_gate_max = atrp_gate_max
         self.ban_hours = set(ban_hours or [])
@@ -313,8 +316,8 @@ class RiskSizingBacktester:
         self.grid_span_atr = float(grid_span_atr)
         self.grid_step_atr = float(grid_step_atr)
         self.grid_anchor = grid_anchor.lower().strip()
-        if self.grid_anchor not in ("ema30", "ema200_4h"):
-            raise ValueError("grid_anchor debe ser 'ema30' o 'ema200_4h'")
+        if self.grid_anchor not in ("ema30", "ema50", "ema200_4h"):
+            raise ValueError("grid_anchor debe ser 'ema30', 'ema50' o 'ema200_4h'")
         self.grid_side = grid_side.lower().strip()
         if self.grid_side not in ("auto", "long", "short"):
             raise ValueError("grid_side debe ser 'auto', 'long' o 'short'")
@@ -541,6 +544,12 @@ class RiskSizingBacktester:
                 return False
             if side == "SHORT" and not (price < ema200_4h):
                 return False
+        elif self.trend_filter == "ema50_1h":
+            ema50_1h = float(row.get("ema50", np.nan))
+            if side == "LONG" and not (price > ema50_1h):
+                return False
+            if side == "SHORT" and not (price < ema50_1h):
+                return False
         if self.rsi4h_gate is not None:
             rsi4h = float(row.get("rsi4h", np.nan))
             if side == "LONG" and not (rsi4h >= self.rsi4h_gate):
@@ -552,6 +561,12 @@ class RiskSizingBacktester:
             if side == "LONG" and not (price > ema200_1h):
                 return False
             if side == "SHORT" and not (price < ema200_1h):
+                return False
+        if self.ema50_1h_confirm:
+            ema50_1h = float(row.get("ema50", np.nan))
+            if side == "LONG" and not (price > ema50_1h):
+                return False
+            if side == "SHORT" and not (price < ema50_1h):
                 return False
         return True
 
@@ -583,15 +598,27 @@ class RiskSizingBacktester:
         if self.grid_side in ("long", "short"):
             return "LONG" if self.grid_side == "long" else "SHORT"
         price = float(row["close"])
-        ema200_4h = float(row.get("ema200_4h", np.nan))
-        rsi4h = float(row.get("rsi4h", np.nan))
-        if np.isnan(ema200_4h) or np.isnan(rsi4h):
+        if self.trend_filter == "ema50_1h":
+            ema50 = float(row.get("ema50", np.nan))
+            rsi1h_gate = float(self.rsi_gate) if getattr(self, "rsi_gate", None) is not None else 50.0
+            rsi1h = float(row.get("rsi", np.nan))
+            if not np.isfinite(ema50) or not np.isfinite(rsi1h):
+                return None
+            if (price > ema50) and (rsi1h >= rsi1h_gate):
+                return "LONG"
+            if (price < ema50) and (rsi1h <= (100 - rsi1h_gate)):
+                return "SHORT"
             return None
-        if (price > ema200_4h) and (rsi4h >= (self.rsi4h_gate if self.rsi4h_gate is not None else 50)):
-            return "LONG"
-        if (price < ema200_4h) and (rsi4h <= (100 - (self.rsi4h_gate if self.rsi4h_gate is not None else 50))):
-            return "SHORT"
-        return None
+        else:
+            ema200_4h = float(row.get("ema200_4h", np.nan))
+            rsi4h = float(row.get("rsi4h", np.nan))
+            if np.isnan(ema200_4h) or np.isnan(rsi4h):
+                return None
+            if (price > ema200_4h) and (rsi4h >= (self.rsi4h_gate if self.rsi4h_gate is not None else 50)):
+                return "LONG"
+            if (price < ema200_4h) and (rsi4h <= (100 - (self.rsi4h_gate if self.rsi4h_gate is not None else 50))):
+                return "SHORT"
+            return None
 
     def _anchor_price(self, row: pd.Series) -> Optional[float]:
         """
@@ -601,6 +628,8 @@ class RiskSizingBacktester:
         """
         if self.grid_anchor == "ema30":
             raw = row.get("ema30", np.nan)
+        elif self.grid_anchor == "ema50":
+            raw = row.get("ema50", np.nan)
         elif self.grid_anchor == "ema200_4h":
             raw = row.get("ema200_4h", np.nan)
         else:
@@ -1113,12 +1142,12 @@ PRESETS = {
         "use_atr": True,
         "sl_atr_mult": 1.3,
         "tp_atr_mult": 3.0,
-        "trend_filter": "ema200_4h",
-        "ema200_1h_confirm": True,
-        "rsi4h_gate": 52.0,
+        "trend_filter": "ema50_1h",
+        "ema50_1h_confirm": True,
+        "rsi4h_gate": None,
         "grid_span_atr": 2.5,
         "grid_step_atr": 0.6,
-        "grid_anchor": "ema30",
+        "grid_anchor": "ema50",
         "grid_side": "auto",
         "atrp_gate_min": 0.10,
         "atrp_gate_max": 1.20,
@@ -1134,12 +1163,12 @@ PRESETS = {
         "use_atr": True,
         "sl_atr_mult": 1.3,
         "tp_atr_mult": 3.2,
-        "trend_filter": "ema200_4h",
-        "ema200_1h_confirm": True,
-        "rsi4h_gate": 52.0,
+        "trend_filter": "ema50_1h",
+        "ema50_1h_confirm": True,
+        "rsi4h_gate": None,
         "grid_span_atr": 2.5,
         "grid_step_atr": 0.4,
-        "grid_anchor": "ema30",
+        "grid_anchor": "ema50",
         "grid_side": "auto",
         "atrp_gate_min": 0.08,
         "atrp_gate_max": 1.40,
@@ -1252,10 +1281,11 @@ def main():
     ap.add_argument("--funding-interval-hours", type=int, default=8, help="Intervalo de funding (8h)")
     ap.add_argument("--funding-gate-bps", type=int, default=80, help="Evitar abrir si |rate| > gate (bps por 8h)")
 
-    # Filtros tendencia 4h + confirmación 1h
-    ap.add_argument("--trend-filter", type=str, default="ema200_4h", choices=["none", "ema200_4h"], help="Filtro de tendencia 4h")
+    # Filtros de tendencia
+    ap.add_argument("--trend-filter", type=str, default="ema50_1h", choices=["none", "ema50_1h", "ema200_4h"], help="Filtro de tendencia (por defecto EMA50 en 1h)")
     ap.add_argument("--rsi4h-gate", type=float, default=52.0, help="RSI 4h mínimo para LONG y (100-valor) para SHORT")
-    ap.add_argument("--ema200-1h-confirm", action="store_true", help="Requiere precio > EMA200(1h) para LONG y < para SHORT")
+    ap.add_argument("--ema200-1h-confirm", action="store_true", help="(Compat) Requiere precio > EMA200(1h) para LONG y < para SHORT")
+    ap.add_argument("--ema50-1h-confirm", action="store_true", help="Requiere precio > EMA50(1h) para LONG y < para SHORT")
 
     # Volatilidad & horario
     ap.add_argument("--atrp-gate-min", type=float, default=0.15, help="ATR%% mínimo (evitar chop)")
@@ -1273,7 +1303,7 @@ def main():
     # Pullback grid
     ap.add_argument("--grid-span-atr", type=float, default=2.5, help="Ancho total de banda desde ancla (en ATR)")
     ap.add_argument("--grid-step-atr", type=float, default=0.6, help="Paso de disparo de pullback (en ATR)")
-    ap.add_argument("--grid-anchor", type=str, default="ema30", choices=["ema30", "ema200_4h"], help="Ancla del grid dinámico")
+    ap.add_argument("--grid-anchor", type=str, default="ema50", choices=["ema30", "ema50", "ema200_4h"], help="Ancla del grid dinámico")
     ap.add_argument("--grid-side", type=str, default="auto", choices=["auto", "long", "short"], help="Lado preferido del grid")
     ap.add_argument(
         "--anchor-bias-frac",
@@ -1343,6 +1373,7 @@ def main():
         trend_filter=args.trend_filter,
         rsi4h_gate=args.rsi4h_gate,
         ema200_1h_confirm=bool(args.ema200_1h_confirm),
+        ema50_1h_confirm=bool(args.ema50_1h_confirm),
         atrp_gate_min=args.atrp_gate_min,
         atrp_gate_max=args.atrp_gate_max,
         ban_hours=_parse_ban_hours(args.ban_hours),
