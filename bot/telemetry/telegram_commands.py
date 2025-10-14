@@ -3,7 +3,7 @@ from typing import Dict, Tuple, List, Optional
 from telegram.ext import Application, MessageHandler, filters
 import unicodedata
 
-from trading import POSITION_SERVICE, switch_mode
+import trading
 from config import S
 from bot.motives import MOTIVES
 
@@ -203,8 +203,8 @@ async def _cmd_precio(engine, reply, symbol: Optional[str] = None):
     if px is None:
         return await reply("No pude obtener el precio.")
     try:
-        if S.PAPER and POSITION_SERVICE:
-            POSITION_SERVICE.mark_to_market(float(px))
+        if S.PAPER and trading.POSITION_SERVICE:
+            trading.POSITION_SERVICE.mark_to_market(float(px))
     except Exception:
         log.debug("No se pudo actualizar mark en PAPER desde /precio", exc_info=True)
     return await reply(f"{sym}: ${float(px):,.2f}")
@@ -212,7 +212,7 @@ async def _cmd_precio(engine, reply, symbol: Optional[str] = None):
 
 async def _cmd_posicion(engine, reply):
     try:
-        st = POSITION_SERVICE.get_status() if POSITION_SERVICE else None
+        st = trading.POSITION_SERVICE.get_status() if trading.POSITION_SERVICE else None
     except Exception as e:
         st = None
         log.debug("posicion/status error: %s", e)
@@ -507,7 +507,7 @@ class CommandBot:
         if cmd_alias:
             if cmd_alias in ("modo_real", "modo_simulado"):
                 new_mode = "real" if cmd_alias == "modo_real" else "simulado"
-                res = switch_mode(new_mode)
+                res = trading.switch_mode(new_mode)
                 if res.ok:
                     return await reply(
                         f"✅ Modo cambiado a **{new_mode.upper()}**.\nEl bot ya opera en {new_mode}."

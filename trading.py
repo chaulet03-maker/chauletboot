@@ -16,6 +16,7 @@ BROKER: Any | None = None
 POSITION_SERVICE: PositionService | None = None
 PUBLIC_CCXT_CLIENT: Optional[Any] = None
 ACTIVE_MODE: Mode = "simulado"
+_INITIALIZED: bool = False
 
 
 def _build_public_ccxt() -> Optional[Any]:
@@ -56,7 +57,7 @@ def _sync_settings_mode(mode: Mode) -> None:
 
 
 def rebuild(mode: Mode) -> None:
-    global BROKER, POSITION_SERVICE, PUBLIC_CCXT_CLIENT, ACTIVE_MODE
+    global BROKER, POSITION_SERVICE, PUBLIC_CCXT_CLIENT, ACTIVE_MODE, _INITIALIZED
     ACTIVE_MODE = mode
     _sync_settings_mode(mode)
     PUBLIC_CCXT_CLIENT = _build_public_ccxt()
@@ -68,13 +69,23 @@ def rebuild(mode: Mode) -> None:
         symbol="BTC/USDT",
     )
     logger.info("Trading stack reconstruido para modo %s", mode.upper())
+    _INITIALIZED = True
 
 
-# Inicialización al importar el módulo
-rebuild(get_mode())
+def ensure_initialized(mode: Mode | None = None) -> None:
+    """Inicializa el stack de trading solo una vez (o para un modo específico)."""
+
+    global _INITIALIZED, ACTIVE_MODE
+
+    target_mode = mode or get_mode()
+    if _INITIALIZED and mode is None and ACTIVE_MODE == target_mode:
+        return
+
+    rebuild(target_mode)
 
 
 def position_status() -> dict[str, Any]:
+    ensure_initialized()
     if POSITION_SERVICE is None:
         return {"side": "FLAT"}
     try:
@@ -100,6 +111,7 @@ def switch_mode(new_mode: Mode) -> ModeResult:
 
 
 def place_order_safe(side: str, qty: float, price: float, **kwargs):
+    ensure_initialized()
     logger.info(
         "ORDER PATH: %s",
         "PAPER/SimBroker" if ACTIVE_MODE == "simulado" else "LIVE/Binance",

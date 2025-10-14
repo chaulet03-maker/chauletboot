@@ -21,7 +21,7 @@ from bot.motives import MOTIVES, MotiveItem, compute_codes
 from core.strategy import Strategy
 from core.indicators import add_indicators
 from config import S
-from trading import BROKER, POSITION_SERVICE
+import trading
 from risk_guards import (
     clear_pause_if_expired,
     get_pause_manager,
@@ -38,6 +38,9 @@ class TradingApp:
         self.config.setdefault("mode", "paper" if S.PAPER else "real")
         self.config.setdefault("start_equity", S.start_equity)
         self.logger = logging.getLogger(__name__)
+
+        trading.ensure_initialized()
+
         storage_cfg = cfg.get("storage", {}) if isinstance(cfg, dict) else {}
         self.db_path = (
             storage_cfg.get("db_path")
@@ -270,18 +273,18 @@ class TradingApp:
                 self.logger.exception(f"Shock gate check failed: {e}")
 
             # 0) Refrescar mark-to-market en paper utilizando el precio actual
-            if S.PAPER and POSITION_SERVICE is not None:
+            if S.PAPER and trading.POSITION_SERVICE is not None:
                 try:
                     last_px = await self.exchange.get_current_price(self.config.get('symbol', 'BTC/USDT'))
                     if last_px is not None:
-                        POSITION_SERVICE.mark_to_market(float(last_px))
+                        trading.POSITION_SERVICE.mark_to_market(float(last_px))
                 except Exception as exc:
                     logging.debug("No se pudo refrescar mark-to-market inicial: %s", exc)
 
             position = await self.trader.check_open_position(self.exchange)
-            if (position is None) and (POSITION_SERVICE is not None):
+            if (position is None) and (trading.POSITION_SERVICE is not None):
                 try:
-                    st = POSITION_SERVICE.get_status()
+                    st = trading.POSITION_SERVICE.get_status()
                     side = (st.get("side") or "FLAT").upper()
                     if side != "FLAT":
                         position = {
@@ -807,9 +810,9 @@ class TradingApp:
                     f"Apalancamiento: x{leverage}"
                 )
                 cached_position = order_result
-                if POSITION_SERVICE is not None:
+                if trading.POSITION_SERVICE is not None:
                     try:
-                        st = POSITION_SERVICE.get_status()
+                        st = trading.POSITION_SERVICE.get_status()
                         side = (st.get("side") or "FLAT").upper()
                         if side != "FLAT":
                             cached_position = {
@@ -858,10 +861,10 @@ class TradingApp:
             logging.warning(f"No pude actualizar la cache de precios: {e}")
 
     async def _preload_position_from_store(self) -> None:
-        if POSITION_SERVICE is None:
+        if trading.POSITION_SERVICE is None:
             return
         try:
-            status = POSITION_SERVICE.get_status()
+            status = trading.POSITION_SERVICE.get_status()
         except Exception as exc:
             logging.debug("Preload posición falló: %s", exc)
             return
@@ -897,7 +900,7 @@ class TradingApp:
         mode_msg = "🧪 Modo SIMULADO activo" if S.PAPER else "🔴 Modo REAL activo"
         if S.PAPER:
             try:
-                equity = float(getattr(BROKER, "equity"))
+                equity = float(getattr(trading.BROKER, "equity"))
                 mode_msg += f"\nEquity sim: ${equity:.2f} USDT"
             except Exception:
                 pass

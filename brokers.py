@@ -145,9 +145,8 @@ def build_broker(settings, client_factory: Callable[..., Any]):
         fee_rate = float(os.getenv("PAPER_FEE_RATE", "0") or 0.0)
         return SimBroker(ACTIVE_PAPER_STORE, fee_rate=fee_rate)
 
-    assert settings.binance_api_key and settings.binance_api_secret, (
-        "Faltan credenciales Binance para modo 'real'."
-    )
+    assert settings.binance_api_key, "Falta BINANCE_API_KEY (modo real)."
+    assert settings.binance_api_secret, "Falta BINANCE_API_SECRET (modo real)."
     client = client_factory(api_key=settings.binance_api_key, secret=settings.binance_api_secret)
     ACTIVE_LIVE_CLIENT = client
     logger.warning("MODO: 🔴 REAL | Binance listo.")
