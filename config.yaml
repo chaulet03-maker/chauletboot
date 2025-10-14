@@ -56,7 +56,7 @@ leverage_strong: 10.0
 adx_strong_threshold: 25.0
 
 # modo
-trading_mode: "real"   # "real" para operar live en exchange
+trading_mode: "simulado"   # "real" para operar live en exchange
 start_equity: 1000.0
 debug_signals: true
 
