@@ -2,6 +2,7 @@ import logging
 import math
 import asyncio
 import os
+import threading
 from collections import deque
 from typing import Any, Dict, Optional, cast
 from time import time as _now
@@ -23,9 +24,11 @@ from config import S
 from trading import BROKER, POSITION_SERVICE
 from risk_guards import (
     clear_pause_if_expired,
+    get_pause_manager,
     in_ban_hours,
     is_paused_now,
 )
+from reanudar_listener import listen_reanudar
 
 
 class TradingApp:
@@ -47,6 +50,8 @@ class TradingApp:
         self.storage = Storage(cfg)
         self.strategy = Strategy(cfg)
         self.is_paused = False
+        self.pause_manager = get_pause_manager()
+        self._reanudar_thread: Optional[threading.Thread] = None
         self.connection_lost = False
         self.rejection_log = deque(maxlen=10)
         self.telegram_app = setup_telegram_bot(self)
@@ -78,6 +83,8 @@ class TradingApp:
                     self._load_funding_series(funding_csv)
                 except Exception as exc:
                     logging.warning("No se pudo cargar la serie de funding desde %s: %s", funding_csv, exc)
+
+        self._start_reanudar_listener()
 
     # === Rejection recording helpers ===
     def record_rejection(self, symbol: str, side: str, code: str, detail: str = "", ts=None):
@@ -184,6 +191,25 @@ class TradingApp:
         for key in stale:
             self._entry_locks.pop(key, None)
         self._entry_lock_gc_last = now
+
+    def _start_reanudar_listener(self) -> None:
+        if self._reanudar_thread is not None and self._reanudar_thread.is_alive():
+            return
+
+        def _on_reanudar() -> None:
+            try:
+                self.pause_manager.clear_pause()
+                self.is_paused = False
+                logging.info("[RISK] Pausa eliminada manualmente vía Telegram.")
+            except Exception as exc:  # pragma: no cover - defensivo
+                logging.debug("reanudar callback falló: %s", exc)
+
+        try:
+            thread = threading.Thread(target=listen_reanudar, args=(_on_reanudar,), daemon=True)
+            thread.start()
+            self._reanudar_thread = thread
+        except Exception as exc:  # pragma: no cover - defensivo
+            logging.debug("No se pudo iniciar listener de reanudar: %s", exc)
 
     def _acquire_entry_lock(
         self,
