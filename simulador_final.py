@@ -659,13 +659,25 @@ class RiskSizingBacktester:
 
         step = self.grid_step_atr * atr
         half_span = self.grid_span_atr * atr
+        same_anchor_as_trend = (
+            self.trend_filter == "ema50_1h" and self.grid_anchor == "ema50"
+        )
         if side_pref == "LONG":
-            long_ok = (price < anchor) and (step <= (anchor - price) <= half_span)
-            if long_ok:
-                return "LONG"
+            if same_anchor_as_trend:
+                pull = max(0.0, abs(price - anchor))
+                if step <= pull <= half_span:
+                    return "LONG"
+            else:
+                long_ok = (price < anchor) and (step <= (anchor - price) <= half_span)
+                if long_ok:
+                    return "LONG"
         else:
-            pullback_ok = (price > anchor) and (step <= (price - anchor) <= half_span)
-            breakdown_ok = (price < anchor) and (step <= (anchor - price) <= half_span)
+            if same_anchor_as_trend:
+                pull = max(0.0, abs(price - anchor))
+                pullback_ok = breakdown_ok = step <= pull <= half_span
+            else:
+                pullback_ok = (price > anchor) and (step <= (price - anchor) <= half_span)
+                breakdown_ok = (price < anchor) and (step <= (anchor - price) <= half_span)
             if self.grid_short_mode == "pullback":
                 if pullback_ok:
                     return "SHORT"
