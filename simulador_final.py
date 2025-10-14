@@ -168,6 +168,7 @@ class RiskSizingBacktester:
         initial_balance: float = 1000.0,
         fee_pct: float = 0.0005,
         lev: float = 5.0,
+        dynamic_leverage: bool = False,
         taker_fee: Optional[float] = None,
         maker_fee: Optional[float] = None,
         slip_bps: float = 2.0,
@@ -253,6 +254,7 @@ class RiskSizingBacktester:
         self.initial_balance = float(initial_balance)
         self.fee = float(fee_pct)
         self.lev = float(lev)
+        self.dynamic_leverage = bool(dynamic_leverage)
         self.rsi_gate = float(rsi_gate)
         self.only_longs = bool(only_longs)
         self.only_shorts = bool(only_shorts)
@@ -896,7 +898,9 @@ class RiskSizingBacktester:
                     # Sizing
                     leverage_for_this_trade = self.lev
                     if self.size_mode == "full_equity":
-                        leverage_for_this_trade = self._get_dynamic_leverage(row)
+                        leverage_for_this_trade = (
+                            self._get_dynamic_leverage(row) if self.dynamic_leverage else self.lev
+                        )
                         equity_fraction = getattr(self, "equity_fraction", 1.0)
                         notional = (self.balance * equity_fraction) * leverage_for_this_trade
                         qty = notional / max(entry_fill, 1e-12)
@@ -1323,6 +1327,11 @@ def main():
     ap.add_argument("--balance", type=float, default=1000.0, help="Balance inicial (equity)")
     ap.add_argument("--fee", type=float, default=0.0005, help="Fee proporcional por trade")
     ap.add_argument("--lev", type=float, default=5.0, help="Apalancamiento")
+    ap.add_argument(
+        "--dynamic-leverage",
+        action="store_true",
+        help="Si se activa, en full_equity usa apalancamiento dinámico por ADX (x5/x10). Por defecto usa --lev.",
+    )
 
     # Tag / presets
     ap.add_argument("--preset", type=str, default=None, choices=["conservador", "agresivo"], help="Carga parámetros predefinidos. Tus flags explíticas prevalecen.")
@@ -1459,6 +1468,7 @@ def main():
         slip_bps=args.slip_bps,
         max_vol_frac=args.max_vol_frac,
         margin_safety_pct=args.margin_safety_pct,
+        dynamic_leverage=args.dynamic_leverage,
         entry_mode=args.entry_mode,
         rsi_gate=args.rsi_gate,
         only_longs=args.only_longs,
