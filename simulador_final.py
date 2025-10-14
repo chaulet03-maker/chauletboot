@@ -221,8 +221,8 @@ class RiskSizingBacktester:
         anchor_bias_frac: float = 1.0,
         # tagging
         tag: Optional[str] = None,
-        # >>> PATCH: parámetros de shock pause
-        shock_move_threshold_pct: float = 10.0,
+        # --- Shock pause ---
+        shock_move_threshold_pct: float = 5.0,
         shock_pause_hours: int = 24,
     ):
         self.entry_mode = entry_mode.lower().strip()
@@ -243,6 +243,9 @@ class RiskSizingBacktester:
         df4_agg = df4[["ema200", "rsi"]].rename(columns={"ema200": "ema200_4h", "rsi": "rsi4h"})
         self.df = self.df_1h.join(df4_agg.reindex(self.df_1h.index, method="ffill")).dropna()
 
+        # Cambio 24h (para detectar shocks del 5%+)
+        self.df["chg_24h_pct"] = self.df["close"].pct_change(periods=24) * 100.0
+
         # estado
         self.balance = float(initial_balance)
         self.initial_balance = float(initial_balance)
@@ -251,6 +254,12 @@ class RiskSizingBacktester:
         self.rsi_gate = float(rsi_gate)
         self.only_longs = bool(only_longs)
         self.only_shorts = bool(only_shorts)
+
+        # Shock-pause config y estado
+        self.shock_move_threshold_pct = float(shock_move_threshold_pct)
+        self.shock_pause_hours = int(shock_pause_hours)
+        self.paused_until: Optional[pd.Timestamp] = None
+        self.last_chg_24h_pct: float = 0.0
 
         # Fees por lado (si no vienen, caen al fee_pct existente)
         self.taker_fee = float(taker_fee) if taker_fee is not None else float(fee_pct)
@@ -325,13 +334,6 @@ class RiskSizingBacktester:
 
         # Tag
         self.tag = (tag or "").strip()
-
-        # >>> PATCH: configuración de shock pause
-        self.shock_move_threshold = float(shock_move_threshold_pct) / 100.0  # 10% -> 0.10
-        self.shock_pause_hours = int(shock_pause_hours)
-        self.cooldown_until: Optional[pd.Timestamp] = None
-        self.last_bar_shock = False
-        self.last_signed_move = 0.0  # (c - prev_close)/prev_close
 
         # Posición
         self.active = False
@@ -785,16 +787,10 @@ class RiskSizingBacktester:
             ts = pd.to_datetime(row["timestamp"], utc=True)
             o = float(row["open"]); h = float(row["high"]); l = float(row["low"]); c = float(row["close"])
 
-            # >>> PATCH: medir shock de precio vs close anterior
-            prev_close = float(prev["close"])
-            self.last_signed_move = (c - prev_close) / max(prev_close, 1e-12)
-            self.last_bar_shock = abs(self.last_signed_move) >= self.shock_move_threshold
-
-            # >>> PATCH: si estamos en cooldown, no permitir programar ni abrir nuevas posiciones
-            in_cooldown = (self.cooldown_until is not None) and (ts < self.cooldown_until)
-            if in_cooldown:
-                # Anulamos cualquier orden pendiente que haya quedado
-                self.pending_order = None
+            # Variación 24h de este bar (puede ser NaN al inicio)
+            chg24 = float(row.get("chg_24h_pct", np.nan))
+            if np.isfinite(chg24):
+                self.last_chg_24h_pct = chg24
 
             # Cobro funding en esta barra si corresponde
             self._apply_funding(ts, c)
@@ -804,13 +800,15 @@ class RiskSizingBacktester:
 
             # 1) Si hay orden pendiente del bar anterior y NO hay posición -> abrir en el OPEN de esta barra (i+1)
             if (not self.active) and (self.pending_order is not None):
-                # >>> PATCH: bloqueo por cooldown
-                if (self.cooldown_until is not None) and (ts < self.cooldown_until):
-                    self.pending_order = None  # cancelar apertura
-                else:
-                    dkey = _day(ts)
-                    if self.daily_stop_R is None or self.daily_R.get(dkey, 0.0) > -float(self.daily_stop_R):
-                        side = self.pending_order["side"]
+                # Bloqueo global por shock: mientras dure, no se abren posiciones
+                if self.paused_until is not None and ts < self.paused_until:
+                    self.pending_order = None  # descartar cualquier pendiente
+                    # Seguimos al próximo bar sin evaluar nuevas señales
+                    continue
+
+                dkey = _day(ts)
+                if self.daily_stop_R is None or self.daily_R.get(dkey, 0.0) > -float(self.daily_stop_R):
+                    side = self.pending_order["side"]
 
                         # Precio de entrada = OPEN de esta barra, con slippage
                         entry_raw = o
@@ -893,8 +891,8 @@ class RiskSizingBacktester:
                             "sl_multiplier": self.last_sl_multiplier,
                         })
 
-                    # consumir la pendiente
-                    self.pending_order = None
+                # consumir la pendiente
+                self.pending_order = None
 
             # 2) Gestión de posición activa (intrabar SL/TP + safety de margen + time stop)
             if self.active:
@@ -950,19 +948,19 @@ class RiskSizingBacktester:
                 # día bloqueado
                 pass
             else:
-                if (self.cooldown_until is not None) and (ts < self.cooldown_until):
-                    # En cooldown: no generamos señales nuevas
-                    pass
+                # Si está en pausa, no generamos señales nuevas
+                if self.paused_until is not None and ts < self.paused_until:
+                    continue
+
+                if self.entry_mode == "rsi_cross":
+                    sig = self._signal_rsi_cross(row, prev)
                 else:
-                    if self.entry_mode == "rsi_cross":
-                        sig = self._signal_rsi_cross(row, prev)
-                    else:
-                        sig = self._signal_pullback_grid(row)
-                    if sig is not None and self._passes_trend_filters(row, sig) and self._volatility_and_session_ok(row, ts):
-                        # Funding gate en la barra de señal
-                        open_rate = self._funding_rate_at(ts)
-                        if not ((sig == "LONG" and open_rate > self.funding_gate_frac) or (sig == "SHORT" and open_rate < -self.funding_gate_frac)):
-                            self.pending_order = {"side": sig}
+                    sig = self._signal_pullback_grid(row)
+                if sig is not None and self._passes_trend_filters(row, sig) and self._volatility_and_session_ok(row, ts):
+                    # Funding gate en la barra de señal
+                    open_rate = self._funding_rate_at(ts)
+                    if not ((sig == "LONG" and open_rate > self.funding_gate_frac) or (sig == "SHORT" and open_rate < -self.funding_gate_frac)):
+                        self.pending_order = {"side": sig}
 
         # Cierre al final
         if self.active:
@@ -1030,32 +1028,29 @@ class RiskSizingBacktester:
         except Exception as exc:
             logging.error(f"Error al guardar trade en base de datos: {exc}")
 
-        # >>> PATCH: activar pausa si hubo pérdida durante un shock contrario a la dirección del trade
-        try:
-            lost_trade = (trade_pnl < 0)
-            # Dirección del shock vs lado del trade:
-            # LONG y caída fuerte (signed_move <= -threshold)  -> pausa
-            # SHORT y suba fuerte (signed_move >=  threshold)  -> pausa
-            shock_against_long  = (self.side == "LONG"  and self.last_signed_move <= -self.shock_move_threshold)
-            shock_against_short = (self.side == "SHORT" and self.last_signed_move >=  self.shock_move_threshold)
-            shock_against = shock_against_long or shock_against_short
-
-            if lost_trade and shock_against:
-                self.cooldown_until = ts + pd.Timedelta(hours=self.shock_pause_hours)
+        # Si el trade cerró con pérdida y hubo shock >= umbral, pausar nuevas entradas 24h
+        if trade_pnl < 0:
+            chg_abs = abs(self.last_chg_24h_pct) if self.last_chg_24h_pct is not None else 0.0
+            if chg_abs >= self.shock_move_threshold_pct:
+                self.paused_until = ts + pd.Timedelta(hours=self.shock_pause_hours)
                 logging.warning(
-                    "Activando pausa por shock: move=%.2f%% contra %s; cooldown hasta %s",
-                    self.last_signed_move * 100.0, self.side, self.cooldown_until
+                    f"Shock {chg_abs:.2f}% y trade perdedor: trading PAUSADO hasta {self.paused_until}."
                 )
-                # Logueamos como evento informativo en el track de trades
+                # Opcional: registrar evento en el log de 'trades' para trazabilidad
                 self.trades.append({
-                    "timestamp": ts, "action": "PAUSE",
-                    "side": self.side, "price": float(price),
-                    "qty": float(self.qty), "regime": "RISK", "mode": "RISK",
-                    "pnl": 0.0, "balance": float(self.balance),
-                    "note": f"COOLDOWN {self.shock_pause_hours}h por shock {self.last_signed_move*100:.2f}%"
+                    "timestamp": ts,
+                    "action": "PAUSE",
+                    "side": None,
+                    "price": float(price),
+                    "qty": 0.0,
+                    "regime": "RISK",
+                    "mode": "RISK",
+                    "pnl": 0.0,
+                    "balance": float(self.balance),
+                    "note": f"SHOCK_PAUSE {chg_abs:.2f}% for {self.shock_pause_hours}h",
+                    "vol_regime": None,
+                    "sl_multiplier": None,
                 })
-        except Exception as _:
-            pass
 
         # Reset
         self.active = False
@@ -1310,10 +1305,18 @@ def main():
     ap.add_argument("--emerg-trade-stop-R", type=float, default=1.5, help="Cerrar si pérdida latente < -R*emerg")
     ap.add_argument("--daily-stop-R", type=float, default=2.0, help="No abrir más si el día acumula <= -R*daily")
     # Shock pause por movimiento extremo + pérdida
-    ap.add_argument("--shock-move-threshold-pct", type=float, default=10.0,
-                    help="Umbral de shock: movimiento %, absoluto, para activar pausa si hubo pérdida (ej 10.0)")
-    ap.add_argument("--shock-pause-hours", type=int, default=24,
-                    help="Horas de pausa luego de pérdida en shock (ej 24)")
+    ap.add_argument(
+        "--shock-move-threshold-pct",
+        type=float,
+        default=5.0,
+        help="Umbral de variación en 24h (%%) para activar pausa tras un trade perdedor",
+    )
+    ap.add_argument(
+        "--shock-pause-hours",
+        type=int,
+        default=24,
+        help="Horas de pausa de trading tras shock+trade perdedor",
+    )
 
     # Trailing / cierre final
     ap.add_argument("--trail-to-be", action="store_true", help="Mueve SL a BE al 50% del recorrido a TP")
