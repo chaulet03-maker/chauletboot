@@ -169,6 +169,9 @@ class RiskSizingBacktester:
         fee_pct: float = 0.0005,
         lev: float = 5.0,
         dynamic_leverage: bool = False,
+        loss_cooldown_bars: int = 0,
+        no_reentry_same_dir_bars: int = 0,
+        max_trades_per_day: Optional[int] = None,
         taker_fee: Optional[float] = None,
         maker_fee: Optional[float] = None,
         slip_bps: float = 2.0,
@@ -258,6 +261,15 @@ class RiskSizingBacktester:
         self.rsi_gate = float(rsi_gate)
         self.only_longs = bool(only_longs)
         self.only_shorts = bool(only_shorts)
+
+        utc_min = pd.Timestamp.min.tz_localize("UTC")
+        self._utc_min = utc_min
+        self.loss_cooldown_bars = int(loss_cooldown_bars or 0)
+        self.cooldown_until_ts = utc_min
+        self.no_reentry_same_dir_bars = int(no_reentry_same_dir_bars or 0)
+        self.side_block_until = {"LONG": utc_min, "SHORT": utc_min}
+        self.max_trades_per_day = max_trades_per_day if max_trades_per_day is None else int(max_trades_per_day)
+        self.trades_per_day: Dict[pd.Timestamp, int] = {}
 
         # Fees por lado (si no vienen, caen al fee_pct existente)
         self.taker_fee = float(taker_fee) if taker_fee is not None else float(fee_pct)
@@ -1056,9 +1068,27 @@ class RiskSizingBacktester:
                 else:
                     sig = self._signal_pullback_grid(row)
                 if sig is not None and self._passes_trend_filters(row, sig) and self._volatility_and_session_ok(row, ts):
+                    if self.no_reentry_same_dir_bars:
+                        block_until = self.side_block_until.get(sig, self._utc_min)
+                        if ts <= block_until:
+                            sig = None
+                    if sig is None:
+                        continue
+                    if ts <= getattr(self, "cooldown_until_ts", self._utc_min):
+                        continue
+                    dkey = _day(ts)
+                    if (
+                        self.max_trades_per_day is not None
+                        and self.trades_per_day.get(dkey, 0) >= self.max_trades_per_day
+                    ):
+                        continue
+
                     # Funding gate en la barra de señal
                     open_rate = self._funding_rate_at(ts)
-                    if not ((sig == "LONG" and open_rate > self.funding_gate_frac) or (sig == "SHORT" and open_rate < -self.funding_gate_frac)):
+                    if not (
+                        (sig == "LONG" and open_rate > self.funding_gate_frac)
+                        or (sig == "SHORT" and open_rate < -self.funding_gate_frac)
+                    ):
                         self.pending_order = {"side": sig}
 
         # Cierre al final
@@ -1095,10 +1125,14 @@ class RiskSizingBacktester:
         trade_pnl = pnl_gross - fee_close
         self.balance += trade_pnl
 
+        day_key = pd.Timestamp(year=ts.year, month=ts.month, day=ts.day, tz='UTC')
+
         # Actualizar daily R
         if self.risk_usd_trade and self.risk_usd_trade > 0:
-            day_key = pd.Timestamp(year=ts.year, month=ts.month, day=ts.day, tz='UTC')
             self.daily_R[day_key] = self.daily_R.get(day_key, 0.0) + (trade_pnl / self.risk_usd_trade)
+
+        # Conteo de cierres por día
+        self.trades_per_day[day_key] = self.trades_per_day.get(day_key, 0) + 1
 
         self.trades.append({
             "timestamp": ts, "action": "CLOSE", "side": self.side, "price": float(price),
@@ -1126,6 +1160,15 @@ class RiskSizingBacktester:
             )
         except Exception as exc:
             logging.error(f"Error al guardar trade en base de datos: {exc}")
+
+        if trade_pnl < 0:
+            if self.loss_cooldown_bars:
+                cooldown_target = ts + pd.Timedelta(hours=int(self.loss_cooldown_bars))
+                self.cooldown_until_ts = max(self.cooldown_until_ts, cooldown_target)
+            if self.no_reentry_same_dir_bars and self.side in ("LONG", "SHORT"):
+                self.side_block_until[self.side] = ts + pd.Timedelta(
+                    hours=int(self.no_reentry_same_dir_bars)
+                )
 
         # Reset
         self.active = False
@@ -1415,6 +1458,24 @@ def main():
         default=None,
         help="Límite diario de pérdida como % del equity al inicio del día",
     )
+    ap.add_argument(
+        "--loss-cooldown-bars",
+        type=int,
+        default=0,
+        help="Tras un cierre perdedor, bloquea nuevas entradas por N velas 1h",
+    )
+    ap.add_argument(
+        "--no-reentry-same-dir-bars",
+        type=int,
+        default=0,
+        help="Tras pérdida, bloquea re-entrar en la MISMA dirección por N velas 1h",
+    )
+    ap.add_argument(
+        "--max-trades-per-day",
+        type=int,
+        default=None,
+        help="Máximo de cierres por día; si se alcanza, no se abren más entradas ese día",
+    )
 
     # Trailing / cierre final
     ap.add_argument("--trail-to-be", action="store_true", help="Mueve SL a BE al 50% del recorrido a TP")
@@ -1505,6 +1566,9 @@ def main():
         circuit_dd_pct=args.circuit_dd_pct,
         circuit_lock_bars=args.circuit_lock_bars,
         daily_loss_pct=args.daily_loss_pct,
+        loss_cooldown_bars=args.loss_cooldown_bars,
+        no_reentry_same_dir_bars=args.no_reentry_same_dir_bars,
+        max_trades_per_day=args.max_trades_per_day,
         trail_to_be=bool(args.trail_to_be),
         no_end_close=bool(args.no_end_close),
         grid_span_atr=args.grid_span_atr,
