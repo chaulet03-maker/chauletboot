@@ -221,6 +221,9 @@ class RiskSizingBacktester:
         anchor_bias_frac: float = 1.0,
         # tagging
         tag: Optional[str] = None,
+        # >>> PATCH: parámetros de shock pause
+        shock_move_threshold_pct: float = 10.0,
+        shock_pause_hours: int = 24,
     ):
         self.entry_mode = entry_mode.lower().strip()
         if self.entry_mode not in ("rsi_cross", "pullback_grid"):
@@ -322,6 +325,13 @@ class RiskSizingBacktester:
 
         # Tag
         self.tag = (tag or "").strip()
+
+        # >>> PATCH: configuración de shock pause
+        self.shock_move_threshold = float(shock_move_threshold_pct) / 100.0  # 10% -> 0.10
+        self.shock_pause_hours = int(shock_pause_hours)
+        self.cooldown_until: Optional[pd.Timestamp] = None
+        self.last_bar_shock = False
+        self.last_signed_move = 0.0  # (c - prev_close)/prev_close
 
         # Posición
         self.active = False
@@ -775,6 +785,17 @@ class RiskSizingBacktester:
             ts = pd.to_datetime(row["timestamp"], utc=True)
             o = float(row["open"]); h = float(row["high"]); l = float(row["low"]); c = float(row["close"])
 
+            # >>> PATCH: medir shock de precio vs close anterior
+            prev_close = float(prev["close"])
+            self.last_signed_move = (c - prev_close) / max(prev_close, 1e-12)
+            self.last_bar_shock = abs(self.last_signed_move) >= self.shock_move_threshold
+
+            # >>> PATCH: si estamos en cooldown, no permitir programar ni abrir nuevas posiciones
+            in_cooldown = (self.cooldown_until is not None) and (ts < self.cooldown_until)
+            if in_cooldown:
+                # Anulamos cualquier orden pendiente que haya quedado
+                self.pending_order = None
+
             # Cobro funding en esta barra si corresponde
             self._apply_funding(ts, c)
 
@@ -783,93 +804,97 @@ class RiskSizingBacktester:
 
             # 1) Si hay orden pendiente del bar anterior y NO hay posición -> abrir en el OPEN de esta barra (i+1)
             if (not self.active) and (self.pending_order is not None):
-                dkey = _day(ts)
-                if self.daily_stop_R is None or self.daily_R.get(dkey, 0.0) > -float(self.daily_stop_R):
-                    side = self.pending_order["side"]
+                # >>> PATCH: bloqueo por cooldown
+                if (self.cooldown_until is not None) and (ts < self.cooldown_until):
+                    self.pending_order = None  # cancelar apertura
+                else:
+                    dkey = _day(ts)
+                    if self.daily_stop_R is None or self.daily_R.get(dkey, 0.0) > -float(self.daily_stop_R):
+                        side = self.pending_order["side"]
 
-                    # Precio de entrada = OPEN de esta barra, con slippage
-                    entry_raw = o
-                    entry_fill = self._apply_slippage_open(entry_raw, side)
+                        # Precio de entrada = OPEN de esta barra, con slippage
+                        entry_raw = o
+                        entry_fill = self._apply_slippage_open(entry_raw, side)
 
-                    # ATR actual para SL/TP
-                    atr = float(row["atr"]) if not np.isnan(row["atr"]) else 0.0
-                    self.last_sl_regime = None
-                    self.last_sl_multiplier = self.sl_atr_mult if self.use_atr else None
-                    target_pct = self._dynamic_target_pct(row, prev)
+                        # ATR actual para SL/TP
+                        atr = float(row["atr"]) if not np.isnan(row["atr"]) else 0.0
+                        self.last_sl_regime = None
+                        self.last_sl_multiplier = self.sl_atr_mult if self.use_atr else None
+                        target_pct = self._dynamic_target_pct(row, prev)
 
-                    # Sizing
-                    leverage_for_this_trade = self.lev
-                    if self.size_mode == "full_equity":
-                        leverage_for_this_trade = self._get_dynamic_leverage(row)
-                        notional = self.balance * leverage_for_this_trade
-                        qty = notional / max(entry_fill, 1e-12)
-                    else:
-                        # modo risk: necesito SL provisional para sizing
-                        if self.use_atr and self.sl_atr_mult is not None:
-                            move = self.sl_atr_mult * atr
-                            sl_tmp = entry_fill - move if side == "LONG" else entry_fill + move
-                        elif (not self.use_atr) and self.sl_pct is not None:
-                            sl_tmp = entry_fill * (1 - self.sl_pct) if side == "LONG" else entry_fill * (1 + self.sl_pct)
+                        # Sizing
+                        leverage_for_this_trade = self.lev
+                        if self.size_mode == "full_equity":
+                            leverage_for_this_trade = self._get_dynamic_leverage(row)
+                            notional = self.balance * leverage_for_this_trade
+                            qty = notional / max(entry_fill, 1e-12)
                         else:
-                            sl_tmp = None
-                        if sl_tmp is None:
+                            # modo risk: necesito SL provisional para sizing
+                            if self.use_atr and self.sl_atr_mult is not None:
+                                move = self.sl_atr_mult * atr
+                                sl_tmp = entry_fill - move if side == "LONG" else entry_fill + move
+                            elif (not self.use_atr) and self.sl_pct is not None:
+                                sl_tmp = entry_fill * (1 - self.sl_pct) if side == "LONG" else entry_fill * (1 + self.sl_pct)
+                            else:
+                                sl_tmp = None
+                            if sl_tmp is None:
+                                self.pending_order = None
+                                continue
+                            risk_u = self._risk_usd(eq_now)
+                            qty = self._qty_from_risk(entry_fill, sl_tmp, risk_u)
+
+                        # Cap por liquidez
+                        qty = self._cap_qty_by_liquidity(qty, entry_fill, row)
+                        self.qty = qty
+                        if self.qty <= 0:
                             self.pending_order = None
                             continue
-                        risk_u = self._risk_usd(eq_now)
-                        qty = self._qty_from_risk(entry_fill, sl_tmp, risk_u)
 
-                    # Cap por liquidez
-                    qty = self._cap_qty_by_liquidity(qty, entry_fill, row)
-                    self.qty = qty
-                    if self.qty <= 0:
-                        self.pending_order = None
-                        continue
+                        # Fees de apertura (taker) sobre notional
+                        notional_open = self.qty * entry_fill
+                        fee_open = self._fee_cost(notional_open, self.taker_fee)
+                        self.balance -= fee_open
 
-                    # Fees de apertura (taker) sobre notional
-                    notional_open = self.qty * entry_fill
-                    fee_open = self._fee_cost(notional_open, self.taker_fee)
-                    self.balance -= fee_open
+                        # Abrir
+                        self.active = True
+                        self.side = side
+                        self.entry = entry_fill
+                        self.entry_ts = ts
+                        self.entry_atr = atr
+                        self.sl_price, self.tp_price = self._calc_sl_tp(
+                            side, entry_fill, atr, eq_now, target_pct
+                        )
+                        self.bars_in_position = 0
+                        self.eq_on_open = eq_now
 
-                    # Abrir
-                    self.active = True
-                    self.side = side
-                    self.entry = entry_fill
-                    self.entry_ts = ts
-                    self.entry_atr = atr
-                    self.sl_price, self.tp_price = self._calc_sl_tp(
-                        side, entry_fill, atr, eq_now, target_pct
-                    )
-                    self.bars_in_position = 0
-                    self.eq_on_open = eq_now
+                        # Margen inicial (aprox) para safety: notional/lev
+                        self.initial_margin = (self.qty * self.entry) / max(leverage_for_this_trade, 1e-12)
 
-                    # Margen inicial (aprox) para safety: notional/lev
-                    self.initial_margin = (self.qty * self.entry) / max(leverage_for_this_trade, 1e-12)
+                        # R real en full_equity
+                        if self.size_mode == "full_equity":
+                            if self.sl_price is not None:
+                                self.risk_usd_trade = abs(self.entry - self.sl_price) * self.qty
+                            else:
+                                self.risk_usd_trade = self.balance * (self.risk_pct if self.risk_pct is not None else 0.01)
 
-                    # R real en full_equity
-                    if self.size_mode == "full_equity":
-                        if self.sl_price is not None:
-                            self.risk_usd_trade = abs(self.entry - self.sl_price) * self.qty
-                        else:
-                            self.risk_usd_trade = self.balance * (self.risk_pct if self.risk_pct is not None else 0.01)
+                        note_msg = (
+                            f"lev={leverage_for_this_trade:.2f} "
+                            f"sl={self.sl_price if self.sl_price is not None else np.nan} "
+                            f"tp={self.tp_price if self.tp_price is not None else np.nan} "
+                            f"size={self.size_mode} "
+                            f"target%={target_pct if target_pct is not None else np.nan}"
+                        )
+                        self.trades.append({
+                            "timestamp": ts, "action": "OPEN", "side": self.side, "price": float(self.entry),
+                            "qty": float(self.qty), "regime": "RISK", "mode": "RISK",
+                            "pnl": -float(fee_open), "balance": float(self.balance),
+                            "note": note_msg,
+                            "vol_regime": self.last_sl_regime,
+                            "sl_multiplier": self.last_sl_multiplier,
+                        })
 
-                    note_msg = (
-                        f"lev={leverage_for_this_trade:.2f} "
-                        f"sl={self.sl_price if self.sl_price is not None else np.nan} "
-                        f"tp={self.tp_price if self.tp_price is not None else np.nan} "
-                        f"size={self.size_mode} "
-                        f"target%={target_pct if target_pct is not None else np.nan}"
-                    )
-                    self.trades.append({
-                        "timestamp": ts, "action": "OPEN", "side": self.side, "price": float(self.entry),
-                        "qty": float(self.qty), "regime": "RISK", "mode": "RISK",
-                        "pnl": -float(fee_open), "balance": float(self.balance),
-                        "note": note_msg,
-                        "vol_regime": self.last_sl_regime,
-                        "sl_multiplier": self.last_sl_multiplier,
-                    })
-
-                # consumir la pendiente
-                self.pending_order = None
+                    # consumir la pendiente
+                    self.pending_order = None
 
             # 2) Gestión de posición activa (intrabar SL/TP + safety de margen + time stop)
             if self.active:
@@ -925,15 +950,19 @@ class RiskSizingBacktester:
                 # día bloqueado
                 pass
             else:
-                if self.entry_mode == "rsi_cross":
-                    sig = self._signal_rsi_cross(row, prev)
+                if (self.cooldown_until is not None) and (ts < self.cooldown_until):
+                    # En cooldown: no generamos señales nuevas
+                    pass
                 else:
-                    sig = self._signal_pullback_grid(row)
-                if sig is not None and self._passes_trend_filters(row, sig) and self._volatility_and_session_ok(row, ts):
-                    # Funding gate en la barra de señal
-                    open_rate = self._funding_rate_at(ts)
-                    if not ((sig == "LONG" and open_rate > self.funding_gate_frac) or (sig == "SHORT" and open_rate < -self.funding_gate_frac)):
-                        self.pending_order = {"side": sig}
+                    if self.entry_mode == "rsi_cross":
+                        sig = self._signal_rsi_cross(row, prev)
+                    else:
+                        sig = self._signal_pullback_grid(row)
+                    if sig is not None and self._passes_trend_filters(row, sig) and self._volatility_and_session_ok(row, ts):
+                        # Funding gate en la barra de señal
+                        open_rate = self._funding_rate_at(ts)
+                        if not ((sig == "LONG" and open_rate > self.funding_gate_frac) or (sig == "SHORT" and open_rate < -self.funding_gate_frac)):
+                            self.pending_order = {"side": sig}
 
         # Cierre al final
         if self.active:
@@ -1000,6 +1029,33 @@ class RiskSizingBacktester:
             )
         except Exception as exc:
             logging.error(f"Error al guardar trade en base de datos: {exc}")
+
+        # >>> PATCH: activar pausa si hubo pérdida durante un shock contrario a la dirección del trade
+        try:
+            lost_trade = (trade_pnl < 0)
+            # Dirección del shock vs lado del trade:
+            # LONG y caída fuerte (signed_move <= -threshold)  -> pausa
+            # SHORT y suba fuerte (signed_move >=  threshold)  -> pausa
+            shock_against_long  = (self.side == "LONG"  and self.last_signed_move <= -self.shock_move_threshold)
+            shock_against_short = (self.side == "SHORT" and self.last_signed_move >=  self.shock_move_threshold)
+            shock_against = shock_against_long or shock_against_short
+
+            if lost_trade and shock_against:
+                self.cooldown_until = ts + pd.Timedelta(hours=self.shock_pause_hours)
+                logging.warning(
+                    "Activando pausa por shock: move=%.2f%% contra %s; cooldown hasta %s",
+                    self.last_signed_move * 100.0, self.side, self.cooldown_until
+                )
+                # Logueamos como evento informativo en el track de trades
+                self.trades.append({
+                    "timestamp": ts, "action": "PAUSE",
+                    "side": self.side, "price": float(price),
+                    "qty": float(self.qty), "regime": "RISK", "mode": "RISK",
+                    "pnl": 0.0, "balance": float(self.balance),
+                    "note": f"COOLDOWN {self.shock_pause_hours}h por shock {self.last_signed_move*100:.2f}%"
+                })
+        except Exception as _:
+            pass
 
         # Reset
         self.active = False
@@ -1253,6 +1309,11 @@ def main():
     # Protecciones en R
     ap.add_argument("--emerg-trade-stop-R", type=float, default=1.5, help="Cerrar si pérdida latente < -R*emerg")
     ap.add_argument("--daily-stop-R", type=float, default=2.0, help="No abrir más si el día acumula <= -R*daily")
+    # Shock pause por movimiento extremo + pérdida
+    ap.add_argument("--shock-move-threshold-pct", type=float, default=10.0,
+                    help="Umbral de shock: movimiento %, absoluto, para activar pausa si hubo pérdida (ej 10.0)")
+    ap.add_argument("--shock-pause-hours", type=int, default=24,
+                    help="Horas de pausa luego de pérdida en shock (ej 24)")
 
     # Trailing / cierre final
     ap.add_argument("--trail-to-be", action="store_true", help="Mueve SL a BE al 50% del recorrido a TP")
@@ -1337,6 +1398,8 @@ def main():
         grid_side=args.grid_side,
         anchor_bias_frac=args.anchor_bias_frac,
         tag=(args.tag or "").strip(),
+        shock_move_threshold_pct=args.shock_move_threshold_pct,
+        shock_pause_hours=args.shock_pause_hours,
     )
 
     _save_run_config(args, out_dir=os.path.join("data", "backtests"), tag=(args.tag or ""))
