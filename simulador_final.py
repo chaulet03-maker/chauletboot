@@ -190,6 +190,8 @@ class RiskSizingBacktester:
         size_mode: str = "risk",  # "risk" | "full_equity"
         risk_pct: Optional[float] = 0.01,
         risk_usd: Optional[float] = None,
+        risk_cap_pct: Optional[float] = None,
+        equity_fraction: float = 1.0,
         # TP como % de equity
         target_eq_pnl_pct: Optional[float] = None,  # ej 0.10
         target_eq_pnl_pct_min: Optional[float] = None,
@@ -211,6 +213,9 @@ class RiskSizingBacktester:
         # Protecciones en R
         emerg_trade_stop_R: Optional[float] = 1.5,
         daily_stop_R: Optional[float] = 2.0,
+        circuit_dd_pct: Optional[float] = None,
+        circuit_lock_bars: Optional[int] = 72,
+        daily_loss_pct: Optional[float] = None,
         # Trailing
         trail_to_be: bool = False,
         # Cierre final
@@ -281,6 +286,11 @@ class RiskSizingBacktester:
         self.size_mode = size_mode
         self.risk_pct = risk_pct
         self.risk_usd_fixed = risk_usd
+        self.risk_cap_pct = float(risk_cap_pct) if risk_cap_pct is not None else None
+        eq_frac = float(equity_fraction) if equity_fraction is not None else 1.0
+        if not (0 < eq_frac <= 1.0):
+            raise ValueError("equity_fraction debe estar en el rango (0, 1].")
+        self.equity_fraction = eq_frac
 
         # TP como % del equity
         self.target_eq_pnl_pct = target_eq_pnl_pct
@@ -305,6 +315,12 @@ class RiskSizingBacktester:
         # Protecciones R
         self.emerg_trade_stop_R = emerg_trade_stop_R
         self.daily_stop_R = daily_stop_R
+        self.circuit_dd_pct = float(circuit_dd_pct) if circuit_dd_pct is not None else None
+        self.circuit_lock_bars = int(circuit_lock_bars) if circuit_lock_bars is not None else 72
+        self.circuit_locked_until_i = -1
+        self.peak_equity = self.balance
+        self.daily_loss_pct_limit = float(daily_loss_pct) if daily_loss_pct is not None else None
+        self._day_start_eq: Dict[pd.Timestamp, float] = {}
 
         # Trailing
         self.trail_to_be = bool(trail_to_be)
@@ -834,10 +850,37 @@ class RiskSizingBacktester:
             # Mark-to-market al cierre de la barra anterior o saldo actual (si no hay posición)
             eq_now = self._mark_equity(c)
 
+            # Actualizar pico de equity y evaluar circuit breaker
+            self.peak_equity = max(self.peak_equity, eq_now)
+            drawdown = 0.0
+            if self.peak_equity > 0:
+                drawdown = (eq_now / self.peak_equity) - 1.0
+            if (
+                self.circuit_dd_pct is not None
+                and drawdown <= -float(self.circuit_dd_pct)
+                and i > self.circuit_locked_until_i
+            ):
+                lock_bars = max(self.circuit_lock_bars or 0, 0)
+                self.circuit_locked_until_i = i + lock_bars
+            circuit_locked = i <= self.circuit_locked_until_i
+
+            # Tracking de equity diario para límites
+            dkey = _day(ts)
+            if dkey not in self._day_start_eq:
+                self._day_start_eq[dkey] = eq_now
+            day_limited = False
+            if (self.daily_loss_pct_limit is not None) and (self._day_start_eq[dkey] > 0):
+                day_ret = (eq_now / self._day_start_eq[dkey]) - 1.0
+                if day_ret <= -float(self.daily_loss_pct_limit):
+                    day_limited = True
+
             # 1) Si hay orden pendiente del bar anterior y NO hay posición -> abrir en el OPEN de esta barra (i+1)
             if (not self.active) and (self.pending_order is not None):
-                dkey = _day(ts)
-                if self.daily_stop_R is None or self.daily_R.get(dkey, 0.0) > -float(self.daily_stop_R):
+                if (
+                    (self.daily_stop_R is None or self.daily_R.get(dkey, 0.0) > -float(self.daily_stop_R))
+                    and not day_limited
+                    and not circuit_locked
+                ):
                     side = self.pending_order["side"]
 
                     # Precio de entrada = OPEN de esta barra, con slippage
@@ -854,8 +897,30 @@ class RiskSizingBacktester:
                     leverage_for_this_trade = self.lev
                     if self.size_mode == "full_equity":
                         leverage_for_this_trade = self._get_dynamic_leverage(row)
-                        notional = self.balance * leverage_for_this_trade
+                        equity_fraction = getattr(self, "equity_fraction", 1.0)
+                        notional = (self.balance * equity_fraction) * leverage_for_this_trade
                         qty = notional / max(entry_fill, 1e-12)
+                        if getattr(self, "risk_cap_pct", None) is not None:
+                            if self.use_atr and self.sl_atr_mult is not None and atr > 0:
+                                sl_tmp = (
+                                    entry_fill - self.sl_atr_mult * atr
+                                    if side == "LONG"
+                                    else entry_fill + self.sl_atr_mult * atr
+                                )
+                            elif (not self.use_atr) and self.sl_pct is not None:
+                                sl_tmp = (
+                                    entry_fill * (1 - self.sl_pct)
+                                    if side == "LONG"
+                                    else entry_fill * (1 + self.sl_pct)
+                                )
+                            else:
+                                sl_tmp = None
+
+                            if sl_tmp is not None and abs(entry_fill - sl_tmp) > 0:
+                                dollar_per_unit = abs(entry_fill - sl_tmp)
+                                risk_cap_usd = float(self.risk_cap_pct) * eq_now
+                                qty_cap_risk = risk_cap_usd / dollar_per_unit
+                                qty = min(qty, max(qty_cap_risk, 0.0))
                     else:
                         # modo risk: necesito SL provisional para sizing
                         if self.use_atr and self.sl_atr_mult is not None:
@@ -923,6 +988,7 @@ class RiskSizingBacktester:
 
                 # consumir la pendiente
                 self.pending_order = None
+                # si no se cumplen las condiciones, la orden queda descartada
 
             # 2) Gestión de posición activa (intrabar SL/TP + safety de margen + time stop)
             if self.active:
@@ -973,8 +1039,11 @@ class RiskSizingBacktester:
                 continue
 
             # 3) Si NO hay posición, evaluar señal ACTUAL para abrir en la PRÓXIMA barra (pendiente)
-            dkey = _day(ts)
-            if self.daily_stop_R is not None and self.daily_R.get(dkey, 0.0) <= -float(self.daily_stop_R):
+            if (
+                (self.daily_stop_R is not None and self.daily_R.get(dkey, 0.0) <= -float(self.daily_stop_R))
+                or day_limited
+                or circuit_locked
+            ):
                 # día bloqueado
                 pass
             else:
@@ -1281,6 +1350,18 @@ def main():
     ap.add_argument("--size-mode", type=str, default="risk", choices=["risk", "full_equity"], help="risk = por R; full_equity = usa todo el equity")
     ap.add_argument("--risk-pct", type=float, default=0.01, help="Riesgo por trade como % del balance (modo risk)")
     ap.add_argument("--risk-usd", type=float, default=None, help="Riesgo fijo por trade en USD (anula risk-pct)")
+    ap.add_argument(
+        "--risk-cap-pct",
+        type=float,
+        default=None,
+        help="Cap de pérdida por trade como % del equity (ej 0.003=0.3%). Solo aplica en full_equity",
+    )
+    ap.add_argument(
+        "--equity-fraction",
+        type=float,
+        default=1.0,
+        help="Fracción del equity usada para notional en full_equity (0<..<=1)",
+    )
 
     # TP como % del equity
     ap.add_argument("--target-eq-pnl-pct", type=float, default=None, help="Objetivo de PnL como % del equity al abrir (ej 0.10 = 10%)")
@@ -1307,6 +1388,24 @@ def main():
     # Protecciones en R
     ap.add_argument("--emerg-trade-stop-R", type=float, default=1.5, help="Cerrar si pérdida latente < -R*emerg")
     ap.add_argument("--daily-stop-R", type=float, default=2.0, help="No abrir más si el día acumula <= -R*daily")
+    ap.add_argument(
+        "--circuit-dd-pct",
+        type=float,
+        default=None,
+        help="Circuit breaker: si el equity cae este % desde el pico, frena entradas",
+    )
+    ap.add_argument(
+        "--circuit-lock-bars",
+        type=int,
+        default=72,
+        help="Barras a bloquear tras activar el circuit breaker",
+    )
+    ap.add_argument(
+        "--daily-loss-pct",
+        type=float,
+        default=None,
+        help="Límite diario de pérdida como % del equity al inicio del día",
+    )
 
     # Trailing / cierre final
     ap.add_argument("--trail-to-be", action="store_true", help="Mueve SL a BE al 50% del recorrido a TP")
@@ -1375,6 +1474,8 @@ def main():
         size_mode=args.size_mode,
         risk_pct=args.risk_pct,
         risk_usd=args.risk_usd,
+        risk_cap_pct=args.risk_cap_pct,
+        equity_fraction=args.equity_fraction,
         target_eq_pnl_pct=args.target_eq_pnl_pct,
         target_eq_pnl_pct_min=args.target_eq_pnl_pct_min,
         target_eq_pnl_pct_max=args.target_eq_pnl_pct_max,
@@ -1391,6 +1492,9 @@ def main():
         ban_hours=_parse_ban_hours(args.ban_hours),
         emerg_trade_stop_R=args.emerg_trade_stop_R,
         daily_stop_R=args.daily_stop_R,
+        circuit_dd_pct=args.circuit_dd_pct,
+        circuit_lock_bars=args.circuit_lock_bars,
+        daily_loss_pct=args.daily_loss_pct,
         trail_to_be=bool(args.trail_to_be),
         no_end_close=bool(args.no_end_close),
         grid_span_atr=args.grid_span_atr,
