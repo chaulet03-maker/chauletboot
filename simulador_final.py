@@ -5,7 +5,7 @@ Backtester con:
 - Position sizing: modo "risk" (por R) o "full_equity" (usa todo el equity como margen * lev)
 - TP / SL reales (por % o ATR)
 - TP objetivo como % del equity al abrir (fijo) o dinámico en rango [min,max] según fuerza de señal
-- Filtros de tendencia (EMA50 1h o EMA200 4h + confirmaciones 1h), gate de RSI 4h
+- Filtros de tendencia (EMA200 4h + confirmación 1h), gate de RSI 4h
 - Filtros de volatilidad (ATR%), sesiones baneadas, funding gate y cobro de funding
 - Time stop, daily stop en R, stop de emergencia en R, trailing a BE
 - Entradas: rsi_cross | pullback_grid (grid de una pierna, disparo por distancia ATR a ancla)
@@ -138,7 +138,6 @@ def leer_archivo_smart(path: str) -> pd.DataFrame:
 def indicators(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     c, h, l = df["close"], df["high"], df["low"]
-    df["ema50"] = EMAIndicator(c, window=50).ema_indicator()
     df["ema10"] = EMAIndicator(c, window=10).ema_indicator()
     df["ema30"] = EMAIndicator(c, window=30).ema_indicator()
     df["ema200"] = EMAIndicator(c, window=200).ema_indicator()  # 1h
@@ -168,10 +167,6 @@ class RiskSizingBacktester:
         initial_balance: float = 1000.0,
         fee_pct: float = 0.0005,
         lev: float = 5.0,
-        dynamic_leverage: bool = False,
-        loss_cooldown_bars: int = 0,
-        no_reentry_same_dir_bars: int = 0,
-        max_trades_per_day: Optional[int] = None,
         taker_fee: Optional[float] = None,
         maker_fee: Optional[float] = None,
         slip_bps: float = 2.0,
@@ -194,8 +189,6 @@ class RiskSizingBacktester:
         size_mode: str = "risk",  # "risk" | "full_equity"
         risk_pct: Optional[float] = 0.01,
         risk_usd: Optional[float] = None,
-        risk_cap_pct: Optional[float] = None,
-        equity_fraction: float = 1.0,
         # TP como % de equity
         target_eq_pnl_pct: Optional[float] = None,  # ej 0.10
         target_eq_pnl_pct_min: Optional[float] = None,
@@ -205,11 +198,10 @@ class RiskSizingBacktester:
         funding_default: float = 0.0001,
         funding_interval_hours: int = 8,
         funding_gate_bps: int = 80,
-        # Filtros de tendencia
-        trend_filter: str = "ema50_1h",
+        # Filtros tendencia 4h + confirmación 1h
+        trend_filter: str = "ema200_4h",
         rsi4h_gate: Optional[float] = 52.0,
         ema200_1h_confirm: bool = False,
-        ema50_1h_confirm: bool = False,
         # Volatilidad & horario
         atrp_gate_min: Optional[float] = 0.15,
         atrp_gate_max: Optional[float] = 1.20,
@@ -217,9 +209,6 @@ class RiskSizingBacktester:
         # Protecciones en R
         emerg_trade_stop_R: Optional[float] = 1.5,
         daily_stop_R: Optional[float] = 2.0,
-        circuit_dd_pct: Optional[float] = None,
-        circuit_lock_bars: Optional[int] = 72,
-        daily_loss_pct: Optional[float] = None,
         # Trailing
         trail_to_be: bool = False,
         # Cierre final
@@ -227,10 +216,9 @@ class RiskSizingBacktester:
         # Pullback grid
         grid_span_atr: float = 2.5,
         grid_step_atr: float = 0.6,
-        grid_anchor: str = "ema50",
+        grid_anchor: str = "ema30",
         grid_side: str = "auto",
         anchor_bias_frac: float = 1.0,
-        grid_short_mode: str = "pullback",
         # tagging
         tag: Optional[str] = None,
     ):
@@ -257,19 +245,9 @@ class RiskSizingBacktester:
         self.initial_balance = float(initial_balance)
         self.fee = float(fee_pct)
         self.lev = float(lev)
-        self.dynamic_leverage = bool(dynamic_leverage)
         self.rsi_gate = float(rsi_gate)
         self.only_longs = bool(only_longs)
         self.only_shorts = bool(only_shorts)
-
-        utc_min = pd.Timestamp.min.tz_localize("UTC")
-        self._utc_min = utc_min
-        self.loss_cooldown_bars = int(loss_cooldown_bars or 0)
-        self.cooldown_until_ts = utc_min
-        self.no_reentry_same_dir_bars = int(no_reentry_same_dir_bars or 0)
-        self.side_block_until = {"LONG": utc_min, "SHORT": utc_min}
-        self.max_trades_per_day = max_trades_per_day if max_trades_per_day is None else int(max_trades_per_day)
-        self.trades_per_day: Dict[pd.Timestamp, int] = {}
 
         # Fees por lado (si no vienen, caen al fee_pct existente)
         self.taker_fee = float(taker_fee) if taker_fee is not None else float(fee_pct)
@@ -300,11 +278,6 @@ class RiskSizingBacktester:
         self.size_mode = size_mode
         self.risk_pct = risk_pct
         self.risk_usd_fixed = risk_usd
-        self.risk_cap_pct = float(risk_cap_pct) if risk_cap_pct is not None else None
-        eq_frac = float(equity_fraction) if equity_fraction is not None else 1.0
-        if not (0 < eq_frac <= 1.0):
-            raise ValueError("equity_fraction debe estar en el rango (0, 1].")
-        self.equity_fraction = eq_frac
 
         # TP como % del equity
         self.target_eq_pnl_pct = target_eq_pnl_pct
@@ -321,7 +294,6 @@ class RiskSizingBacktester:
         self.trend_filter = trend_filter.lower() if trend_filter else "none"
         self.rsi4h_gate = rsi4h_gate
         self.ema200_1h_confirm = bool(ema200_1h_confirm)
-        self.ema50_1h_confirm = bool(ema50_1h_confirm)
         self.atrp_gate_min = atrp_gate_min
         self.atrp_gate_max = atrp_gate_max
         self.ban_hours = set(ban_hours or [])
@@ -329,12 +301,6 @@ class RiskSizingBacktester:
         # Protecciones R
         self.emerg_trade_stop_R = emerg_trade_stop_R
         self.daily_stop_R = daily_stop_R
-        self.circuit_dd_pct = float(circuit_dd_pct) if circuit_dd_pct is not None else None
-        self.circuit_lock_bars = int(circuit_lock_bars) if circuit_lock_bars is not None else 72
-        self.circuit_locked_until_i = -1
-        self.peak_equity = self.balance
-        self.daily_loss_pct_limit = float(daily_loss_pct) if daily_loss_pct is not None else None
-        self._day_start_eq: Dict[pd.Timestamp, float] = {}
 
         # Trailing
         self.trail_to_be = bool(trail_to_be)
@@ -346,16 +312,13 @@ class RiskSizingBacktester:
         self.grid_span_atr = float(grid_span_atr)
         self.grid_step_atr = float(grid_step_atr)
         self.grid_anchor = grid_anchor.lower().strip()
-        if self.grid_anchor not in ("ema30", "ema50", "ema200_4h"):
-            raise ValueError("grid_anchor debe ser 'ema30', 'ema50' o 'ema200_4h'")
+        if self.grid_anchor not in ("ema30", "ema200_4h"):
+            raise ValueError("grid_anchor debe ser 'ema30' o 'ema200_4h'")
         self.grid_side = grid_side.lower().strip()
         if self.grid_side not in ("auto", "long", "short"):
             raise ValueError("grid_side debe ser 'auto', 'long' o 'short'")
         # Sesgo del anchor hacia el precio (k=1 sin cambio; k=0.5 = 50% hacia price)
         self.anchor_bias_frac = float(anchor_bias_frac)
-        self.grid_short_mode = grid_short_mode.lower().strip()
-        if self.grid_short_mode not in ("pullback", "breakdown", "either"):
-            raise ValueError("grid_short_mode debe ser 'pullback', 'breakdown' o 'either'")
 
         # Tag
         self.tag = (tag or "").strip()
@@ -535,7 +498,7 @@ class RiskSizingBacktester:
         Devuelve (fill_price, note) si hay salida intrabar por SL/TP.
         Regla conservadora:
           - LONG: si low<=SL y high>=TP => asume SL primero (peor caso).
-                 SL: fill = min(open, SL). TP: fill = TP.
+                    SL: fill = min(open, SL). TP: fill = TP.
           - SHORT: simétrico (SL primero si choca ambos).
         """
         if not self.active or self.sl_price is None or self.tp_price is None:
@@ -574,12 +537,6 @@ class RiskSizingBacktester:
                 return False
             if side == "SHORT" and not (price < ema200_4h):
                 return False
-        elif self.trend_filter == "ema50_1h":
-            ema50_1h = float(row.get("ema50", np.nan))
-            if side == "LONG" and not (price > ema50_1h):
-                return False
-            if side == "SHORT" and not (price < ema50_1h):
-                return False
         if self.rsi4h_gate is not None:
             rsi4h = float(row.get("rsi4h", np.nan))
             if side == "LONG" and not (rsi4h >= self.rsi4h_gate):
@@ -591,12 +548,6 @@ class RiskSizingBacktester:
             if side == "LONG" and not (price > ema200_1h):
                 return False
             if side == "SHORT" and not (price < ema200_1h):
-                return False
-        if self.ema50_1h_confirm:
-            ema50_1h = float(row.get("ema50", np.nan))
-            if side == "LONG" and not (price > ema50_1h):
-                return False
-            if side == "SHORT" and not (price < ema50_1h):
                 return False
         return True
 
@@ -628,27 +579,15 @@ class RiskSizingBacktester:
         if self.grid_side in ("long", "short"):
             return "LONG" if self.grid_side == "long" else "SHORT"
         price = float(row["close"])
-        if self.trend_filter == "ema50_1h":
-            ema50 = float(row.get("ema50", np.nan))
-            rsi1h_gate = float(self.rsi_gate) if getattr(self, "rsi_gate", None) is not None else 50.0
-            rsi1h = float(row.get("rsi", np.nan))
-            if not np.isfinite(ema50) or not np.isfinite(rsi1h):
-                return None
-            if (price > ema50) and (rsi1h >= rsi1h_gate):
-                return "LONG"
-            if (price < ema50) and (rsi1h <= (100 - rsi1h_gate)):
-                return "SHORT"
+        ema200_4h = float(row.get("ema200_4h", np.nan))
+        rsi4h = float(row.get("rsi4h", np.nan))
+        if np.isnan(ema200_4h) or np.isnan(rsi4h):
             return None
-        else:
-            ema200_4h = float(row.get("ema200_4h", np.nan))
-            rsi4h = float(row.get("rsi4h", np.nan))
-            if np.isnan(ema200_4h) or np.isnan(rsi4h):
-                return None
-            if (price > ema200_4h) and (rsi4h >= (self.rsi4h_gate if self.rsi4h_gate is not None else 50)):
-                return "LONG"
-            if (price < ema200_4h) and (rsi4h <= (100 - (self.rsi4h_gate if self.rsi4h_gate is not None else 50))):
-                return "SHORT"
-            return None
+        if (price > ema200_4h) and (rsi4h >= (self.rsi4h_gate if self.rsi4h_gate is not None else 50)):
+            return "LONG"
+        if (price < ema200_4h) and (rsi4h <= (100 - (self.rsi4h_gate if self.rsi4h_gate is not None else 50))):
+            return "SHORT"
+        return None
 
     def _anchor_price(self, row: pd.Series) -> Optional[float]:
         """
@@ -656,10 +595,10 @@ class RiskSizingBacktester:
             anchor_biased = price + k * (anchor_raw - price)
         donde k = self.anchor_bias_frac (1.0 = sin cambio; 0.5 = 50% hacia price).
         """
+        import numpy as np
+
         if self.grid_anchor == "ema30":
             raw = row.get("ema30", np.nan)
-        elif self.grid_anchor == "ema50":
-            raw = row.get("ema50", np.nan)
         elif self.grid_anchor == "ema200_4h":
             raw = row.get("ema200_4h", np.nan)
         else:
@@ -672,7 +611,7 @@ class RiskSizingBacktester:
         if not np.isfinite(price):
             return float(raw)
 
-        k = float(self.anchor_bias_frac)
+        k = float(getattr(self, "anchor_bias_frac", 1.0))
         return float(price + k * (float(raw) - price))
 
     def _signal_pullback_grid(self, row: pd.Series) -> Optional[str]:
@@ -689,34 +628,12 @@ class RiskSizingBacktester:
 
         step = self.grid_step_atr * atr
         half_span = self.grid_span_atr * atr
-        same_anchor_as_trend = (
-            self.trend_filter == "ema50_1h" and self.grid_anchor == "ema50"
-        )
         if side_pref == "LONG":
-            if same_anchor_as_trend:
-                pull = max(0.0, abs(price - anchor))
-                if step <= pull <= half_span:
-                    return "LONG"
-            else:
-                long_ok = (price < anchor) and (step <= (anchor - price) <= half_span)
-                if long_ok:
-                    return "LONG"
+            if (price < anchor) and (anchor - price >= step) and (anchor - price <= half_span):
+                return "LONG"
         else:
-            if same_anchor_as_trend:
-                pull = max(0.0, abs(price - anchor))
-                pullback_ok = breakdown_ok = step <= pull <= half_span
-            else:
-                pullback_ok = (price > anchor) and (step <= (price - anchor) <= half_span)
-                breakdown_ok = (price < anchor) and (step <= (anchor - price) <= half_span)
-            if self.grid_short_mode == "pullback":
-                if pullback_ok:
-                    return "SHORT"
-            elif self.grid_short_mode == "breakdown":
-                if breakdown_ok:
-                    return "SHORT"
-            else:  # either
-                if pullback_ok or breakdown_ok:
-                    return "SHORT"
+            if (price > anchor) and (price - anchor >= step) and (price - anchor <= half_span):
+                return "SHORT"
         return None
 
     # ------------- Fuerza de señal -> target dinámico -------------
@@ -864,37 +781,10 @@ class RiskSizingBacktester:
             # Mark-to-market al cierre de la barra anterior o saldo actual (si no hay posición)
             eq_now = self._mark_equity(c)
 
-            # Actualizar pico de equity y evaluar circuit breaker
-            self.peak_equity = max(self.peak_equity, eq_now)
-            drawdown = 0.0
-            if self.peak_equity > 0:
-                drawdown = (eq_now / self.peak_equity) - 1.0
-            if (
-                self.circuit_dd_pct is not None
-                and drawdown <= -float(self.circuit_dd_pct)
-                and i > self.circuit_locked_until_i
-            ):
-                lock_bars = max(self.circuit_lock_bars or 0, 0)
-                self.circuit_locked_until_i = i + lock_bars
-            circuit_locked = i <= self.circuit_locked_until_i
-
-            # Tracking de equity diario para límites
-            dkey = _day(ts)
-            if dkey not in self._day_start_eq:
-                self._day_start_eq[dkey] = eq_now
-            day_limited = False
-            if (self.daily_loss_pct_limit is not None) and (self._day_start_eq[dkey] > 0):
-                day_ret = (eq_now / self._day_start_eq[dkey]) - 1.0
-                if day_ret <= -float(self.daily_loss_pct_limit):
-                    day_limited = True
-
             # 1) Si hay orden pendiente del bar anterior y NO hay posición -> abrir en el OPEN de esta barra (i+1)
             if (not self.active) and (self.pending_order is not None):
-                if (
-                    (self.daily_stop_R is None or self.daily_R.get(dkey, 0.0) > -float(self.daily_stop_R))
-                    and not day_limited
-                    and not circuit_locked
-                ):
+                dkey = _day(ts)
+                if self.daily_stop_R is None or self.daily_R.get(dkey, 0.0) > -float(self.daily_stop_R):
                     side = self.pending_order["side"]
 
                     # Precio de entrada = OPEN de esta barra, con slippage
@@ -910,33 +800,9 @@ class RiskSizingBacktester:
                     # Sizing
                     leverage_for_this_trade = self.lev
                     if self.size_mode == "full_equity":
-                        leverage_for_this_trade = (
-                            self._get_dynamic_leverage(row) if self.dynamic_leverage else self.lev
-                        )
-                        equity_fraction = getattr(self, "equity_fraction", 1.0)
-                        notional = (self.balance * equity_fraction) * leverage_for_this_trade
+                        leverage_for_this_trade = self._get_dynamic_leverage(row)
+                        notional = self.balance * leverage_for_this_trade
                         qty = notional / max(entry_fill, 1e-12)
-                        if getattr(self, "risk_cap_pct", None) is not None:
-                            if self.use_atr and self.sl_atr_mult is not None and atr > 0:
-                                sl_tmp = (
-                                    entry_fill - self.sl_atr_mult * atr
-                                    if side == "LONG"
-                                    else entry_fill + self.sl_atr_mult * atr
-                                )
-                            elif (not self.use_atr) and self.sl_pct is not None:
-                                sl_tmp = (
-                                    entry_fill * (1 - self.sl_pct)
-                                    if side == "LONG"
-                                    else entry_fill * (1 + self.sl_pct)
-                                )
-                            else:
-                                sl_tmp = None
-
-                            if sl_tmp is not None and abs(entry_fill - sl_tmp) > 0:
-                                dollar_per_unit = abs(entry_fill - sl_tmp)
-                                risk_cap_usd = float(self.risk_cap_pct) * eq_now
-                                qty_cap_risk = risk_cap_usd / dollar_per_unit
-                                qty = min(qty, max(qty_cap_risk, 0.0))
                     else:
                         # modo risk: necesito SL provisional para sizing
                         if self.use_atr and self.sl_atr_mult is not None:
@@ -1004,7 +870,6 @@ class RiskSizingBacktester:
 
                 # consumir la pendiente
                 self.pending_order = None
-                # si no se cumplen las condiciones, la orden queda descartada
 
             # 2) Gestión de posición activa (intrabar SL/TP + safety de margen + time stop)
             if self.active:
@@ -1055,11 +920,8 @@ class RiskSizingBacktester:
                 continue
 
             # 3) Si NO hay posición, evaluar señal ACTUAL para abrir en la PRÓXIMA barra (pendiente)
-            if (
-                (self.daily_stop_R is not None and self.daily_R.get(dkey, 0.0) <= -float(self.daily_stop_R))
-                or day_limited
-                or circuit_locked
-            ):
+            dkey = _day(ts)
+            if self.daily_stop_R is not None and self.daily_R.get(dkey, 0.0) <= -float(self.daily_stop_R):
                 # día bloqueado
                 pass
             else:
@@ -1068,27 +930,9 @@ class RiskSizingBacktester:
                 else:
                     sig = self._signal_pullback_grid(row)
                 if sig is not None and self._passes_trend_filters(row, sig) and self._volatility_and_session_ok(row, ts):
-                    if self.no_reentry_same_dir_bars:
-                        block_until = self.side_block_until.get(sig, self._utc_min)
-                        if ts <= block_until:
-                            sig = None
-                    if sig is None:
-                        continue
-                    if ts <= getattr(self, "cooldown_until_ts", self._utc_min):
-                        continue
-                    dkey = _day(ts)
-                    if (
-                        self.max_trades_per_day is not None
-                        and self.trades_per_day.get(dkey, 0) >= self.max_trades_per_day
-                    ):
-                        continue
-
                     # Funding gate en la barra de señal
                     open_rate = self._funding_rate_at(ts)
-                    if not (
-                        (sig == "LONG" and open_rate > self.funding_gate_frac)
-                        or (sig == "SHORT" and open_rate < -self.funding_gate_frac)
-                    ):
+                    if not ((sig == "LONG" and open_rate > self.funding_gate_frac) or (sig == "SHORT" and open_rate < -self.funding_gate_frac)):
                         self.pending_order = {"side": sig}
 
         # Cierre al final
@@ -1125,14 +969,10 @@ class RiskSizingBacktester:
         trade_pnl = pnl_gross - fee_close
         self.balance += trade_pnl
 
-        day_key = pd.Timestamp(year=ts.year, month=ts.month, day=ts.day, tz='UTC')
-
         # Actualizar daily R
         if self.risk_usd_trade and self.risk_usd_trade > 0:
+            day_key = pd.Timestamp(year=ts.year, month=ts.month, day=ts.day, tz='UTC')
             self.daily_R[day_key] = self.daily_R.get(day_key, 0.0) + (trade_pnl / self.risk_usd_trade)
-
-        # Conteo de cierres por día
-        self.trades_per_day[day_key] = self.trades_per_day.get(day_key, 0) + 1
 
         self.trades.append({
             "timestamp": ts, "action": "CLOSE", "side": self.side, "price": float(price),
@@ -1160,15 +1000,6 @@ class RiskSizingBacktester:
             )
         except Exception as exc:
             logging.error(f"Error al guardar trade en base de datos: {exc}")
-
-        if trade_pnl < 0:
-            if self.loss_cooldown_bars:
-                cooldown_target = ts + pd.Timedelta(hours=int(self.loss_cooldown_bars))
-                self.cooldown_until_ts = max(self.cooldown_until_ts, cooldown_target)
-            if self.no_reentry_same_dir_bars and self.side in ("LONG", "SHORT"):
-                self.side_block_until[self.side] = ts + pd.Timedelta(
-                    hours=int(self.no_reentry_same_dir_bars)
-                )
 
         # Reset
         self.active = False
@@ -1237,9 +1068,9 @@ class RiskSizingBacktester:
         print("=" * 64)
         print(f"Resultado Neto Final: ${total_pnl:,.2f}")
         print(f"Balance Final:       ${self.balance:,.2f}")
-        print(f"Rentabilidad Total:   {(self.balance / self.initial_balance - 1) * 100:.2f}%")
-        print(f"Winrate:              {winrate:.2f}%  | Payoff: {payoff:.2f}")
-        print(f"Max Drawdown:         {mdd * 100:.2f}%")
+        print(f"Rentabilidad Total:  {(self.balance / self.initial_balance - 1) * 100:.2f}%")
+        print(f"Winrate:             {winrate:.2f}%  | Payoff: {payoff:.2f}")
+        print(f"Max Drawdown:        {mdd * 100:.2f}%")
         print("-" * 64)
         print("PNL por modo (cierres):")
         if len(per_mode):
@@ -1270,12 +1101,12 @@ PRESETS = {
         "use_atr": True,
         "sl_atr_mult": 1.3,
         "tp_atr_mult": 3.0,
-        "trend_filter": "ema50_1h",
-        "ema50_1h_confirm": True,
-        "rsi4h_gate": None,
+        "trend_filter": "ema200_4h",
+        "ema200_1h_confirm": True,
+        "rsi4h_gate": 52.0,
         "grid_span_atr": 2.5,
         "grid_step_atr": 0.6,
-        "grid_anchor": "ema50",
+        "grid_anchor": "ema30",
         "grid_side": "auto",
         "atrp_gate_min": 0.10,
         "atrp_gate_max": 1.20,
@@ -1291,12 +1122,12 @@ PRESETS = {
         "use_atr": True,
         "sl_atr_mult": 1.3,
         "tp_atr_mult": 3.2,
-        "trend_filter": "ema50_1h",
-        "ema50_1h_confirm": True,
-        "rsi4h_gate": None,
+        "trend_filter": "ema200_4h",
+        "ema200_1h_confirm": True,
+        "rsi4h_gate": 52.0,
         "grid_span_atr": 2.5,
         "grid_step_atr": 0.4,
-        "grid_anchor": "ema50",
+        "grid_anchor": "ema30",
         "grid_side": "auto",
         "atrp_gate_min": 0.08,
         "atrp_gate_max": 1.40,
@@ -1370,11 +1201,6 @@ def main():
     ap.add_argument("--balance", type=float, default=1000.0, help="Balance inicial (equity)")
     ap.add_argument("--fee", type=float, default=0.0005, help="Fee proporcional por trade")
     ap.add_argument("--lev", type=float, default=5.0, help="Apalancamiento")
-    ap.add_argument(
-        "--dynamic-leverage",
-        action="store_true",
-        help="Si se activa, en full_equity usa apalancamiento dinámico por ADX (x5/x10). Por defecto usa --lev.",
-    )
 
     # Tag / presets
     ap.add_argument("--preset", type=str, default=None, choices=["conservador", "agresivo"], help="Carga parámetros predefinidos. Tus flags explíticas prevalecen.")
@@ -1402,18 +1228,6 @@ def main():
     ap.add_argument("--size-mode", type=str, default="risk", choices=["risk", "full_equity"], help="risk = por R; full_equity = usa todo el equity")
     ap.add_argument("--risk-pct", type=float, default=0.01, help="Riesgo por trade como % del balance (modo risk)")
     ap.add_argument("--risk-usd", type=float, default=None, help="Riesgo fijo por trade en USD (anula risk-pct)")
-    ap.add_argument(
-        "--risk-cap-pct",
-        type=float,
-        default=None,
-        help="Cap de pérdida por trade como % del equity (ej 0.003=0.3%). Solo aplica en full_equity",
-    )
-    ap.add_argument(
-        "--equity-fraction",
-        type=float,
-        default=1.0,
-        help="Fracción del equity usada para notional en full_equity (0<..<=1)",
-    )
 
     # TP como % del equity
     ap.add_argument("--target-eq-pnl-pct", type=float, default=None, help="Objetivo de PnL como % del equity al abrir (ej 0.10 = 10%)")
@@ -1426,11 +1240,10 @@ def main():
     ap.add_argument("--funding-interval-hours", type=int, default=8, help="Intervalo de funding (8h)")
     ap.add_argument("--funding-gate-bps", type=int, default=80, help="Evitar abrir si |rate| > gate (bps por 8h)")
 
-    # Filtros de tendencia
-    ap.add_argument("--trend-filter", type=str, default="ema50_1h", choices=["none", "ema50_1h", "ema200_4h"], help="Filtro de tendencia (por defecto EMA50 en 1h)")
+    # Filtros tendencia 4h + confirmación 1h
+    ap.add_argument("--trend-filter", type=str, default="ema200_4h", choices=["none", "ema200_4h"], help="Filtro de tendencia 4h")
     ap.add_argument("--rsi4h-gate", type=float, default=52.0, help="RSI 4h mínimo para LONG y (100-valor) para SHORT")
-    ap.add_argument("--ema200-1h-confirm", action="store_true", help="(Compat) Requiere precio > EMA200(1h) para LONG y < para SHORT")
-    ap.add_argument("--ema50-1h-confirm", action="store_true", help="Requiere precio > EMA50(1h) para LONG y < para SHORT")
+    ap.add_argument("--ema200-1h-confirm", action="store_true", help="Requiere precio > EMA200(1h) para LONG y < para SHORT")
 
     # Volatilidad & horario
     ap.add_argument("--atrp-gate-min", type=float, default=0.15, help="ATR%% mínimo (evitar chop)")
@@ -1440,42 +1253,6 @@ def main():
     # Protecciones en R
     ap.add_argument("--emerg-trade-stop-R", type=float, default=1.5, help="Cerrar si pérdida latente < -R*emerg")
     ap.add_argument("--daily-stop-R", type=float, default=2.0, help="No abrir más si el día acumula <= -R*daily")
-    ap.add_argument(
-        "--circuit-dd-pct",
-        type=float,
-        default=None,
-        help="Circuit breaker: si el equity cae este % desde el pico, frena entradas",
-    )
-    ap.add_argument(
-        "--circuit-lock-bars",
-        type=int,
-        default=72,
-        help="Barras a bloquear tras activar el circuit breaker",
-    )
-    ap.add_argument(
-        "--daily-loss-pct",
-        type=float,
-        default=None,
-        help="Límite diario de pérdida como % del equity al inicio del día",
-    )
-    ap.add_argument(
-        "--loss-cooldown-bars",
-        type=int,
-        default=0,
-        help="Tras un cierre perdedor, bloquea nuevas entradas por N velas 1h",
-    )
-    ap.add_argument(
-        "--no-reentry-same-dir-bars",
-        type=int,
-        default=0,
-        help="Tras pérdida, bloquea re-entrar en la MISMA dirección por N velas 1h",
-    )
-    ap.add_argument(
-        "--max-trades-per-day",
-        type=int,
-        default=None,
-        help="Máximo de cierres por día; si se alcanza, no se abren más entradas ese día",
-    )
 
     # Trailing / cierre final
     ap.add_argument("--trail-to-be", action="store_true", help="Mueve SL a BE al 50% del recorrido a TP")
@@ -1484,20 +1261,13 @@ def main():
     # Pullback grid
     ap.add_argument("--grid-span-atr", type=float, default=2.5, help="Ancho total de banda desde ancla (en ATR)")
     ap.add_argument("--grid-step-atr", type=float, default=0.6, help="Paso de disparo de pullback (en ATR)")
-    ap.add_argument("--grid-anchor", type=str, default="ema50", choices=["ema30", "ema50", "ema200_4h"], help="Ancla del grid dinámico")
+    ap.add_argument("--grid-anchor", type=str, default="ema30", choices=["ema30", "ema200_4h"], help="Ancla del grid dinámico")
     ap.add_argument("--grid-side", type=str, default="auto", choices=["auto", "long", "short"], help="Lado preferido del grid")
     ap.add_argument(
         "--anchor-bias-frac",
         type=float,
         default=1.0,
         help="Sesgo del anchor hacia el precio: anchor'=price + k*(anchor-price). Usa 0.5 para mover el anchor 50% hacia price.",
-    )
-    ap.add_argument(
-        "--grid-short-mode",
-        type=str,
-        default="pullback",
-        choices=["pullback", "breakdown", "either"],
-        help="Para señales SHORT: pullback (retroceso), breakdown (continuación) o either (ambos)",
     )
 
     # Fees por lado y slippage
@@ -1529,7 +1299,6 @@ def main():
         slip_bps=args.slip_bps,
         max_vol_frac=args.max_vol_frac,
         margin_safety_pct=args.margin_safety_pct,
-        dynamic_leverage=args.dynamic_leverage,
         entry_mode=args.entry_mode,
         rsi_gate=args.rsi_gate,
         only_longs=args.only_longs,
@@ -1545,8 +1314,6 @@ def main():
         size_mode=args.size_mode,
         risk_pct=args.risk_pct,
         risk_usd=args.risk_usd,
-        risk_cap_pct=args.risk_cap_pct,
-        equity_fraction=args.equity_fraction,
         target_eq_pnl_pct=args.target_eq_pnl_pct,
         target_eq_pnl_pct_min=args.target_eq_pnl_pct_min,
         target_eq_pnl_pct_max=args.target_eq_pnl_pct_max,
@@ -1557,18 +1324,11 @@ def main():
         trend_filter=args.trend_filter,
         rsi4h_gate=args.rsi4h_gate,
         ema200_1h_confirm=bool(args.ema200_1h_confirm),
-        ema50_1h_confirm=bool(args.ema50_1h_confirm),
         atrp_gate_min=args.atrp_gate_min,
         atrp_gate_max=args.atrp_gate_max,
         ban_hours=_parse_ban_hours(args.ban_hours),
         emerg_trade_stop_R=args.emerg_trade_stop_R,
         daily_stop_R=args.daily_stop_R,
-        circuit_dd_pct=args.circuit_dd_pct,
-        circuit_lock_bars=args.circuit_lock_bars,
-        daily_loss_pct=args.daily_loss_pct,
-        loss_cooldown_bars=args.loss_cooldown_bars,
-        no_reentry_same_dir_bars=args.no_reentry_same_dir_bars,
-        max_trades_per_day=args.max_trades_per_day,
         trail_to_be=bool(args.trail_to_be),
         no_end_close=bool(args.no_end_close),
         grid_span_atr=args.grid_span_atr,
@@ -1576,7 +1336,6 @@ def main():
         grid_anchor=args.grid_anchor,
         grid_side=args.grid_side,
         anchor_bias_frac=args.anchor_bias_frac,
-        grid_short_mode=args.grid_short_mode,
         tag=(args.tag or "").strip(),
     )
 
