@@ -22,6 +22,10 @@ atrp_gate_min: 0.25
 atrp_gate_max: 1.50
 ban_hours: [1]
 
+# pausas por shock
+shock_move_threshold_pct: 7.0
+shock_pause_hours: 10.0
+
 # funding (igual que el sim)
 funding_gate_bps: 160
 funding_interval_hours: 8
