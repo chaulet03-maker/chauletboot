@@ -71,6 +71,7 @@ class TradingApp:
             self._entry_lock_ttl_s = max(int(float(ttl_cfg)), 60)
         except Exception:
             self._entry_lock_ttl_s = 12 * 60 * 60
+        self._shock_guard_last_trade_id: Optional[Any] = None
 
         schedule.every().day.at("08:00", "America/Argentina/Buenos_Aires").do(self._generate_daily_report)
         schedule.every().sunday.at("00:00", "America/Argentina/Buenos_Aires").do(self._generate_weekly_report)
@@ -254,6 +255,19 @@ class TradingApp:
                 self.connection_lost = False
 
             logging.info("Iniciando ciclo de análisis de mercado...")
+
+            try:
+                from risk_guards import check_shock_pause_and_pause_if_needed
+
+                check_shock_pause_and_pause_if_needed(
+                    settings=self.config,
+                    state=self,
+                    market=self.exchange,
+                    pause_manager=self.pause_manager,
+                    notifier=self.notifier,
+                )
+            except Exception as e:  # pragma: no cover - defensivo
+                self.logger.exception(f"Shock gate check failed: {e}")
 
             # 0) Refrescar mark-to-market en paper utilizando el precio actual
             if S.PAPER and POSITION_SERVICE is not None:
@@ -440,6 +454,21 @@ class TradingApp:
                     price_val = None
                 ctx_overrides = {"cooldown": True}
                 _emit_motive(ctx_overrides, price_value=price_val)
+                return
+
+            if self.pause_manager.is_paused_now():
+                until = self.pause_manager.get_pause_until()
+                self.is_paused = True
+                logging.info(
+                    "El bot está en pausa hasta %s. No se buscarán nuevas señales.",
+                    until,
+                )
+                reason_msg = (
+                    f"bot en pausa hasta {until.strftime('%Y-%m-%d %H:%M UTC')}"
+                    if until is not None
+                    else "bot en pausa"
+                )
+                _emit_motive({"reasons": [reason_msg]})
                 return
 
             if self.is_paused:
