@@ -243,8 +243,13 @@ class RiskSizingBacktester:
         df4_agg = df4[["ema200", "rsi"]].rename(columns={"ema200": "ema200_4h", "rsi": "rsi4h"})
         self.df = self.df_1h.join(df4_agg.reindex(self.df_1h.index, method="ffill")).dropna()
 
-        # Cambio 24h (para detectar shocks del 5%+)
+        # Métricas de shock 24h
+        # 1) cambio puntual 24h (close vs close-24h)
         self.df["chg_24h_pct"] = self.df["close"].pct_change(periods=24) * 100.0
+        # 2) rango intraperiodo 24h: (max(high)-min(low))/min(low)
+        self.df["high24"] = self.df["high"].rolling(24, min_periods=24).max()
+        self.df["low24"] = self.df["low"].rolling(24, min_periods=24).min()
+        self.df["shock24_range_pct"] = ((self.df["high24"] / self.df["low24"]) - 1.0) * 100.0
 
         # estado
         self.balance = float(initial_balance)
@@ -260,6 +265,7 @@ class RiskSizingBacktester:
         self.shock_pause_hours = int(shock_pause_hours)
         self.paused_until: Optional[pd.Timestamp] = None
         self.last_chg_24h_pct: float = 0.0
+        self.last_shock_24h_range_pct: float = 0.0
 
         # Fees por lado (si no vienen, caen al fee_pct existente)
         self.taker_fee = float(taker_fee) if taker_fee is not None else float(fee_pct)
@@ -787,10 +793,18 @@ class RiskSizingBacktester:
             ts = pd.to_datetime(row["timestamp"], utc=True)
             o = float(row["open"]); h = float(row["high"]); l = float(row["low"]); c = float(row["close"])
 
-            # Variación 24h de este bar (puede ser NaN al inicio)
+            # Actualizar métricas de shock de esta barra
             chg24 = float(row.get("chg_24h_pct", np.nan))
+            rng24 = float(row.get("shock24_range_pct", np.nan))
             if np.isfinite(chg24):
                 self.last_chg_24h_pct = chg24
+            if np.isfinite(rng24):
+                self.last_shock_24h_range_pct = rng24
+
+            # Si hay pausa global por shock, no abrir ni dejar pendientes
+            if self.paused_until is not None and ts < self.paused_until:
+                self.pending_order = None  # descartar orden pendiente
+                # seguimos con la gestión de posición (si la hubiera), pero no generamos señales ni abrimos nada
 
             # Cobro funding en esta barra si corresponde
             self._apply_funding(ts, c)
@@ -802,13 +816,11 @@ class RiskSizingBacktester:
             if (not self.active) and (self.pending_order is not None):
                 # Bloqueo global por shock: mientras dure, no se abren posiciones
                 if self.paused_until is not None and ts < self.paused_until:
-                    self.pending_order = None  # descartar cualquier pendiente
-                    # Seguimos al próximo bar sin evaluar nuevas señales
-                    continue
-
-                dkey = _day(ts)
-                if self.daily_stop_R is None or self.daily_R.get(dkey, 0.0) > -float(self.daily_stop_R):
-                    side = self.pending_order["side"]
+                    self.pending_order = None
+                else:
+                    dkey = _day(ts)
+                    if self.daily_stop_R is None or self.daily_R.get(dkey, 0.0) > -float(self.daily_stop_R):
+                        side = self.pending_order["side"]
 
                         # Precio de entrada = OPEN de esta barra, con slippage
                         entry_raw = o
@@ -842,7 +854,7 @@ class RiskSizingBacktester:
                             qty = self._qty_from_risk(entry_fill, sl_tmp, risk_u)
 
                         # Cap por liquidez
-                        qty = self._cap_qty_by_liquidity(qty, entry_fill, row)
+                        qty = self._cap_qty_by_liquidez(qty, entry_fill, row)
                         self.qty = qty
                         if self.qty <= 0:
                             self.pending_order = None
@@ -891,8 +903,8 @@ class RiskSizingBacktester:
                             "sl_multiplier": self.last_sl_multiplier,
                         })
 
-                # consumir la pendiente
-                self.pending_order = None
+                    # consumir la pendiente
+                    self.pending_order = None
 
             # 2) Gestión de posición activa (intrabar SL/TP + safety de margen + time stop)
             if self.active:
@@ -943,15 +955,15 @@ class RiskSizingBacktester:
                 continue
 
             # 3) Si NO hay posición, evaluar señal ACTUAL para abrir en la PRÓXIMA barra (pendiente)
+            # Pausa por shock activa => no generar señales
+            if self.paused_until is not None and ts < self.paused_until:
+                continue
+
             dkey = _day(ts)
             if self.daily_stop_R is not None and self.daily_R.get(dkey, 0.0) <= -float(self.daily_stop_R):
                 # día bloqueado
                 pass
             else:
-                # Si está en pausa, no generamos señales nuevas
-                if self.paused_until is not None and ts < self.paused_until:
-                    continue
-
                 if self.entry_mode == "rsi_cross":
                     sig = self._signal_rsi_cross(row, prev)
                 else:
@@ -1028,15 +1040,17 @@ class RiskSizingBacktester:
         except Exception as exc:
             logging.error(f"Error al guardar trade en base de datos: {exc}")
 
-        # Si el trade cerró con pérdida y hubo shock >= umbral, pausar nuevas entradas 24h
+        # Pausa si el trade cerró en pérdida y hubo shock >= umbral en las últimas 24h
         if trade_pnl < 0:
             chg_abs = abs(self.last_chg_24h_pct) if self.last_chg_24h_pct is not None else 0.0
-            if chg_abs >= self.shock_move_threshold_pct:
+            rng24 = self.last_shock_24h_range_pct if self.last_shock_24h_range_pct is not None else 0.0
+            if (chg_abs >= self.shock_move_threshold_pct) or (rng24 >= self.shock_move_threshold_pct):
                 self.paused_until = ts + pd.Timedelta(hours=self.shock_pause_hours)
                 logging.warning(
-                    f"Shock {chg_abs:.2f}% y trade perdedor: trading PAUSADO hasta {self.paused_until}."
+                    f"Shock detectado (Δ24h={chg_abs:.2f}% | Rango24h={rng24:.2f}%) y trade perdedor: "
+                    f"PAUSA hasta {self.paused_until}."
                 )
-                # Opcional: registrar evento en el log de 'trades' para trazabilidad
+                # Loguear evento en el CSV
                 self.trades.append({
                     "timestamp": ts,
                     "action": "PAUSE",
@@ -1047,7 +1061,7 @@ class RiskSizingBacktester:
                     "mode": "RISK",
                     "pnl": 0.0,
                     "balance": float(self.balance),
-                    "note": f"SHOCK_PAUSE {chg_abs:.2f}% for {self.shock_pause_hours}h",
+                    "note": f"SHOCK_PAUSE thr={self.shock_move_threshold_pct:.2f}% chg24={chg_abs:.2f}% rng24={rng24:.2f}%, {self.shock_pause_hours}h",
                     "vol_regime": None,
                     "sl_multiplier": None,
                 })
