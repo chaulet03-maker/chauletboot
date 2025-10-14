@@ -172,10 +172,6 @@ class RiskSizingBacktester:
         slip_bps: float = 2.0,
         max_vol_frac: Optional[float] = None,
         margin_safety_pct: Optional[float] = None,
-        dynamic_leverage: bool = False,
-        adx_trend_threshold: float = 25.0,
-        high_trend_lev: Optional[float] = None,
-        low_trend_lev: Optional[float] = None,
         entry_mode: str = "rsi_cross",  # o "pullback_grid"
         rsi_gate: float = 55.0,
         only_longs: bool = False,
@@ -249,13 +245,6 @@ class RiskSizingBacktester:
         self.initial_balance = float(initial_balance)
         self.fee = float(fee_pct)
         self.lev = float(lev)
-        self.dynamic_leverage = bool(dynamic_leverage)
-        self.adx_trend_threshold = float(adx_trend_threshold)
-        base_lev = float(lev)
-        default_high = max(base_lev, 10.0)
-        self.high_trend_lev = float(high_trend_lev) if high_trend_lev is not None else default_high
-        default_low = base_lev if low_trend_lev is None else float(low_trend_lev)
-        self.low_trend_lev = max(min(default_low, self.high_trend_lev), 0.1)
         self.rsi_gate = float(rsi_gate)
         self.only_longs = bool(only_longs)
         self.only_shorts = bool(only_shorts)
@@ -733,27 +722,23 @@ class RiskSizingBacktester:
         return max(qty, 0.0)
 
     def _get_dynamic_leverage(self, row: pd.Series) -> float:
-        """Devuelve el apalancamiento dinámico basándose en la fuerza de tendencia."""
-        if not self.dynamic_leverage:
-            return self.lev
+        """
+        Analiza la fuerza de la tendencia (ADX) y devuelve el apalancamiento
+        apropiado según 2 niveles: x5 o x10.
+        """
+        adx = float(row["adx"])
 
-        adx = float(row.get("adx", np.nan))
-        if not np.isfinite(adx):
-            return self.low_trend_lev
-
-        if adx >= self.adx_trend_threshold:
-            leverage = self.high_trend_lev
+        # --- Definimos el umbral de tendencia ---
+        if adx >= 25:
+            # Tendencia FUERTE, usamos apalancamiento agresivo
+            leverage = 10.0
             trend_strength = "FUERTE"
         else:
-            leverage = self.low_trend_lev
+            # Tendencia DEBIL o LATERAL, usamos apalancamiento base
+            leverage = 5.0
             trend_strength = "DEBIL"
 
-        logging.info(
-            "Fuerza de tendencia: %s (ADX=%.2f). Usando apalancamiento: x%.2f",
-            trend_strength,
-            adx,
-            leverage,
-        )
+        logging.info(f"Fuerza de tendencia: {trend_strength} (ADX={adx:.2f}). Usando apalancamiento: x{leverage}")
 
         return leverage
 
@@ -1216,10 +1201,6 @@ def main():
     ap.add_argument("--balance", type=float, default=1000.0, help="Balance inicial (equity)")
     ap.add_argument("--fee", type=float, default=0.0005, help="Fee proporcional por trade")
     ap.add_argument("--lev", type=float, default=5.0, help="Apalancamiento")
-    ap.add_argument("--dynamic-leverage", action="store_true", help="Habilita apalancamiento dinámico basado en ADX")
-    ap.add_argument("--adx-trend-threshold", type=float, default=25.0, help="Umbral de ADX para considerar tendencia fuerte")
-    ap.add_argument("--high-trend-lev", type=float, default=None, help="Apalancamiento usado cuando ADX supera el umbral")
-    ap.add_argument("--low-trend-lev", type=float, default=None, help="Apalancamiento usado cuando ADX está por debajo del umbral")
 
     # Tag / presets
     ap.add_argument("--preset", type=str, default=None, choices=["conservador", "agresivo"], help="Carga parámetros predefinidos. Tus flags explíticas prevalecen.")
@@ -1313,10 +1294,6 @@ def main():
         initial_balance=args.balance,
         fee_pct=args.fee,
         lev=args.lev,
-        dynamic_leverage=bool(args.dynamic_leverage),
-        adx_trend_threshold=args.adx_trend_threshold,
-        high_trend_lev=args.high_trend_lev,
-        low_trend_lev=args.low_trend_lev,
         taker_fee=args.taker_fee,
         maker_fee=args.maker_fee,
         slip_bps=args.slip_bps,
