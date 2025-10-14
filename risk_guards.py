@@ -1,56 +1,33 @@
-import json
 import logging
-import os
 from datetime import datetime, timedelta, timezone
 
-STATE_FILE = "runtime_state.json"
+from notifier import notify
+from pause_manager import ShockPauseManager
+
+PAUSE_MANAGER = ShockPauseManager(state_path="pause_state.json")
 
 
 def _utcnow():
     return datetime.now(timezone.utc)
 
 
-def load_state():
-    if os.path.exists(STATE_FILE):
-        with open(STATE_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    return {"paused_until": None}
-
-
-def save_state(state):
-    with open(STATE_FILE, "w", encoding="utf-8") as f:
-        json.dump(state, f, ensure_ascii=False, indent=2, default=str)
+def get_pause_manager() -> ShockPauseManager:
+    return PAUSE_MANAGER
 
 
 def is_paused_now():
-    state = load_state()
-    pu = state.get("paused_until")
-    if not pu:
-        return False
-    try:
-        pu_dt = datetime.fromisoformat(pu)
-    except Exception:
-        return False
-    return _utcnow() < pu_dt
+    return PAUSE_MANAGER.is_paused()
 
 
 def set_pause_hours(hours: float):
-    until = _utcnow() + timedelta(hours=hours)
-    state = load_state()
-    state["paused_until"] = until.isoformat()
-    save_state(state)
+    until = PAUSE_MANAGER.set_pause_hours(hours)
     logging.warning(f"[RISK] Trading en PAUSA hasta {until.isoformat()}.")
+    return until
 
 
 def clear_pause_if_expired():
-    state = load_state()
-    pu = state.get("paused_until")
-    if not pu:
-        return
-    pu_dt = datetime.fromisoformat(pu)
-    if _utcnow() >= pu_dt:
-        state["paused_until"] = None
-        save_state(state)
+    if PAUSE_MANAGER.pause_until and not PAUSE_MANAGER.is_paused():
+        PAUSE_MANAGER.clear_pause()
         logging.info("[RISK] Pausa expirada, reanudando trading.")
 
 
@@ -135,6 +112,27 @@ def get_24h_change_pct_ccxt(exchange, symbol):
     return 0.0
 
 
+def get_24h_range_pct_ccxt(exchange, symbol) -> float:
+    """Calcula el rango porcentual de las últimas 24h usando OHLCV de 1h."""
+    try:
+        ohlcv = exchange.fetch_ohlcv(symbol, timeframe="1h", limit=24)
+        if not ohlcv:
+            return 0.0
+        highs = [c[2] for c in ohlcv]
+        lows = [c[3] for c in ohlcv]
+        closes = [c[4] for c in ohlcv]
+        if not highs or not lows or not closes:
+            return 0.0
+        high = max(highs)
+        low = min(lows)
+        ref = closes[-1] or (high + low) / 2
+        if ref:
+            return (high - low) / ref * 100.0
+    except Exception:
+        pass
+    return 0.0
+
+
 def maybe_trigger_shock_pause_on_loss(
     exchange,
     symbol,
@@ -147,7 +145,15 @@ def maybe_trigger_shock_pause_on_loss(
         return
     pct = abs(get_24h_change_pct_ccxt(exchange, symbol))
     if pct >= shock_move_threshold_pct:
-        set_pause_hours(shock_pause_hours)
+        until = set_pause_hours(shock_pause_hours)
+        range_pct = get_24h_range_pct_ccxt(exchange, symbol)
         logging.warning(
-            f"[RISK] Shock detectado (Δ24h={pct:.2f}%) y trade perdedor -> PAUSA {shock_pause_hours}h."
+            f"[RISK] Shock detectado (Δ24h={pct:.2f}% | Rango24h={range_pct:.2f}%) y trade perdedor -> PAUSA {shock_pause_hours}h."
+        )
+        notify(
+            "Trading PAUSADO por shock de volatilidad.\n"
+            "Motivo: pérdida tras movimiento extremo 24h.\n"
+            f"Δ24h={pct:.2f}% | Rango24h={range_pct:.2f}%\n"
+            f"Duración: {shock_pause_hours:.1f} h | Auto-reanudación: {until.replace(microsecond=0).isoformat()} (UTC)\n"
+            "Escribe 'reanudar' para continuar ahora."
         )
