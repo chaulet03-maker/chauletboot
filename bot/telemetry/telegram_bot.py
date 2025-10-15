@@ -1059,6 +1059,12 @@ async def _modo_command(update: Update, context: ContextTypes.DEFAULT_TYPE, new_
                     await engine.exchange.downgrade_to_paper()
             except Exception:
                 logger.debug("No se pudo pasar exchange a paper tras cambio a SIM.", exc_info=True)
+        # Resetear caches del trader para evitar balances/posiciones viejas
+        try:
+            if engine and getattr(engine, "trader", None):
+                engine.trader.reset_caches()
+        except Exception:
+            logger.debug("No se pudo resetear caches del trader tras cambio de modo.", exc_info=True)
     else:
         msg = f"❌ No pude cambiar el modo: {result.msg}"
     message = update.effective_message
@@ -1169,6 +1175,64 @@ async def equity_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await message.reply_text(f"✅ Porcentaje de equity seteado: {pct:.2f}% (frac={frac})")
 
 
+async def diag_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Diagnóstico rápido del estado del bot."""
+    engine = _get_engine_from_context(context)
+    if engine is None:
+        await _reply_chunks(update, "Engine no disponible.")
+        return
+
+    lines = ["🧪 *Diagnóstico*"]
+
+    try:
+        mode = str(get_mode()).upper()
+    except Exception:
+        mode = "DESCONOCIDO"
+    lines.append(f"• Modo: `{mode}`")
+
+    ex = getattr(engine, "exchange", None)
+    if ex:
+        try:
+            authed = bool(getattr(ex, "is_authenticated", False))
+            client = getattr(ex, "client", None)
+            if authed and client is not None:
+                authed = bool(getattr(client, "apiKey", None))
+            lines.append(f"• CCXT: {'AUTENTICADO' if authed else 'PÚBLICO'}")
+        except Exception:
+            lines.append("• CCXT: (estado desconocido)")
+
+        try:
+            px = await ex.get_current_price()
+            lines.append(f"• Precio cache: {px if px is not None else 'N/D'}")
+        except Exception:
+            lines.append("• Precio cache: error")
+
+        try:
+            symbol = engine.config.get("symbol", "BTC/USDT") if getattr(engine, "config", None) else "BTC/USDT"
+            if getattr(ex, "public_client", None):
+                fr = await asyncio.to_thread(ex.public_client.fetchFundingRate, symbol)
+                val = float(fr.get("fundingRate")) if fr else None
+            else:
+                val = None
+            lines.append(f"• Funding rate: {val if val is not None else 'N/D'}")
+        except Exception:
+            lines.append("• Funding rate: error")
+    else:
+        lines.append("• Exchange: N/D")
+
+    try:
+        trader = getattr(engine, "trader", None)
+        if trader is not None:
+            eq = await trader.get_balance(ex)
+        else:
+            eq = None
+        lines.append(f"• Equity: {eq if eq is not None else 'N/D'}")
+    except Exception:
+        lines.append("• Equity: error")
+
+    await _reply_chunks(update, "\n".join(lines), parse_mode="Markdown")
+
+
 async def motivos_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Envía los últimos motivos registrados por los filtros de entrada."""
     items = MOTIVES.last(10)
@@ -1228,6 +1292,12 @@ def _populate_registry() -> None:
         posiciones_command,
         aliases=["positions", "open positions", "posicioness"],
         help_text="Lista todas las posiciones abiertas (la del bot en negrita).",
+    )
+    REGISTRY.register(
+        "diag",
+        diag_command,
+        aliases=["diagnostico", "status", "health"],
+        help_text="Muestra un diagnóstico rápido (modo, CCXT, precio, funding, equity).",
     )
     REGISTRY.register(
         "rendimiento",

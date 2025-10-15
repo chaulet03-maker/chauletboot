@@ -19,9 +19,22 @@ class Trader:
                 pass
         self._balance = default_balance
         self._open_position: Optional[Dict[str, Any]] = None
+        self._last_mode = "paper" if S.PAPER else "real"
+
+    def reset_caches(self):
+        """Limpiar caches de balance/posición al cambiar de modo."""
+        self._balance = float(self.config.get('balance', S.start_equity))
+        self._open_position = None
+        self._last_mode = "paper" if S.PAPER else "real"
+
+    def _ensure_mode_consistency(self):
+        curr = "paper" if S.PAPER else "real"
+        if curr != getattr(self, "_last_mode", curr):
+            self.reset_caches()
 
     async def get_balance(self, exchange=None) -> float:
         """Devuelve el balance actual de la cuenta."""
+        self._ensure_mode_consistency()
         if S.PAPER:
             try:
                 self._balance = float(self.equity())
@@ -43,6 +56,7 @@ class Trader:
 
     def equity(self, force_refresh: bool = False) -> float:
         """Devuelve el equity actual (USDT) usando las fuentes disponibles."""
+        self._ensure_mode_consistency()
         trading.ensure_initialized()
 
         if not force_refresh and math.isfinite(self._balance):
@@ -99,6 +113,7 @@ class Trader:
 
     async def check_open_position(self, exchange=None) -> Optional[Dict[str, Any]]:
         """Devuelve la posición abierta (si la hay) y cachea el resultado."""
+        self._ensure_mode_consistency()
 
         if self._open_position:
             return self._open_position
