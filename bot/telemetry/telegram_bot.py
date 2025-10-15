@@ -320,13 +320,24 @@ def _chunk_text(text: str, max_len: int = 3800) -> List[str]:
     return chunks or [text]
 
 
-async def _reply_chunks(update: Update, text: str):
+async def _reply_chunks(
+    update: Update,
+    text: str,
+    chunk_size: int = 3800,
+    delay: float = 0.0,
+    **reply_kwargs,
+):
     message = update.effective_message
     if message is None:
         return
-    for chunk in _chunk_text(text):
-        if chunk:
-            await message.reply_text(chunk)
+    chunks = _chunk_text(text, max_len=chunk_size)
+    total = len(chunks)
+    for idx, chunk in enumerate(chunks):
+        if not chunk:
+            continue
+        await message.reply_text(chunk, **reply_kwargs)
+        if delay and idx + 1 < total:
+            await asyncio.sleep(delay)
 
 
 async def ayuda_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
