@@ -137,7 +137,7 @@ def switch_mode(new_mode: Mode) -> ModeResult:
     return safe_switch(new_mode, _Services)
 
 
-def place_order_safe(side: str, qty: float, price: float, **kwargs):
+def place_order_safe(side: str, qty: float, price: float | None = None, **kwargs):
     ensure_initialized()
     logger.info(
         "ORDER PATH: %s",
@@ -146,3 +146,31 @@ def place_order_safe(side: str, qty: float, price: float, **kwargs):
     if BROKER is None:
         raise RuntimeError("Broker no inicializado")
     return BROKER.place_order(side, qty, price, **kwargs)
+
+
+def close_now(symbol: str | None = None):
+    """Cierra la posición actual de inmediato usando orden MARKET reduce-only."""
+
+    ensure_initialized()
+    if POSITION_SERVICE is None or BROKER is None:
+        raise RuntimeError("No hay servicios activos para cerrar.")
+
+    status = POSITION_SERVICE.get_status() or {}
+    side = (status.get("side") or "FLAT").upper()
+    if side == "FLAT":
+        return {"status": "noop", "msg": "Sin posición para cerrar"}
+
+    qty = float(status.get("qty") or status.get("pos_qty") or 0.0)
+    if qty <= 0:
+        return {"status": "noop", "msg": "Qty=0"}
+
+    close_side = "SELL" if side == "LONG" else "BUY"
+    target_symbol = symbol or status.get("symbol")
+    return BROKER.place_order(
+        close_side,
+        qty,
+        None,
+        reduce_only=True,
+        order_type="market",
+        symbol=target_symbol,
+    )

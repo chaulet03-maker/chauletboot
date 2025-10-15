@@ -83,14 +83,22 @@ class SimBroker:
 
         return self.store.save(**updates)
 
-    def place_order(self, side: str, qty: float, price: float, **kwargs: Any) -> dict[str, Any]:
+    def place_order(self, side: str, qty: float, price: float | None, **kwargs: Any) -> dict[str, Any]:
+        fill_price: float | None = None if price is None else float(price)
+        if fill_price is None:
+            state = self.store.load()
+            fallback = state.get("mark") or state.get("avg_price")
+            if fallback is None:
+                raise ValueError("SimBroker requiere un precio para simular fills")
+            fill_price = float(fallback)
+
         oid = f"sim-{int(time.time() * 1000)}"
-        new_state = self._apply_fill(side, qty, price)
-        logger.info("PAPER ORDER %s %.6f @ %.2f → FILLED [%s]", side, qty, price, oid)
+        new_state = self._apply_fill(side, qty, float(fill_price))
+        logger.info("PAPER ORDER %s %.6f @ %.2f → FILLED [%s]", side, qty, float(fill_price), oid)
         payload: dict[str, Any] = {
             "orderId": oid,
             "status": "FILLED",
-            "price": float(price),
+            "price": float(fill_price),
             "executedQty": float(qty),
             "side": str(side).upper(),
             "sim": True,
@@ -112,15 +120,32 @@ class BinanceBroker:
     def __init__(self, client: Any):
         self.client = client
 
-    def place_order(self, side: str, qty: float, price: float, **kwargs: Any) -> Any:
+    def place_order(self, side: str, qty: float, price: float | None, **kwargs: Any) -> Any:
         symbol = kwargs.get("symbol")
         if not symbol:
             raise ValueError("BinanceBroker requiere 'symbol' para enviar la orden.")
         params = {k: v for k, v in kwargs.items() if k not in {"symbol", "sl", "tp"}}
+        explicit_type = params.pop("order_type", None)
+        reduce_only = params.pop("reduce_only", False)
+        if explicit_type is None:
+            order_type = "MARKET" if price in (None, 0, "0") else "LIMIT"
+        else:
+            order_type = str(explicit_type).upper()
+
+        if order_type == "LIMIT":
+            if price is None:
+                raise ValueError("Orden LIMIT requiere precio")
+            params["price"] = float(price)
+        else:
+            params.pop("price", None)
+
+        if reduce_only:
+            params["reduceOnly"] = True
+
         return self.client.futures_create_order(
             symbol=symbol,
             side=side,
-            type="MARKET",
+            type=order_type,
             quantity=qty,
             **params,
         )
