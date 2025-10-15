@@ -1,6 +1,8 @@
 import asyncio
 import logging
 import os
+import threading
+import time
 from typing import Any, Dict, List, Optional
 
 import ccxt
@@ -20,6 +22,61 @@ class Exchange:
         if self.public_client is None:
             self.public_client = self.client
         self.is_authenticated = getattr(self, "is_authenticated", False)
+        self._price_cache: Dict[str, Dict[str, float]] = {}
+        self._price_lock = threading.Lock()
+        self._price_stream = None
+        self._start_price_stream()
+
+    def _normalize_symbol(self, symbol: str) -> str:
+        return symbol.replace("/", "").lower()
+
+    def _start_price_stream(self):
+        symbol = self.config.get("symbol", "BTC/USDT")
+        ws_symbol = self._normalize_symbol(symbol)
+        try:
+            from binance.websocket.um_futures.websocket_client import (  # type: ignore
+                UMFuturesWebsocketClient,
+            )
+        except Exception:
+            logger.debug("UMFuturesWebsocketClient no disponible, fallback REST")
+            return
+
+        def handle(message):
+            if not isinstance(message, dict):
+                return
+            price = (
+                message.get("p")
+                or message.get("price")
+                or message.get("markPrice")
+                or message.get("c")
+            )
+            if price is None:
+                return
+            try:
+                px = float(price)
+            except Exception:
+                return
+            ts = float(message.get("E") or message.get("eventTime") or time.time()) / 1000.0
+            with self._price_lock:
+                self._price_cache[symbol] = {"price": px, "ts": ts}
+
+        try:
+            self._price_stream = UMFuturesWebsocketClient(on_message=handle)
+            self._price_stream.start()
+            self._price_stream.book_ticker(symbol=ws_symbol)
+        except Exception:
+            logger.warning("No se pudo iniciar websocket de precios", exc_info=True)
+            self._price_stream = None
+
+    def _stop_price_stream(self):
+        stream = getattr(self, "_price_stream", None)
+        if not stream:
+            return
+        try:
+            stream.stop()
+        except Exception:
+            pass
+        self._price_stream = None
 
     def _credentials_available(self) -> bool:
         return (
@@ -51,6 +108,8 @@ class Exchange:
             self.public_client = client
             self.is_authenticated = True
             logger.info("Cliente CCXT actualizado a AUTENTICADO tras cambio de modo.")
+            self._stop_price_stream()
+            self._start_price_stream()
         except Exception:
             logger.warning("No pude reautenticar CCXT tras cambio a REAL.", exc_info=True)
 
@@ -62,6 +121,8 @@ class Exchange:
             self.public_client = client
             self.is_authenticated = False
             logger.info("Cliente CCXT cambiado a PÚBLICO (paper).")
+            self._stop_price_stream()
+            self._start_price_stream()
         except Exception:
             logger.warning("No pude pasar exchange a paper.", exc_info=True)
 
@@ -116,6 +177,12 @@ class Exchange:
         """Obtiene el precio actual del símbolo configurado."""
 
         base_symbol = symbol or self.config.get('symbol', 'BTC/USDT')
+        with self._price_lock:
+            cached = self._price_cache.get(base_symbol)
+        if cached:
+            age = time.time() - cached.get("ts", 0.0)
+            if age <= 2.0:
+                return float(cached.get("price", 0.0))
         candidates = [base_symbol]
         if base_symbol.endswith('/USDT') and ':USDT' not in base_symbol:
             candidates.append(f"{base_symbol}:USDT")

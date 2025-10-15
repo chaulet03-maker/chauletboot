@@ -17,6 +17,7 @@ from bot.trader import Trader
 from bot.storage import Storage
 from bot.telemetry.notifier import Notifier
 from bot.telemetry.telegram_bot import setup_telegram_bot
+from brokers import ACTIVE_LIVE_CLIENT
 from bot.motives import MOTIVES, MotiveItem, compute_codes
 from core.strategy import Strategy
 from core.indicators import add_indicators
@@ -925,6 +926,39 @@ class TradingApp:
         trades_path = persistence_cfg.get("trades_csv", os.path.join(base_dir, "trades.csv"))
         return equity_path, trades_path
 
+    def _sum_income(self, income_type: str, start_ms: int, end_ms: int) -> float:
+        if S.PAPER or ACTIVE_LIVE_CLIENT is None:
+            return 0.0
+        client = ACTIVE_LIVE_CLIENT
+        total = 0.0
+        cursor = start_ms
+        try:
+            while True:
+                batch = client.futures_income_history(  # type: ignore[attr-defined]
+                    startTime=cursor,
+                    endTime=end_ms,
+                    incomeType=income_type,
+                    limit=1000,
+                )
+                if not batch:
+                    break
+                last_ts = None
+                for row in batch:
+                    ts = int(row.get("time", 0))
+                    if ts > end_ms:
+                        continue
+                    try:
+                        total += float(row.get("income", 0.0))
+                    except Exception:
+                        continue
+                    last_ts = ts if last_ts is None else max(last_ts, ts)
+                if last_ts is None or last_ts >= end_ms or len(batch) < 1000:
+                    break
+                cursor = last_ts + 1
+        except Exception as exc:
+            logging.debug("income_history(%s) falló: %s", income_type, exc)
+        return total
+
     def _generate_period_report(self, days: int):
         try:
             from zoneinfo import ZoneInfo
@@ -986,6 +1020,18 @@ class TradingApp:
                 f"PnL neto:       ${pnl:,.2f}\n"
                 f"Trades: {total_trades} (W:{wins}/L:{losses})"
             )
+            if not S.PAPER:
+                try:
+                    start_ms = int(since.timestamp() * 1000)
+                    end_ms = int(now.timestamp() * 1000)
+                    fees_real = self._sum_income("COMMISSION", start_ms, end_ms)
+                    funding_real = self._sum_income("FUNDING_FEE", start_ms, end_ms)
+                    msg += (
+                        f"\nFees cobradas:   ${fees_real:,.2f}\n"
+                        f"Funding neto:    ${funding_real:,.2f}"
+                    )
+                except Exception:
+                    logging.debug("No se pudieron obtener fees/funding reales", exc_info=True)
 
             if hasattr(self, "notifier") and self.notifier:
                 try:
