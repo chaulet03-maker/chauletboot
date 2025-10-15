@@ -984,6 +984,39 @@ async def logs_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _reply_chunks(update, text)
 
 
+async def equity_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Fija el porcentaje de equity global a usar (1–100%). Ej: 'equity 50%'."""
+    engine = _get_engine_from_context(context)
+    message = update.effective_message
+    if message is None:
+        return
+    if engine is None:
+        await message.reply_text("No pude acceder al engine para ajustar el equity.")
+        return
+
+    txt = (message.text or "").strip().lower()
+    match = re.search(r"equity\s+(\d+(?:[.,]\d+)?)\s*%?", txt)
+    if not match:
+        await message.reply_text("Uso: equity N%   (1–100). Ej: equity 37%")
+        return
+
+    try:
+        pct_str = match.group(1).replace(",", ".")
+        pct = float(pct_str)
+    except Exception:
+        await message.reply_text("No pude leer el porcentaje. Ej: equity 25%")
+        return
+
+    if not (1.0 <= pct <= 100.0):
+        await message.reply_text("El porcentaje debe estar entre 1 y 100.")
+        return
+
+    frac = round(pct / 100.0, 4)
+    _find_and_set_config(engine, "order_sizing.default_pct", frac)
+    os.environ["EQUITY_PCT"] = str(frac)
+    await message.reply_text(f"✅ Porcentaje de equity seteado: {pct:.2f}% (frac={frac})")
+
+
 async def motivos_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Envía los últimos motivos registrados por los filtros de entrada."""
     items = MOTIVES.last(10)
@@ -1068,6 +1101,12 @@ def _populate_registry() -> None:
         logs_command,
         aliases=["log", "ver logs", "log tail"],
         help_text="Muestra las últimas N líneas del log",
+    )
+    REGISTRY.register(
+        "equity",
+        equity_command,
+        aliases=["equity%", "equitypct", "porcentaje", "size"],
+        help_text="Fija el % de equity a usar (1–100). Ej: equity 50%",
     )
     REGISTRY.register(
         "pausa",

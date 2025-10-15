@@ -35,6 +35,14 @@ def _build_public_ccxt() -> Optional[Any]:
         return None
 
 
+def force_refresh_clients():
+    global PUBLIC_CCXT_CLIENT
+    try:
+        PUBLIC_CCXT_CLIENT = _build_public_ccxt()
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.debug('No se pudo recrear ccxt: %s', exc)
+
+
 def _sync_settings_mode(mode: Mode) -> None:
     setattr(S, "trading_mode", mode)
     if mode == "real":
