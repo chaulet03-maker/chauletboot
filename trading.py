@@ -20,18 +20,37 @@ _INITIALIZED: bool = False
 
 
 def _build_public_ccxt() -> Optional[Any]:
+    """
+    Crea SIEMPRE binanceusdm (UM Futures).
+    En REAL: setea apiKey/secret y sandbox según BINANCE_UMFUTURES_TESTNET.
+    En SIM: público (sin keys), pero sigue siendo UM Futures.
+    """
     try:
         import ccxt  # type: ignore
     except ImportError:
-        logger.warning(
-            "ccxt no está disponible. PositionService no podrá refrescar precios públicos."
-        )
+        logger.warning("ccxt no está disponible. Sin precios/privado por ccxt.")
         return None
 
     try:
-        return ccxt.binance({"enableRateLimit": True, "options": {"defaultType": "future"}})
+        exchange = ccxt.binanceusdm(
+            {
+                "enableRateLimit": True,
+                "options": {"defaultType": "future"},
+            }
+        )
+
+        from config import S
+
+        use_testnet = os.getenv("BINANCE_UMFUTURES_TESTNET", "false").lower() == "true"
+        if (S.PAPER or use_testnet) and hasattr(exchange, "set_sandbox_mode"):
+            exchange.set_sandbox_mode(True)
+
+        if not S.PAPER:
+            exchange.apiKey = S.binance_api_key
+            exchange.secret = S.binance_api_secret
+        return exchange
     except Exception as exc:
-        logger.warning("No se pudo inicializar cliente público ccxt: %s", exc)
+        logger.warning("No se pudo construir ccxt/binanceusdm: %s", exc)
         return None
 
 

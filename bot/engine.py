@@ -3,7 +3,6 @@ import math
 import asyncio
 import os
 import threading
-from zoneinfo import ZoneInfo
 from collections import deque
 from typing import Any, Dict, Optional, cast
 from time import time as _now
@@ -920,78 +919,66 @@ class TradingApp:
 
     def _csv_paths(self):
         cfg = getattr(self, "config", {}) or {}
-        persistence_cfg = {}
-        if isinstance(cfg, dict):
-            persistence_cfg = cfg.get("persistence", {}) or {}
-        base_dir = persistence_cfg.get("dir") or "data"
-        equity_path = persistence_cfg.get("equity_csv") or os.path.join(base_dir, "equity.csv")
-        trades_path = persistence_cfg.get("trades_csv") or os.path.join(base_dir, "trades.csv")
+        persistence_cfg = cfg.get("persistence", {}) if isinstance(cfg, dict) else {}
+        base_dir = persistence_cfg.get("dir", "data")
+        equity_path = persistence_cfg.get("equity_csv", os.path.join(base_dir, "equity.csv"))
+        trades_path = persistence_cfg.get("trades_csv", os.path.join(base_dir, "trades.csv"))
         return equity_path, trades_path
 
     def _generate_period_report(self, days: int):
         try:
-            try:
-                tz = ZoneInfo("America/Argentina/Buenos_Aires")
-            except Exception:
-                tz = None
+            from zoneinfo import ZoneInfo
+
+            tz = ZoneInfo("America/Argentina/Buenos_Aires")
+        except Exception:
+            tz = None
+        try:
+            import pandas as pd
 
             equity_csv, trades_csv = self._csv_paths()
-            equity_ini = 0.0
-            equity_fin = 0.0
-            pnl = 0.0
-            total_trades = 0
-            wins = 0
-            losses = 0
-
-            now = (
-                pd.Timestamp.now(tz=tz).tz_convert("UTC")
-                if tz is not None
-                else pd.Timestamp.utcnow()
-            )
-            since = now - pd.Timedelta(days=days)
+            equity_ini = equity_fin = pnl = 0.0
+            total_trades = wins = losses = 0
 
             try:
-                df_eq = pd.read_csv(equity_csv)
-                if "ts" in df_eq.columns and "equity" in df_eq.columns:
-                    df_eq["ts"] = pd.to_datetime(df_eq["ts"], utc=True, errors="coerce")
-                    df_window = df_eq[df_eq["ts"] >= since]
-                    df_window = df_window.dropna(subset=["ts", "equity"])
-                    if not df_window.empty:
-                        equity_ini = float(df_window["equity"].iloc[0])
-                        equity_fin = float(df_window["equity"].iloc[-1])
-                        if "pnl" in df_window.columns:
-                            pnl = float(df_window["pnl"].fillna(0).sum())
-                        else:
-                            pnl = equity_fin - equity_ini
-            except FileNotFoundError:
-                logging.debug("Equity CSV no encontrado en %s", equity_csv)
+                df_eq = pd.read_csv(equity_csv, parse_dates=["ts"])
+                df_eq["ts"] = pd.to_datetime(df_eq["ts"], utc=True, errors="coerce")
+                now = (
+                    pd.Timestamp.now(tz=tz).tz_convert("UTC")
+                    if tz
+                    else pd.Timestamp.utcnow()
+                )
+                since = now - pd.Timedelta(days=days)
+                df_window = df_eq[df_eq["ts"] >= since]
+                if not df_window.empty:
+                    equity_ini = float(df_window["equity"].iloc[0])
+                    equity_fin = float(df_window["equity"].iloc[-1])
+                    if "pnl" in df_window.columns:
+                        pnl = float(df_window["pnl"].sum())
+                    else:
+                        pnl = equity_fin - equity_ini
             except Exception:
-                logging.debug("No se pudo procesar equity CSV %s", equity_csv, exc_info=True)
+                pass
 
             try:
-                df_tr = pd.read_csv(trades_csv)
-                if "ts" in df_tr.columns:
-                    df_tr["ts"] = pd.to_datetime(df_tr["ts"], utc=True, errors="coerce")
-                    df_trades = df_tr[df_tr["ts"] >= since]
-                    df_trades = df_trades.dropna(subset=["ts"])
-                    if not df_trades.empty:
-                        total_trades = int(len(df_trades))
-                        if "pnl" in df_trades.columns:
-                            pnl_series = df_trades["pnl"].fillna(0)
-                            wins = int((pnl_series > 0).sum())
-                            losses = int((pnl_series < 0).sum())
-            except FileNotFoundError:
-                logging.debug("Trades CSV no encontrado en %s", trades_csv)
+                df_tr = pd.read_csv(trades_csv, parse_dates=["ts"])
+                df_tr["ts"] = pd.to_datetime(df_tr["ts"], utc=True, errors="coerce")
+                now = (
+                    pd.Timestamp.now(tz=tz).tz_convert("UTC")
+                    if tz
+                    else pd.Timestamp.utcnow()
+                )
+                since = now - pd.Timedelta(days=days)
+                df_trades = df_tr[df_tr["ts"] >= since]
+                if not df_trades.empty:
+                    total_trades = int(len(df_trades))
+                    pnl_col = df_trades.get("pnl")
+                    if pnl_col is not None:
+                        wins = int((pnl_col > 0).sum())
+                        losses = int((pnl_col < 0).sum())
             except Exception:
-                logging.debug("No se pudo procesar trades CSV %s", trades_csv, exc_info=True)
+                pass
 
-            if days == 1:
-                title = "🗓️ Reporte 24h"
-            elif days == 7:
-                title = "📈 Reporte 7d"
-            else:
-                title = f"📊 Reporte {days}d"
-
+            title = "🗓️ Reporte 24h" if days == 1 else "📈 Reporte 7d"
             msg = (
                 f"{title}\n"
                 f"Equity inicial: ${equity_ini:,.2f}\n"
@@ -1000,20 +987,13 @@ class TradingApp:
                 f"Trades: {total_trades} (W:{wins}/L:{losses})"
             )
 
-            notifier = getattr(self, "notifier", None)
-            if notifier is not None:
+            if hasattr(self, "notifier") and self.notifier:
                 try:
-                    coro = notifier.send(msg)
-                    try:
-                        loop = asyncio.get_event_loop()
-                        if loop.is_running():
-                            loop.create_task(coro)
-                        else:
-                            loop.run_until_complete(coro)
-                    except RuntimeError:
-                        asyncio.run(coro)
+                    coro = self.notifier.send(msg)
+                    if asyncio.iscoroutine(coro):
+                        asyncio.create_task(coro)
                 except Exception:
-                    logging.debug("No se pudo enviar reporte via notifier.", exc_info=True)
+                    pass
             else:
                 logging.info(msg)
         except Exception:

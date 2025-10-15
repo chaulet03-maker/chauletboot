@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import os
 from typing import Any, Dict, List, Optional
 
 import ccxt
@@ -21,25 +22,22 @@ class Exchange:
 
     def _setup_client(self):
         """ Configura e inicializa el cliente del exchange. """
-        mode = self.config.get('trading_mode', 'simulado')
         self.is_authenticated = False  # Bandera de estado
 
         # 1. Intento de Conexión Autenticada (para Trading)
+        params = {
+            'enableRateLimit': True,
+            'options': {'defaultType': 'future'},
+        }
+        use_testnet = os.getenv('BINANCE_UMFUTURES_TESTNET', 'false').lower() == 'true'
+
         try:
-            if mode == 'real':
-                api_key = self.config.get('binance_api_key_real')
-                secret = self.config.get('binance_api_secret_real')
-            else:
-                api_key = self.config.get('binance_api_key_test')
-                secret = self.config.get('binance_api_secret_test')
+            client = ccxt.binanceusdm(params)
 
-            client = ccxt.binance({
-                'apiKey': api_key,
-                'secret': secret,
-                'options': {'defaultType': 'future'},
-            })
-
-            if mode != 'real':
+            if not S.PAPER:
+                client.apiKey = S.binance_api_key
+                client.secret = S.binance_api_secret
+            if (S.PAPER or use_testnet) and hasattr(client, 'set_sandbox_mode'):
                 client.set_sandbox_mode(True)
 
             # Intentamos verificar si las credenciales funcionan cargando mercados
@@ -56,9 +54,9 @@ class Exchange:
             logger.warning("Verifique las claves de Testnet en su archivo .env.")
 
             # Creamos un cliente que NO necesita claves para obtener precios públicos
-            public_client = ccxt.binance({
-                'options': {'defaultType': 'future'},
-            })
+            public_client = ccxt.binanceusdm(params)
+            if (S.PAPER or use_testnet) and hasattr(public_client, 'set_sandbox_mode'):
+                public_client.set_sandbox_mode(True)
             self.public_client = public_client
             return public_client
 
