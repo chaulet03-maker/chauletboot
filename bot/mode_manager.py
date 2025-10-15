@@ -109,6 +109,12 @@ def safe_switch(new_mode: Mode, services) -> ModeResult:
     try:
         set_mode_in_yaml(new_mode)
         services.rebuild(new_mode)
+        try:
+            import trading
+
+            trading.force_refresh_clients()
+        except Exception:
+            pass
         return ModeResult(True, f"Modo cambiado a {new_mode.upper()} correctamente.", new_mode)
     except Exception as exc:  # pragma: no cover - defensivo
         log.exception("Error al cambiar de modo: %s", exc)
