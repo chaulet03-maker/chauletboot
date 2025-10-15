@@ -147,6 +147,8 @@ def build_broker(settings, client_factory: Callable[..., Any]):
 
     assert settings.binance_api_key, "Falta BINANCE_API_KEY (modo real)."
     assert settings.binance_api_secret, "Falta BINANCE_API_SECRET (modo real)."
+    # Siempre recrear el cliente al cambiar a REAL para evitar credenciales viejas
+    ACTIVE_LIVE_CLIENT = None
     client = client_factory(api_key=settings.binance_api_key, secret=settings.binance_api_secret)
     ACTIVE_LIVE_CLIENT = client
     logger.warning("MODO: 🔴 REAL | Binance listo.")
