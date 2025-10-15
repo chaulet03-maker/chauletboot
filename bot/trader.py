@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import math
 from typing import Any, Dict, Optional
 
 from config import S
@@ -23,10 +24,10 @@ class Trader:
         """Devuelve el balance actual de la cuenta."""
         if S.PAPER:
             try:
-                self._balance = float(getattr(trading.BROKER, "equity", self._balance))
+                self._balance = float(self.equity())
                 return self._balance
             except Exception:
-                pass
+                logging.debug("No se pudo refrescar equity en modo paper.", exc_info=True)
 
         if exchange and getattr(exchange, 'client', None):
             try:
@@ -38,6 +39,62 @@ class Trader:
                         self._balance = float(total)
             except Exception as exc:
                 logging.warning("No se pudo actualizar el balance desde el exchange: %s", exc)
+        return self._balance
+
+    def equity(self, force_refresh: bool = False) -> float:
+        """Devuelve el equity actual (USDT) usando las fuentes disponibles."""
+        trading.ensure_initialized()
+
+        if not force_refresh and math.isfinite(self._balance):
+            cached = float(self._balance)
+        else:
+            cached = 0.0
+
+        equity: Optional[float] = None
+
+        service = getattr(trading, "POSITION_SERVICE", None)
+        if service is not None:
+            try:
+                status = service.get_status() or {}
+                raw_equity = status.get("equity")
+                if raw_equity is not None:
+                    equity = float(raw_equity)
+            except Exception:
+                logging.debug("No se pudo obtener equity desde PositionService.", exc_info=True)
+
+        if equity is None and S.PAPER:
+            store = None
+            broker = getattr(trading, "BROKER", None)
+            if broker is not None:
+                store = getattr(broker, "store", None)
+            if store is None:
+                store = getattr(trading, "ACTIVE_PAPER_STORE", None)
+            if store is not None:
+                try:
+                    state = store.load()
+                    base_equity = float(state.get("equity") or 0.0)
+                    realized = float(state.get("realized_pnl") or 0.0)
+                    fees = float(state.get("fees") or 0.0)
+                    mark = float(state.get("mark") or 0.0)
+                    pos_qty = float(state.get("pos_qty") or 0.0)
+                    avg_price = float(state.get("avg_price") or 0.0)
+                    unreal = 0.0
+                    if pos_qty != 0.0 and avg_price > 0.0 and mark > 0.0:
+                        delta = mark - avg_price
+                        if pos_qty < 0:
+                            delta = -delta
+                        unreal = abs(pos_qty) * delta
+                    equity = base_equity + realized + unreal - fees
+                except Exception:
+                    logging.debug("No se pudo calcular equity desde el PaperStore.", exc_info=True)
+
+        if equity is None:
+            equity = cached
+
+        if not math.isfinite(equity):
+            equity = 0.0
+
+        self._balance = float(equity)
         return self._balance
 
     async def check_open_position(self, exchange=None) -> Optional[Dict[str, Any]]:
