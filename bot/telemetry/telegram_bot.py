@@ -1164,8 +1164,7 @@ async def equity_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         fraction = float(_get_equity_fraction(engine))
         pct = round(fraction * 100.0, 2)
         await message.reply_text(
-            f"Equity actual seteado: {pct:.2f}% (frac={fraction})\n"
-            "Para cambiarlo: equity N%   (1–100). Ej: equity 37%"
+            f"Equity actual seteado: {pct:.2f}% (frac={fraction})\n"            
         )
         return
 
