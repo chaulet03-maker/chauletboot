@@ -153,6 +153,49 @@ def _fmt_num(x, nd=2):
     except Exception:
         return str(x)
 
+
+def _get_equity_fraction(engine) -> float:
+    """Devuelve el equity% configurado como fracción.
+
+    Prioriza, en orden:
+    1) engine.config.order_sizing.default_pct
+    2) getattr(engine, "order_sizes", {}).get("default_pct")
+    3) Variable de entorno EQUITY_PCT
+    Fallback: 1.0
+    """
+
+    try:
+        cfg = getattr(engine, "config", {}) or {}
+        osz = cfg.get("order_sizing") or {}
+        value = osz.get("default_pct", None)
+        if value is not None:
+            fraction = float(value)
+            if 0.01 <= fraction <= 1.0:
+                return fraction
+    except Exception:
+        pass
+
+    try:
+        osz = getattr(engine, "order_sizes", {}) or {}
+        value = osz.get("default_pct", None)
+        if value is not None:
+            fraction = float(value)
+            if 0.01 <= fraction <= 1.0:
+                return fraction
+    except Exception:
+        pass
+
+    try:
+        env_value = os.environ.get("EQUITY_PCT")
+        if env_value is not None:
+            fraction = float(env_value)
+            if 0.01 <= fraction <= 1.0:
+                return fraction
+    except Exception:
+        pass
+
+    return 1.0
+
 def _pct_rel(entry: float, level: float) -> float:
     try:
         entry = float(entry); level = float(level)
@@ -1089,7 +1132,7 @@ async def logs_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def equity_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Fija el porcentaje de equity global a usar (1–100%). Ej: 'equity 50%'."""
+    """Fija o muestra el porcentaje de equity (1–100%). Ej: 'equity 50%'."""
     engine = _get_engine_from_context(context)
     message = update.effective_message
     if message is None:
@@ -1101,7 +1144,12 @@ async def equity_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     txt = (message.text or "").strip().lower()
     match = re.search(r"equity\s+(\d+(?:[.,]\d+)?)\s*%?", txt)
     if not match:
-        await message.reply_text("Uso: equity N%   (1–100). Ej: equity 37%")
+        fraction = float(_get_equity_fraction(engine))
+        pct = round(fraction * 100.0, 2)
+        await message.reply_text(
+            f"Equity actual seteado: {pct:.2f}% (frac={fraction})\n"
+            "Para cambiarlo: equity N%   (1–100). Ej: equity 37%"
+        )
         return
 
     try:
@@ -1215,7 +1263,7 @@ def _populate_registry() -> None:
         "equity",
         equity_command,
         aliases=["equity%", "equitypct", "porcentaje", "size"],
-        help_text="Fija el % de equity a usar (1–100). Ej: equity 50%",
+        help_text="Muestra o fija el % de equity (1–100). Ej: equity 37%",
     )
     REGISTRY.register(
         "pausa",
