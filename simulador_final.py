@@ -198,6 +198,16 @@ class RiskSizingBacktester:
         funding_default: float = 0.0001,
         funding_interval_hours: int = 8,
         funding_gate_bps: int = 80,
+        # --- MICRO trading (scalp en mercado planchado) ---
+        enable_micro: bool = True,
+        micro_equity_frac: float = 0.10,
+        micro_lev: float = 3.0,
+        micro_target_on_invested: float = 0.02,
+        micro_atrp_max: float = 0.30,
+        micro_adx_max: float = 18.0,
+        micro_deviation_atr: float = 0.5,
+        micro_max_hold_bars: int = 6,
+        micro_funding_gate_bps: int = 120,
         # Filtros tendencia 4h + confirmación 1h
         trend_filter: str = "ema200_4h",
         rsi4h_gate: Optional[float] = 52.0,
@@ -291,6 +301,7 @@ class RiskSizingBacktester:
         self.sl_atr_mult = sl_atr_mult
         self.tp_atr_mult = tp_atr_mult
         self.max_hold_bars = int(max_hold_bars)
+        self.base_max_hold_bars = int(max_hold_bars)
 
         # Sizing
         self.size_mode = size_mode
@@ -307,6 +318,17 @@ class RiskSizingBacktester:
         self.funding_default = float(funding_default)
         self.funding_series = self._load_funding_series(funding_csv) if funding_csv else None
         self.funding_gate_frac = float(funding_gate_bps)/10000.0 if funding_gate_bps is not None else 0.0
+
+        # Micro trading config
+        self.enable_micro = bool(enable_micro)
+        self.micro_equity_frac = float(micro_equity_frac)
+        self.micro_lev = float(micro_lev)
+        self.micro_target_on_invested = float(micro_target_on_invested)
+        self.micro_atrp_max = float(micro_atrp_max)
+        self.micro_adx_max = float(micro_adx_max)
+        self.micro_deviation_atr = float(micro_deviation_atr)
+        self.micro_max_hold_bars = int(micro_max_hold_bars)
+        self.micro_funding_gate_frac = float(micro_funding_gate_bps)/10000.0 if micro_funding_gate_bps is not None else 0.0
 
         # Filtros
         self.trend_filter = trend_filter.lower() if trend_filter else "none"
@@ -355,6 +377,7 @@ class RiskSizingBacktester:
         self.entry_atr: Optional[float] = None
         self.last_sl_regime: Optional[str] = None
         self.last_sl_multiplier: Optional[float] = None
+        self.current_mode: Optional[str] = None
 
         # Tracking
         self.trades: List[Dict] = []
@@ -654,6 +677,39 @@ class RiskSizingBacktester:
                 return "SHORT"
         return None
 
+    def _signal_micro(self, row: pd.Series) -> Optional[str]:
+        """
+        Dispara en rangos planchados:
+          - ATR% bajo y ADX bajo
+          - Desviación del precio respecto a EMA30 >= micro_deviation_atr * ATR
+          - RSI cerca de 50 (40..60) para evitar extremos de tendencia
+        Side: LONG si precio < EMA30; SHORT si precio > EMA30
+        """
+        if not self.enable_micro:
+            return None
+        c = float(row["close"])
+        atr = float(row["atr"])
+        ema30 = float(row.get("ema30", np.nan))
+        adx = float(row.get("adx", np.nan))
+        rsi = float(row.get("rsi", np.nan))
+
+        if any(np.isnan(x) for x in (atr, ema30, adx, rsi)) or atr <= 0:
+            return None
+
+        atrp = (atr / c) * 100.0
+        if atrp > self.micro_atrp_max or adx > self.micro_adx_max:
+            return None
+        if not (40.0 <= rsi <= 60.0):
+            return None
+
+        dev = c - ema30
+        thr = self.micro_deviation_atr * atr
+        if dev <= -thr and not self.only_shorts:
+            return "LONG"
+        if dev >= +thr and not self.only_longs:
+            return "SHORT"
+        return None
+
     # ------------- Fuerza de señal -> target dinámico -------------
     def _signal_strength(self, row: pd.Series, prev: Optional[pd.Series]) -> float:
         """Devuelve s en [0,1] combinando: RSI 4h alineado, ADX(1h), distancia a EMA200(4h) normalizada por ATR."""
@@ -733,6 +789,12 @@ class RiskSizingBacktester:
         qty = risk_usd / dollar_per_unit
         return max(qty, 0.0)
 
+    def _qty_fraction_equity(self, price: float, equity_now: float, frac: float, lev: float) -> float:
+        """Usa una fracción del equity como margen y aplica leverage."""
+        invested = max(equity_now * max(min(frac, 1.0), 0.0), 0.0)
+        notional = invested * lev
+        return max(notional / max(price, 1e-12), 0.0)
+
     def _qty_full_equity(self, price: float) -> float:
         # notional = equity * lev  => qty = notional / price
         notional = self.balance * self.lev
@@ -773,7 +835,7 @@ class RiskSizingBacktester:
             self.balance += funding_pnl
             self.trades.append({
                 "timestamp": ts, "action": "FUNDING", "side": self.side, "price": float(price),
-                "qty": float(self.qty), "regime": "RISK", "mode": "RISK",
+                "qty": float(self.qty), "regime": "RISK", "mode": self.current_mode or "RISK",
                 "pnl": float(funding_pnl), "balance": float(self.balance), "note": f"rate={rate:.6f}"
             })
 
@@ -821,6 +883,7 @@ class RiskSizingBacktester:
                     dkey = _day(ts)
                     if self.daily_stop_R is None or self.daily_R.get(dkey, 0.0) > -float(self.daily_stop_R):
                         side = self.pending_order["side"]
+                        mode = self.pending_order.get("mode", "RISK")
 
                         # Precio de entrada = OPEN de esta barra, con slippage
                         entry_raw = o
@@ -830,28 +893,46 @@ class RiskSizingBacktester:
                         atr = float(row["atr"]) if not np.isnan(row["atr"]) else 0.0
                         self.last_sl_regime = None
                         self.last_sl_multiplier = self.sl_atr_mult if self.use_atr else None
-                        target_pct = self._dynamic_target_pct(row, prev)
 
-                        # Sizing
+                        target_pct = None
                         leverage_for_this_trade = self.lev
-                        if self.size_mode == "full_equity":
-                            leverage_for_this_trade = self._get_dynamic_leverage(row)
-                            notional = self.balance * leverage_for_this_trade
-                            qty = notional / max(entry_fill, 1e-12)
+                        self.risk_usd_trade = None
+                        self.max_hold_bars = self.base_max_hold_bars
+                        sl_price: Optional[float] = None
+                        tp_price: Optional[float] = None
+
+                        if mode == "MICRO":
+                            leverage_for_this_trade = self.micro_lev
+                            qty = self._qty_fraction_equity(entry_fill, eq_now, self.micro_equity_frac, leverage_for_this_trade)
+
+                            tp_pct_micro = self.micro_target_on_invested / leverage_for_this_trade
+                            sl_pct_micro = tp_pct_micro * 0.75
+
+                            sl_price = entry_fill * (1 - sl_pct_micro) if side == "LONG" else entry_fill * (1 + sl_pct_micro)
+                            tp_price = entry_fill * (1 + tp_pct_micro) if side == "LONG" else entry_fill * (1 - tp_pct_micro)
+                            self.max_hold_bars = self.micro_max_hold_bars
+                            self.last_sl_multiplier = None
                         else:
-                            # modo risk: necesito SL provisional para sizing
-                            if self.use_atr and self.sl_atr_mult is not None:
-                                move = self.sl_atr_mult * atr
-                                sl_tmp = entry_fill - move if side == "LONG" else entry_fill + move
-                            elif (not self.use_atr) and self.sl_pct is not None:
-                                sl_tmp = entry_fill * (1 - self.sl_pct) if side == "LONG" else entry_fill * (1 + self.sl_pct)
+                            target_pct = self._dynamic_target_pct(row, prev)
+                            leverage_for_this_trade = self.lev
+                            if self.size_mode == "full_equity":
+                                leverage_for_this_trade = self._get_dynamic_leverage(row)
+                                notional = self.balance * leverage_for_this_trade
+                                qty = notional / max(entry_fill, 1e-12)
                             else:
-                                sl_tmp = None
-                            if sl_tmp is None:
-                                self.pending_order = None
-                                continue
-                            risk_u = self._risk_usd(eq_now)
-                            qty = self._qty_from_risk(entry_fill, sl_tmp, risk_u)
+                                # modo risk: necesito SL provisional para sizing
+                                if self.use_atr and self.sl_atr_mult is not None:
+                                    move = self.sl_atr_mult * atr
+                                    sl_tmp = entry_fill - move if side == "LONG" else entry_fill + move
+                                elif (not self.use_atr) and self.sl_pct is not None:
+                                    sl_tmp = entry_fill * (1 - self.sl_pct) if side == "LONG" else entry_fill * (1 + self.sl_pct)
+                                else:
+                                    sl_tmp = None
+                                if sl_tmp is None:
+                                    self.pending_order = None
+                                    continue
+                                risk_u = self._risk_usd(eq_now)
+                                qty = self._qty_from_risk(entry_fill, sl_tmp, risk_u)
 
                         # Cap por liquidez
                         qty = self._cap_qty_by_liquidity(qty, entry_fill, row)
@@ -871,17 +952,22 @@ class RiskSizingBacktester:
                         self.entry = entry_fill
                         self.entry_ts = ts
                         self.entry_atr = atr
-                        self.sl_price, self.tp_price = self._calc_sl_tp(
-                            side, entry_fill, atr, eq_now, target_pct
-                        )
+                        if mode == "MICRO":
+                            self.sl_price = sl_price
+                            self.tp_price = tp_price
+                        else:
+                            self.sl_price, self.tp_price = self._calc_sl_tp(
+                                side, entry_fill, atr, eq_now, target_pct
+                            )
                         self.bars_in_position = 0
                         self.eq_on_open = eq_now
+                        self.current_mode = mode
 
                         # Margen inicial (aprox) para safety: notional/lev
                         self.initial_margin = (self.qty * self.entry) / max(leverage_for_this_trade, 1e-12)
 
                         # R real en full_equity
-                        if self.size_mode == "full_equity":
+                        if mode != "MICRO" and self.size_mode == "full_equity":
                             if self.sl_price is not None:
                                 self.risk_usd_trade = abs(self.entry - self.sl_price) * self.qty
                             else:
@@ -896,7 +982,7 @@ class RiskSizingBacktester:
                         )
                         self.trades.append({
                             "timestamp": ts, "action": "OPEN", "side": self.side, "price": float(self.entry),
-                            "qty": float(self.qty), "regime": "RISK", "mode": "RISK",
+                            "qty": float(self.qty), "regime": "RISK", "mode": mode,
                             "pnl": -float(fee_open), "balance": float(self.balance),
                             "note": note_msg,
                             "vol_regime": self.last_sl_regime,
@@ -964,15 +1050,20 @@ class RiskSizingBacktester:
                 # día bloqueado
                 pass
             else:
-                if self.entry_mode == "rsi_cross":
-                    sig = self._signal_rsi_cross(row, prev)
-                else:
-                    sig = self._signal_pullback_grid(row)
+                sig = self._signal_rsi_cross(row, prev) if self.entry_mode == "rsi_cross" else self._signal_pullback_grid(row)
                 if sig is not None and self._passes_trend_filters(row, sig) and self._volatility_and_session_ok(row, ts):
                     # Funding gate en la barra de señal
                     open_rate = self._funding_rate_at(ts)
                     if not ((sig == "LONG" and open_rate > self.funding_gate_frac) or (sig == "SHORT" and open_rate < -self.funding_gate_frac)):
-                        self.pending_order = {"side": sig}
+                        self.pending_order = {"side": sig, "mode": "RISK"}
+
+            # Si la principal NO dispara, probamos MICRO
+            if (self.pending_order is None) and self.enable_micro:
+                msig = self._signal_micro(row)
+                if msig is not None:
+                    mrate = self._funding_rate_at(ts)
+                    if not ((msig == "LONG" and mrate > self.micro_funding_gate_frac) or (msig == "SHORT" and mrate < -self.micro_funding_gate_frac)):
+                        self.pending_order = {"side": msig, "mode": "MICRO"}
 
         # Cierre al final
         if self.active:
@@ -1001,6 +1092,7 @@ class RiskSizingBacktester:
         atr_on_entry = self.entry_atr
         pnl_gross = (price - self.entry) * self.qty if self.side == "LONG" else (self.entry - price) * self.qty
         notional_close = self.qty * price
+        mode = self.current_mode or "RISK"
 
         # Fee de cierre: maker para TP (limit), taker para el resto (market)
         fee_rate = self.maker_fee if note == "TP" else self.taker_fee
@@ -1015,7 +1107,7 @@ class RiskSizingBacktester:
 
         self.trades.append({
             "timestamp": ts, "action": "CLOSE", "side": self.side, "price": float(price),
-            "qty": float(self.qty), "regime": "RISK", "mode": "RISK",
+            "qty": float(self.qty), "regime": "RISK", "mode": mode,
             "pnl": float(trade_pnl), "balance": float(self.balance), "note": note,
             "vol_regime": vol_regime,
             "sl_multiplier": sl_multiplier,
@@ -1058,7 +1150,7 @@ class RiskSizingBacktester:
                     "price": float(price),
                     "qty": 0.0,
                     "regime": "RISK",
-                    "mode": "RISK",
+                    "mode": mode,
                     "pnl": 0.0,
                     "balance": float(self.balance),
                     "note": f"SHOCK_PAUSE thr={self.shock_move_threshold_pct:.2f}% chg24={chg_abs:.2f}% rng24={rng24:.2f}%, {self.shock_pause_hours}h",
@@ -1079,6 +1171,8 @@ class RiskSizingBacktester:
         self.eq_on_open = None
         self.initial_margin = None
         self.entry_atr = None
+        self.current_mode = None
+        self.max_hold_bars = self.base_max_hold_bars
 
     # ------------- Reporte -------------
     def _suffix(self) -> str:
@@ -1181,6 +1275,15 @@ PRESETS = {
         "max_hold_bars": 8,
         "daily_stop_R": 2.0,
         "emerg_trade_stop_R": 1.8,
+        "enable_micro": True,
+        "micro_equity_frac": 0.10,
+        "micro_lev": 3.0,
+        "micro_target_on_invested": 0.02,
+        "micro_atrp_max": 0.30,
+        "micro_adx_max": 18.0,
+        "micro_deviation_atr": 0.5,
+        "micro_max_hold_bars": 6,
+        "micro_funding_gate_bps": 120,
     },
     "agresivo": {
         "entry_mode": "pullback_grid",
@@ -1202,6 +1305,15 @@ PRESETS = {
         "max_hold_bars": 8,
         "daily_stop_R": 2.2,
         "emerg_trade_stop_R": 2.0,
+        "enable_micro": True,
+        "micro_equity_frac": 0.10,
+        "micro_lev": 3.0,
+        "micro_target_on_invested": 0.02,
+        "micro_atrp_max": 0.30,
+        "micro_adx_max": 18.0,
+        "micro_deviation_atr": 0.5,
+        "micro_max_hold_bars": 6,
+        "micro_funding_gate_bps": 120,
     }
 }
 
@@ -1305,6 +1417,17 @@ def main():
     ap.add_argument("--funding-interval-hours", type=int, default=8, help="Intervalo de funding (8h)")
     ap.add_argument("--funding-gate-bps", type=int, default=80, help="Evitar abrir si |rate| > gate (bps por 8h)")
 
+    # Micro trading
+    ap.add_argument("--enable-micro", action="store_true", help="Activa estrategia micro en rango planchado")
+    ap.add_argument("--micro-equity-frac", type=float, default=0.10)
+    ap.add_argument("--micro-lev", type=float, default=3.0)
+    ap.add_argument("--micro-target-on-invested", type=float, default=0.02)
+    ap.add_argument("--micro-atrp-max", type=float, default=0.30)
+    ap.add_argument("--micro-adx-max", type=float, default=18.0)
+    ap.add_argument("--micro-deviation-atr", type=float, default=0.5)
+    ap.add_argument("--micro-max-hold-bars", type=int, default=6)
+    ap.add_argument("--micro-funding-gate-bps", type=int, default=120)
+
     # Filtros tendencia 4h + confirmación 1h
     ap.add_argument("--trend-filter", type=str, default="ema200_4h", choices=["none", "ema200_4h"], help="Filtro de tendencia 4h")
     ap.add_argument("--rsi4h-gate", type=float, default=52.0, help="RSI 4h mínimo para LONG y (100-valor) para SHORT")
@@ -1399,6 +1522,15 @@ def main():
         funding_default=args.funding_default,
         funding_interval_hours=args.funding_interval_hours,
         funding_gate_bps=args.funding_gate_bps,
+        enable_micro=bool(args.enable_micro),
+        micro_equity_frac=args.micro_equity_frac,
+        micro_lev=args.micro_lev,
+        micro_target_on_invested=args.micro_target_on_invested,
+        micro_atrp_max=args.micro_atrp_max,
+        micro_adx_max=args.micro_adx_max,
+        micro_deviation_atr=args.micro_deviation_atr,
+        micro_max_hold_bars=args.micro_max_hold_bars,
+        micro_funding_gate_bps=args.micro_funding_gate_bps,
         trend_filter=args.trend_filter,
         rsi4h_gate=args.rsi4h_gate,
         ema200_1h_confirm=bool(args.ema200_1h_confirm),
