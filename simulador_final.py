@@ -21,12 +21,6 @@ import json
 import logging
 import sqlite3
 from typing import Optional, Tuple, List, Dict
-import datetime as dt
-import math
-try:
-    import yaml  # opcional: para leer pro-config YAML
-except Exception:
-    yaml = None
 
 import numpy as np
 import pandas as pd
@@ -37,14 +31,6 @@ from ta.volatility import AverageTrueRange
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 np.random.seed(42)
-
-# -------- Helpers PRO ----------
-def _pct_rank(x: float, arr: List[float]) -> float:
-    """Porcentaje de elementos <= x en la ventana (0..1)."""
-    if not arr:
-        return 0.5
-    cnt = sum(1 for v in arr if v <= x)
-    return cnt / max(1, len(arr))
 
 # ============================
 # Utilidades de carga / normalización OHLCV
@@ -238,8 +224,6 @@ class RiskSizingBacktester:
         # --- Shock pause ---
         shock_move_threshold_pct: float = 5.0,
         shock_pause_hours: int = 24,
-        # ---- PRO CONFIG (opcional) ----
-        pro_config: Optional[Dict] = None,
     ):
         self.entry_mode = entry_mode.lower().strip()
         if self.entry_mode not in ("rsi_cross", "pullback_grid"):
@@ -387,68 +371,6 @@ class RiskSizingBacktester:
             f"TP%={self.tp_pct} TP_ATR={self.tp_atr_mult} entry_mode={self.entry_mode}"
         )
 
-        # ---------- PRO: toggles y parámetros ----------
-        self.pro: Dict = {
-            "enable": True,
-            "grid_edge_tolerance_bps": 10,     # 0.10%
-            "regime": {
-                "adx_min": 25,
-                "ema200_k_atr": 0.8,
-                "gate_bps_trend_min": 120,
-                "gate_bps_range_max": 80,
-                "maker_in_range": True,
-            },
-            "atr_percentile": {
-                "lookback_bars": 1440,
-                "step_scale_min": 0.7,
-                "step_scale_max": 1.3,
-            },
-            "funding_bias": {
-                "long_threshold": -0.0002,
-                "short_threshold": 0.0002,
-                "size_boost_pct": 10,
-            },
-            "drawdown_cap": {
-                "lookback_days": 7,
-                "caps": [
-                    {"dd": 0.04, "lev": 5},
-                    {"dd": 0.02, "lev": 7},
-                    {"dd": 0.00, "lev": 10},
-                ],
-            },
-            "microstructure": {
-                "max_spread_bps": 5,
-            },
-            "micro_burst": {
-                "atr1m_factor": 1.8,
-            },
-            "ban_windows": {
-                "around_funding_minutes": 10,
-                "macro_events": [],  # ISO strings opcionales
-            },
-        }
-        if pro_config:
-            # merge superficial (suficiente para pruebas)
-            import copy
-            base = copy.deepcopy(self.pro)
-            for k, v in (pro_config or {}).items():
-                if isinstance(v, dict) and isinstance(base.get(k), dict):
-                    base[k].update(v)
-                else:
-                    base[k] = v
-            self.pro = base
-
-        # caches PRO por-barra
-        self._vol_scale: float = 1.0
-        self._grid_tol_frac: float = 0.0
-        self._last_regime: str = "RANGE"
-        self._last_gate_bps: int = 160
-        self._last_funding_rate: float = 0.0
-        self._last_lev_used: float = self.lev
-        self._last_slip_bps: float = (self.slip_frac * 10000.0)
-        self._last_fee_type: str = "TAKER"
-        self._last_vol_pct: float = 0.5
-
     def _init_db(self) -> None:
         os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
         with sqlite3.connect(self.db_path) as conn:
@@ -568,22 +490,16 @@ class RiskSizingBacktester:
     def _apply_slippage_open(self, price: float, side: str) -> float:
         """Compra LONG => paga +slip; Venta SHORT => recibe -slip."""
         if self.slip_frac <= 0:
-            self._last_slip_bps = 0.0
             return price
         sign = +1 if side == "LONG" else -1
-        slipped = price * (1.0 + sign * self.slip_frac)
-        self._last_slip_bps = abs(self.slip_frac * 10000.0)
-        return slipped
+        return price * (1.0 + sign * self.slip_frac)
 
     def _apply_slippage_close(self, price: float, side: str) -> float:
         """Cierre LONG (vende) => -slip; Cierre SHORT (compra) => +slip."""
         if self.slip_frac <= 0:
-            self._last_slip_bps = 0.0
             return price
         sign = +1 if side == "LONG" else -1
-        slipped = price * (1.0 - sign * self.slip_frac)
-        self._last_slip_bps = abs(self.slip_frac * 10000.0)
-        return slipped
+        return price * (1.0 - sign * self.slip_frac)
 
     def _cap_qty_by_liquidity(self, qty: float, price: float, row: pd.Series) -> float:
         """Capea qty por fracción del volumen 1h. Aproxima volumen_quote = close * volume."""
@@ -728,21 +644,13 @@ class RiskSizingBacktester:
         if side_pref is None:
             return None
 
-        # Escala por volatilidad (PRO): self._vol_scale set en run()
-        step = (self.grid_step_atr * atr) * getattr(self, "_vol_scale", 1.0)
-        half_span = (self.grid_span_atr * atr) * getattr(self, "_vol_scale", 1.0)
-        tol_frac = getattr(self, "_grid_tol_frac", 0.0)  # bps→frac ya precalculado
+        step = self.grid_step_atr * atr
+        half_span = self.grid_span_atr * atr
         if side_pref == "LONG":
-            diff = (anchor - price)
-            lo = step * (1.0 - tol_frac)
-            hi = half_span * (1.0 + tol_frac)
-            if (price < anchor) and (diff >= lo) and (diff <= hi):
+            if (price < anchor) and (anchor - price >= step) and (anchor - price <= half_span):
                 return "LONG"
         else:
-            diff = (price - anchor)
-            lo = step * (1.0 - tol_frac)
-            hi = half_span * (1.0 + tol_frac)
-            if (price > anchor) and (diff >= lo) and (diff <= hi):
+            if (price > anchor) and (price - anchor >= step) and (price - anchor <= half_span):
                 return "SHORT"
         return None
 
@@ -884,7 +792,6 @@ class RiskSizingBacktester:
             prev = df.iloc[i - 1]
             ts = pd.to_datetime(row["timestamp"], utc=True)
             o = float(row["open"]); h = float(row["high"]); l = float(row["low"]); c = float(row["close"])
-            pro_on = bool(self.pro.get("enable", True))
 
             # Actualizar métricas de shock de esta barra
             chg24 = float(row.get("chg_24h_pct", np.nan))
@@ -905,80 +812,6 @@ class RiskSizingBacktester:
             # Mark-to-market al cierre de la barra anterior o saldo actual (si no hay posición)
             eq_now = self._mark_equity(c)
 
-            # ---------- PRO: preparar contexto para esta barra ----------
-            # ATR percentile (ventana lookback)
-            vol_scale = 1.0
-            if pro_on:
-                ap = self.pro.get("atr_percentile", {})
-                lb = int(ap.get("lookback_bars", 1440))
-                if lb > 50 and i >= lb:
-                    atr_hist = list(self.df["atr"].iloc[i - lb:i])
-                    vol_pct = _pct_rank(float(row["atr"]), atr_hist)  # 0..1
-                    smin = float(ap.get("step_scale_min", 0.7))
-                    smax = float(ap.get("step_scale_max", 1.3))
-                    vol_scale = smin + (smax - smin) * vol_pct
-                else:
-                    vol_pct = 0.5
-            else:
-                vol_pct = 0.5
-            self._vol_scale = float(vol_scale)
-            self._last_vol_pct = float(vol_pct)
-
-            # Régimen: tendencia si ADX alto y alejamiento de EMA200_4h en ATRs
-            is_trend = False
-            gate_bps = 160
-            if pro_on:
-                rg = self.pro.get("regime", {})
-                adx_min = float(rg.get("adx_min", 25))
-                ema_k = float(rg.get("ema200_k_atr", 0.8))
-                adx = float(row.get("adx", np.nan))
-                ema200_4h = float(row.get("ema200_4h", np.nan))
-                atr = float(row.get("atr", np.nan))
-                if np.isfinite(adx) and np.isfinite(ema200_4h) and np.isfinite(atr) and atr > 0:
-                    if (adx >= adx_min) and (abs(c - ema200_4h) > ema_k * atr):
-                        is_trend = True
-                gate_bps = max(gate_bps, int(rg.get("gate_bps_trend_min", 120))) if is_trend else \
-                    min(gate_bps, int(rg.get("gate_bps_range_max", 80)))
-            self._last_regime = "TREND" if is_trend else "RANGE"
-            self._last_gate_bps = int(gate_bps)
-
-            # Tolerancia de grilla (en bps → frac)
-            tol_bps = float(self.pro.get("grid_edge_tolerance_bps", 0.0)) if pro_on else 0.0
-            self._grid_tol_frac = max(0.0, tol_bps / 10000.0)
-
-            # Funding bias
-            fr = float(self._funding_rate_at(ts))
-            self._last_funding_rate = fr
-            allow_long = True; allow_short = True
-            size_boost_long = size_boost_short = 1.0
-            if pro_on:
-                fb = self.pro.get("funding_bias", {})
-                if fr > float(fb.get("short_threshold", 0.0002)):
-                    allow_long = False
-                    size_boost_short *= 1.0 + float(fb.get("size_boost_pct", 10)) / 100.0
-                elif fr < float(fb.get("long_threshold", -0.0002)):
-                    allow_short = False
-                    size_boost_long *= 1.0 + float(fb.get("size_boost_pct", 10)) / 100.0
-
-            # Microestructura: spread guard si están best_bid/ask
-            micro_spread_block = False
-            if pro_on and ("best_bid" in row) and ("best_ask" in row) and pd.notna(row["best_bid"]) and pd.notna(row["best_ask"]):
-                spr_bps = (float(row["best_ask"]) - float(row["best_bid"])) / max(1e-9, c) * 10000.0
-                max_spr = float(self.pro.get("microstructure", {}).get("max_spread_bps", 5))
-                if spr_bps > max_spr:
-                    micro_spread_block = True
-
-            # Micro-burst
-            if pro_on and ("atr_1m" in row) and ("atr_1m_med_24h" in row) and pd.notna(row["atr_1m"]) and pd.notna(row["atr_1m_med_24h"]):
-                factor = float(self.pro.get("micro_burst", {}).get("atr1m_factor", 1.8))
-                micro_burst_block = bool(float(row["atr_1m"]) > factor * float(row["atr_1m_med_24h"]))
-            else:
-                micro_burst_block = False
-
-            # Ban windows
-            ban_funding = pro_on and self._is_in_funding_window_pro(ts)
-            ban_macro = pro_on and self._is_in_macro_window_pro(ts)
-
             # 1) Si hay orden pendiente del bar anterior y NO hay posición -> abrir en el OPEN de esta barra (i+1)
             if (not self.active) and (self.pending_order is not None):
                 # Bloqueo global por shock: mientras dure, no se abren posiciones
@@ -988,10 +821,6 @@ class RiskSizingBacktester:
                     dkey = _day(ts)
                     if self.daily_stop_R is None or self.daily_R.get(dkey, 0.0) > -float(self.daily_stop_R):
                         side = self.pending_order["side"]
-                        is_trend_pending = bool(self.pending_order.get("pro_is_trend", False))
-                        size_boost_long_pending = float(self.pending_order.get("pro_size_boost_long", 1.0))
-                        size_boost_short_pending = float(self.pending_order.get("pro_size_boost_short", 1.0))
-                        vol_pct_open = float(self.pending_order.get("pro_vol_pct", self._last_vol_pct))
 
                         # Precio de entrada = OPEN de esta barra, con slippage
                         entry_raw = o
@@ -1007,16 +836,6 @@ class RiskSizingBacktester:
                         leverage_for_this_trade = self.lev
                         if self.size_mode == "full_equity":
                             leverage_for_this_trade = self._get_dynamic_leverage(row)
-                            # PRO: cap por drawdown rolling
-                            if pro_on:
-                                dd_look = int(self.pro.get("drawdown_cap", {}).get("lookback_days", 7))
-                                dd_frac = self._rolling_dd_frac(dd_look, i)
-                                lev_cap = leverage_for_this_trade
-                                for rule in sorted(self.pro.get("drawdown_cap", {}).get("caps", []), key=lambda r: r["dd"], reverse=True):
-                                    if dd_frac >= float(rule.get("dd", 0.0)):
-                                        lev_cap = min(lev_cap, float(rule.get("lev", lev_cap)))
-                                        break
-                                leverage_for_this_trade = min(leverage_for_this_trade, lev_cap)
                             notional = self.balance * leverage_for_this_trade
                             qty = notional / max(entry_fill, 1e-12)
                         else:
@@ -1034,12 +853,6 @@ class RiskSizingBacktester:
                             risk_u = self._risk_usd(eq_now)
                             qty = self._qty_from_risk(entry_fill, sl_tmp, risk_u)
 
-                        # Boost por funding (lado favorecido)
-                        if side == "LONG":
-                            qty *= size_boost_long_pending
-                        else:
-                            qty *= size_boost_short_pending
-
                         # Cap por liquidez
                         qty = self._cap_qty_by_liquidity(qty, entry_fill, row)
                         self.qty = qty
@@ -1048,14 +861,8 @@ class RiskSizingBacktester:
                             continue
 
                         # Fees de apertura (taker) sobre notional
-                        fee_rate_open = self.taker_fee
-                        if pro_on and (not is_trend_pending) and bool(self.pro.get("regime", {}).get("maker_in_range", True)):
-                            fee_rate_open = self.maker_fee
-                            self._last_fee_type = "MAKER"
-                        else:
-                            self._last_fee_type = "TAKER"
                         notional_open = self.qty * entry_fill
-                        fee_open = self._fee_cost(notional_open, fee_rate_open)
+                        fee_open = self._fee_cost(notional_open, self.taker_fee)
                         self.balance -= fee_open
 
                         # Abrir
@@ -1072,7 +879,6 @@ class RiskSizingBacktester:
 
                         # Margen inicial (aprox) para safety: notional/lev
                         self.initial_margin = (self.qty * self.entry) / max(leverage_for_this_trade, 1e-12)
-                        self._last_lev_used = float(leverage_for_this_trade)
 
                         # R real en full_equity
                         if self.size_mode == "full_equity":
@@ -1093,14 +899,6 @@ class RiskSizingBacktester:
                             "qty": float(self.qty), "regime": "RISK", "mode": "RISK",
                             "pnl": -float(fee_open), "balance": float(self.balance),
                             "note": note_msg,
-                            # ---- PRO logging extra ----
-                            "pro_regime": self._last_regime,
-                            "pro_gate_bps": int(self._last_gate_bps),
-                            "pro_vol_pct": float(vol_pct_open),
-                            "pro_funding_rate": float(self._last_funding_rate),
-                            "pro_lev_used": float(self._last_lev_used),
-                            "pro_slip_bps": float(self._last_slip_bps),
-                            "pro_open_fee_type": self._last_fee_type,
                             "vol_regime": self.last_sl_regime,
                             "sl_multiplier": self.last_sl_multiplier,
                         })
@@ -1171,26 +969,10 @@ class RiskSizingBacktester:
                 else:
                     sig = self._signal_pullback_grid(row)
                 if sig is not None and self._passes_trend_filters(row, sig) and self._volatility_and_session_ok(row, ts):
-                    # PRO: bloqueos adicionales
-                    if pro_on:
-                        if (sig == "LONG" and not allow_long) or (sig == "SHORT" and not allow_short):
-                            sig = None
-                        if ban_funding or ban_macro or micro_spread_block or micro_burst_block:
-                            sig = None
-                    # fin PRO blocks
-                    if sig is None:
-                        continue
                     # Funding gate en la barra de señal
                     open_rate = self._funding_rate_at(ts)
                     if not ((sig == "LONG" and open_rate > self.funding_gate_frac) or (sig == "SHORT" and open_rate < -self.funding_gate_frac)):
-                        # Guardamos contexto PRO para próxima barra (fee, régimen, boosts)
-                        self.pending_order = {
-                            "side": sig,
-                            "pro_is_trend": bool(is_trend),
-                            "pro_size_boost_long": float(size_boost_long),
-                            "pro_size_boost_short": float(size_boost_short),
-                            "pro_vol_pct": float(self._last_vol_pct),
-                        }
+                        self.pending_order = {"side": sig}
 
         # Cierre al final
         if self.active:
@@ -1235,14 +1017,6 @@ class RiskSizingBacktester:
             "timestamp": ts, "action": "CLOSE", "side": self.side, "price": float(price),
             "qty": float(self.qty), "regime": "RISK", "mode": "RISK",
             "pnl": float(trade_pnl), "balance": float(self.balance), "note": note,
-            # ---- PRO logging extra ----
-            "pro_regime": self._last_regime,
-            "pro_gate_bps": int(self._last_gate_bps),
-            "pro_vol_pct": None,
-            "pro_funding_rate": float(self._last_funding_rate),
-            "pro_lev_used": float(self._last_lev_used),
-            "pro_slip_bps": float(self._last_slip_bps),
-            "pro_open_fee_type": self._last_fee_type,
             "vol_regime": vol_regime,
             "sl_multiplier": sl_multiplier,
         })
@@ -1382,40 +1156,6 @@ class RiskSizingBacktester:
         logging.info(f"Equity curve guardada en: {equity_path}")
         logging.info(f"Resumen mensual guardado en: {monthly_path}")
 
-    # --------- PRO: ventanas y métricas auxiliares ----------
-    def _is_in_funding_window_pro(self, ts: pd.Timestamp) -> bool:
-        around = int(self.pro.get("ban_windows", {}).get("around_funding_minutes", 10))
-        if around <= 0:
-            return False
-        # En 1h bars, sólo podemos bloquear la barra exacta del rollover
-        return (ts.minute == 0) and (self.funding_interval_hours > 0) and (ts.hour % self.funding_interval_hours == 0)
-
-    def _is_in_macro_window_pro(self, ts: pd.Timestamp) -> bool:
-        evts = self.pro.get("ban_windows", {}).get("macro_events", []) or []
-        if not evts:
-            return False
-        for iso in evts:
-            try:
-                t = pd.to_datetime(iso, utc=True)
-                if abs((ts - t).total_seconds()) <= 15 * 60:
-                    return True
-            except Exception:
-                continue
-        return False
-
-    def _rolling_dd_frac(self, lookback_days: int, i_bar: int) -> float:
-        """Drawdown (positivo) como fracción en ventana lookback_days, usando equity_series hasta i_bar."""
-        if lookback_days <= 0 or i_bar <= 1:
-            return 0.0
-        bars = lookback_days * 24  # 1h timeframe
-        arr = self.equity_series[max(0, len(self.equity_series) - bars - 1):]
-        if len(arr) < 3:
-            return 0.0
-        s = pd.Series(arr)
-        peak = s.cummax()
-        dd = (s / peak) - 1.0
-        return float(-min(0.0, dd.min()))
-
 # ============================
 # PRESETS
 # ============================
@@ -1520,7 +1260,7 @@ def _save_run_config(args: argparse.Namespace, out_dir: str, tag: str):
 # ============================
 
 def main():
-    ap = argparse.ArgumentParser(description="Backtest con sizing por riesgo o full equity, TP/SL reales, filtros y protecciones. Incluye modo pullback_grid y TP objetivo como % del equity (fijo o dinámico). Soporta PRO toggles.")
+    ap = argparse.ArgumentParser(description="Backtest con sizing por riesgo o full equity, TP/SL reales, filtros y protecciones. Incluye modo pullback_grid y TP objetivo como % del equity (fijo o dinámico).")
     ap.add_argument("--csv1h", required=True, help="Ruta 1h (CSV/Excel)")
     ap.add_argument("--csv4h", required=True, help="Ruta 4h (CSV/Excel)")
     ap.add_argument("--balance", type=float, default=1000.0, help="Balance inicial (equity)")
@@ -1616,8 +1356,6 @@ def main():
     # Cap de posición vs. liquidez y safety de margen
     ap.add_argument("--max-vol-frac", type=float, default=0.005, help="Fracción máxima del volumen 1h usada para el notional (0.005 = 0.5%)")
     ap.add_argument("--margin-safety-pct", type=float, default=0.5, help="Cierre de emergencia si pérdida latente >= pct del margen inicial (ej 0.5 = 50%)")
-    # PRO config externa
-    ap.add_argument("--pro-config", type=str, default=None, help="Ruta a JSON/YAML con toggles PRO (opcional)")
 
     args = ap.parse_args()
     defaults = {a.dest: a.default for a in ap._actions if a.dest and a.dest != "help"}
@@ -1627,19 +1365,6 @@ def main():
 
     start_ts = pd.to_datetime(args.start, utc=True) if args.start else None
     end_ts = pd.to_datetime(args.end, utc=True) if args.end else None
-
-    # Cargar pro-config si llega
-    pro_cfg = None
-    if args.pro_config:
-        try:
-            with open(args.pro_config, "r", encoding="utf-8") as f:
-                text = f.read()
-            if (args.pro_config.lower().endswith(".yml") or args.pro_config.lower().endswith(".yaml")) and yaml is not None:
-                pro_cfg = yaml.safe_load(text)
-            else:
-                pro_cfg = json.loads(text)
-        except Exception as exc:
-            logging.warning(f"No se pudo leer pro-config {args.pro_config}: {exc}")
 
     bt = RiskSizingBacktester(
         df_1h=df_1h,
@@ -1692,7 +1417,6 @@ def main():
         tag=(args.tag or "").strip(),
         shock_move_threshold_pct=args.shock_move_threshold_pct,
         shock_pause_hours=args.shock_pause_hours,
-        pro_config=pro_cfg,
     )
 
     _save_run_config(args, out_dir=os.path.join("data", "backtests"), tag=(args.tag or ""))
