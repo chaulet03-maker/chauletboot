@@ -140,6 +140,7 @@ def indicators(df: pd.DataFrame) -> pd.DataFrame:
     c, h, l = df["close"], df["high"], df["low"]
     df["ema10"] = EMAIndicator(c, window=10).ema_indicator()
     df["ema30"] = EMAIndicator(c, window=30).ema_indicator()
+    df["ema50"] = EMAIndicator(c, window=50).ema_indicator()
     df["ema200"] = EMAIndicator(c, window=200).ema_indicator()  # 1h
     df["rsi"] = RSIIndicator(c, window=14).rsi()
     df["adx"] = ADXIndicator(h, l, c, window=14).adx()
@@ -202,11 +203,14 @@ class RiskSizingBacktester:
         enable_micro: bool = True,
         micro_equity_frac: float = 0.10,
         micro_lev: float = 3.0,
-        micro_target_on_invested: float = 0.02,
-        micro_atrp_max: float = 0.30,
-        micro_adx_max: float = 18.0,
-        micro_deviation_atr: float = 0.5,
-        micro_max_hold_bars: int = 6,
+        micro_anchor: str = "ema50",
+        micro_rsi_band_low: float = 45.0,
+        micro_rsi_band_high: float = 55.0,
+        micro_target_on_invested: float = 0.012,
+        micro_atrp_max: float = 0.25,
+        micro_adx_max: float = 20.0,
+        micro_deviation_atr: float = 0.35,
+        micro_max_hold_bars: int = 4,
         micro_funding_gate_bps: int = 120,
         # Filtros tendencia 4h + confirmación 1h
         trend_filter: str = "ema200_4h",
@@ -323,6 +327,9 @@ class RiskSizingBacktester:
         self.enable_micro = bool(enable_micro)
         self.micro_equity_frac = float(micro_equity_frac)
         self.micro_lev = float(micro_lev)
+        self.micro_anchor = str(micro_anchor).lower()
+        self.micro_rsi_band_low = float(micro_rsi_band_low)
+        self.micro_rsi_band_high = float(micro_rsi_band_high)
         self.micro_target_on_invested = float(micro_target_on_invested)
         self.micro_atrp_max = float(micro_atrp_max)
         self.micro_adx_max = float(micro_adx_max)
@@ -655,6 +662,15 @@ class RiskSizingBacktester:
         k = float(getattr(self, "anchor_bias_frac", 1.0))
         return float(price + k * (float(raw) - price))
 
+    def _micro_anchor_price(self, row: pd.Series) -> Optional[float]:
+        import numpy as np
+
+        if self.micro_anchor == "ema50":
+            val = row.get("ema50", np.nan)
+        else:
+            val = row.get("ema30", np.nan)
+        return float(val) if np.isfinite(val) else None
+
     def _signal_pullback_grid(self, row: pd.Series) -> Optional[str]:
         atr = float(row["atr"])
         if not np.isfinite(atr) or atr <= 0:
@@ -678,32 +694,30 @@ class RiskSizingBacktester:
         return None
 
     def _signal_micro(self, row: pd.Series) -> Optional[str]:
-        """
-        Dispara en rangos planchados:
-          - ATR% bajo y ADX bajo
-          - Desviación del precio respecto a EMA30 >= micro_deviation_atr * ATR
-          - RSI cerca de 50 (40..60) para evitar extremos de tendencia
-        Side: LONG si precio < EMA30; SHORT si precio > EMA30
-        """
         if not self.enable_micro:
             return None
+
+        import numpy as np
+
         c = float(row["close"])
         atr = float(row["atr"])
-        ema30 = float(row.get("ema30", np.nan))
         adx = float(row.get("adx", np.nan))
         rsi = float(row.get("rsi", np.nan))
+        anchor = self._micro_anchor_price(row)
 
-        if any(np.isnan(x) for x in (atr, ema30, adx, rsi)) or atr <= 0:
+        if any(np.isnan(x) for x in (atr, adx, rsi)) or anchor is None or atr <= 0:
             return None
 
         atrp = (atr / c) * 100.0
         if atrp > self.micro_atrp_max or adx > self.micro_adx_max:
             return None
-        if not (40.0 <= rsi <= 60.0):
+
+        if not (self.micro_rsi_band_low <= rsi <= self.micro_rsi_band_high):
             return None
 
-        dev = c - ema30
+        dev = c - anchor
         thr = self.micro_deviation_atr * atr
+
         if dev <= -thr and not self.only_shorts:
             return "LONG"
         if dev >= +thr and not self.only_longs:
@@ -1046,23 +1060,38 @@ class RiskSizingBacktester:
                 continue
 
             dkey = _day(ts)
-            if self.daily_stop_R is not None and self.daily_R.get(dkey, 0.0) <= -float(self.daily_stop_R):
-                # día bloqueado
-                pass
-            else:
-                sig = self._signal_rsi_cross(row, prev) if self.entry_mode == "rsi_cross" else self._signal_pullback_grid(row)
-                if sig is not None and self._passes_trend_filters(row, sig) and self._volatility_and_session_ok(row, ts):
-                    # Funding gate en la barra de señal
-                    open_rate = self._funding_rate_at(ts)
-                    if not ((sig == "LONG" and open_rate > self.funding_gate_frac) or (sig == "SHORT" and open_rate < -self.funding_gate_frac)):
-                        self.pending_order = {"side": sig, "mode": "RISK"}
+            trend_day_blocked = (
+                self.daily_stop_R is not None and self.daily_R.get(dkey, 0.0) <= -float(self.daily_stop_R)
+            )
 
-            # Si la principal NO dispara, probamos MICRO
+            # --- Señal PRINCIPAL (tendencia, pullback_grid / rsi_cross) ---
+            sig_main = None
+            if not trend_day_blocked:
+                sig_main = (
+                    self._signal_rsi_cross(row, prev)
+                    if self.entry_mode == "rsi_cross"
+                    else self._signal_pullback_grid(row)
+                )
+                if sig_main is not None and self._passes_trend_filters(row, sig_main) and self._volatility_and_session_ok(row, ts):
+                    open_rate = self._funding_rate_at(ts)
+                    if not (
+                        (sig_main == "LONG" and open_rate > self.funding_gate_frac)
+                        or (sig_main == "SHORT" and open_rate < -self.funding_gate_frac)
+                    ):
+                        if self.active and self.current_mode == "MICRO":
+                            exit_px = self._apply_slippage_close(c, self.side)
+                            self._close(ts, exit_px, note="PROMOTE_TO_TREND")
+                        self.pending_order = {"side": sig_main, "mode": "RISK"}
+
+            # --- Si NO hubo señal principal aprobada, consideramos MICRO ---
             if (self.pending_order is None) and self.enable_micro:
                 msig = self._signal_micro(row)
                 if msig is not None:
                     mrate = self._funding_rate_at(ts)
-                    if not ((msig == "LONG" and mrate > self.micro_funding_gate_frac) or (msig == "SHORT" and mrate < -self.micro_funding_gate_frac)):
+                    if not (
+                        (msig == "LONG" and mrate > self.micro_funding_gate_frac)
+                        or (msig == "SHORT" and mrate < -self.micro_funding_gate_frac)
+                    ):
                         self.pending_order = {"side": msig, "mode": "MICRO"}
 
         # Cierre al final
@@ -1421,11 +1450,14 @@ def main():
     ap.add_argument("--enable-micro", action="store_true", help="Activa estrategia micro en rango planchado")
     ap.add_argument("--micro-equity-frac", type=float, default=0.10)
     ap.add_argument("--micro-lev", type=float, default=3.0)
-    ap.add_argument("--micro-target-on-invested", type=float, default=0.02)
-    ap.add_argument("--micro-atrp-max", type=float, default=0.30)
-    ap.add_argument("--micro-adx-max", type=float, default=18.0)
-    ap.add_argument("--micro-deviation-atr", type=float, default=0.5)
-    ap.add_argument("--micro-max-hold-bars", type=int, default=6)
+    ap.add_argument("--micro-anchor", type=str, default="ema50", choices=["ema30", "ema50"])
+    ap.add_argument("--micro-rsi-band-low", type=float, default=45.0)
+    ap.add_argument("--micro-rsi-band-high", type=float, default=55.0)
+    ap.add_argument("--micro-target-on-invested", type=float, default=0.012)
+    ap.add_argument("--micro-atrp-max", type=float, default=0.25)
+    ap.add_argument("--micro-adx-max", type=float, default=20.0)
+    ap.add_argument("--micro-deviation-atr", type=float, default=0.35)
+    ap.add_argument("--micro-max-hold-bars", type=int, default=4)
     ap.add_argument("--micro-funding-gate-bps", type=int, default=120)
 
     # Filtros tendencia 4h + confirmación 1h
@@ -1525,6 +1557,9 @@ def main():
         enable_micro=bool(args.enable_micro),
         micro_equity_frac=args.micro_equity_frac,
         micro_lev=args.micro_lev,
+        micro_anchor=args.micro_anchor,
+        micro_rsi_band_low=args.micro_rsi_band_low,
+        micro_rsi_band_high=args.micro_rsi_band_high,
         micro_target_on_invested=args.micro_target_on_invested,
         micro_atrp_max=args.micro_atrp_max,
         micro_adx_max=args.micro_adx_max,
