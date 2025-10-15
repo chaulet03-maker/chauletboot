@@ -112,30 +112,43 @@ class Exchange:
                 return await asyncio.to_thread(self.client.fetch_ohlcv, fut_symbol, timeframe=timeframe, limit=limit)
             raise
 
-    async def get_current_price(self, symbol=None):
-        """ Obtiene el último precio de un par de forma resiliente. """
+    async def get_current_price(self, symbol: Optional[str] = None) -> Optional[float]:
+        """Obtiene el precio actual del símbolo configurado."""
+
         base_symbol = symbol or self.config.get('symbol', 'BTC/USDT')
         candidates = [base_symbol]
         if base_symbol.endswith('/USDT') and ':USDT' not in base_symbol:
             candidates.append(f"{base_symbol}:USDT")
-        stripped = base_symbol
-        if stripped not in candidates:
-            candidates.append(stripped)
+        if base_symbol.replace('/', '') not in candidates:
+            candidates.append(base_symbol.replace('/', ''))
 
         clients: List[Any] = []
-        if self.client is not None:
-            clients.append(self.client)
-        if self.public_client is not None and self.public_client is not self.client:
+        if self.public_client is not None:
             clients.append(self.public_client)
+        if self.client is not None and self.client is not self.public_client:
+            clients.append(self.client)
 
         for candidate in candidates:
             for client in clients:
                 try:
-                    ticker = await asyncio.to_thread(client.fetch_ticker, candidate)
-                    if ticker and ticker.get('last') is not None:
-                        return ticker['last']
+                    data = await asyncio.to_thread(client.fetch_ticker, candidate)
                 except Exception:
                     continue
+
+                if not data:
+                    continue
+
+                price = (
+                    data.get('last')
+                    or data.get('close')
+                    or data.get('ask')
+                    or data.get('bid')
+                )
+                if price is not None:
+                    try:
+                        return float(price)
+                    except Exception:
+                        continue
 
         logger.warning(f"No pude obtener precio para {base_symbol}")
         return None
