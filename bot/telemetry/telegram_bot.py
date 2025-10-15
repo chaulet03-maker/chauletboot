@@ -809,17 +809,38 @@ async def estado_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 pnl_week = float(row[0]) if row and row[0] is not None else 0.0
 
         trader = getattr(engine, "trader", None)
-        balance = 0.0
-        if trader and hasattr(trader, "get_balance"):
+        from config import S as _S_
+
+        balance_actual: Optional[float] = None
+        if _S_.PAPER:
             try:
-                balance_result = trader.get_balance(getattr(engine, "exchange", None))
-                balance = (
-                    await balance_result
-                    if inspect.isawaitable(balance_result)
-                    else float(balance_result or 0.0)
-                )
+                if trader and hasattr(trader, "equity"):
+                    balance_actual = float(trader.equity())
             except Exception:
-                balance = 0.0
+                balance_actual = None
+
+        if balance_actual is None:
+            try:
+                ex = getattr(engine, "exchange", None)
+                if ex and hasattr(ex, "client") and not _S_.PAPER:
+                    bal = await asyncio.to_thread(ex.client.fetch_balance)
+                    usdt = bal.get("USDT") or {}
+                    balance_actual = float(usdt.get("total") or usdt.get("free") or 0.0)
+            except Exception:
+                balance_actual = None
+
+        if balance_actual is None:
+            try:
+                cfg = _engine_config(engine)
+                equity_csv, _ = _cfg_csv_paths(cfg)
+                df = pd.read_csv(equity_csv)
+                if not df.empty:
+                    balance_actual = float(df["equity"].iloc[-1])
+            except Exception:
+                balance_actual = None
+
+        if balance_actual is None:
+            balance_actual = float(getattr(_S_, "start_equity", 0.0))
 
         estado_lineas = [
             _position_status_message(engine),
@@ -829,7 +850,7 @@ async def estado_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Hora local: {now_local_str}",
             f"PNL Hoy (24h): ${pnl_day:+.2f}",
             f"PNL Semana (7d): ${pnl_week:+.2f}",
-            f"Balance Actual: ${balance:,.2f}",
+            f"Balance Actual: ${balance_actual:,.2f}",
         ]
         reply_text = "\n".join(estado_lineas)
     except Exception as exc:
@@ -982,14 +1003,19 @@ async def _modo_command(update: Update, context: ContextTypes.DEFAULT_TYPE, new_
     if result.ok:
         base_msg = f"✅ Modo cambiado a *{new_mode.upper()}*. El bot ya opera en {new_mode}."
         msg = f"{base_msg}\n{result.msg}" if result.msg else base_msg
+        engine = _get_engine_from_context(context)
         if new_mode == "real":
-            engine = _get_engine_from_context(context)
             try:
-                exchange = getattr(engine, "exchange", None) if engine is not None else None
-                if exchange is not None and hasattr(exchange, "upgrade_to_real_if_needed"):
-                    await exchange.upgrade_to_real_if_needed()
+                if engine and hasattr(engine, "exchange") and engine.exchange:
+                    await engine.exchange.upgrade_to_real_if_needed()
             except Exception:
                 logger.debug("No se pudo reautenticar exchange tras cambio a REAL.", exc_info=True)
+        else:
+            try:
+                if engine and hasattr(engine, "exchange") and engine.exchange:
+                    await engine.exchange.downgrade_to_paper()
+            except Exception:
+                logger.debug("No se pudo pasar exchange a paper tras cambio a SIM.", exc_info=True)
     else:
         msg = f"❌ No pude cambiar el modo: {result.msg}"
     message = update.effective_message

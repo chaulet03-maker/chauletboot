@@ -32,7 +32,7 @@ class Exchange:
         params = {"enableRateLimit": True, "options": {"defaultType": "future"}}
         client = ccxt.binanceusdm(params)
         use_testnet = os.getenv("BINANCE_UMFUTURES_TESTNET", "false").lower() == "true"
-        if (S.PAPER or use_testnet) and hasattr(client, "set_sandbox_mode"):
+        if use_testnet and hasattr(client, "set_sandbox_mode"):
             client.set_sandbox_mode(True)
         return client
 
@@ -54,43 +54,43 @@ class Exchange:
         except Exception:
             logger.warning("No pude reautenticar CCXT tras cambio a REAL.", exc_info=True)
 
+    async def downgrade_to_paper(self):
+        """Vuelve a modo paper: cliente público sin credenciales."""
+        try:
+            client = self._new_usdm_client()
+            self.client = client
+            self.public_client = client
+            self.is_authenticated = False
+            logger.info("Cliente CCXT cambiado a PÚBLICO (paper).")
+        except Exception:
+            logger.warning("No pude pasar exchange a paper.", exc_info=True)
+
     def _setup_client(self):
         """ Configura e inicializa el cliente del exchange. """
         self.is_authenticated = False  # Bandera de estado
 
-        # 1. Intento de Conexión Autenticada (para Trading)
-        params = {
-            'enableRateLimit': True,
-            'options': {'defaultType': 'future'},
-        }
-        use_testnet = os.getenv('BINANCE_UMFUTURES_TESTNET', 'false').lower() == 'true'
+        if not self._credentials_available():
+            client = self._new_usdm_client()
+            self.public_client = client
+            return client
 
         try:
-            client = ccxt.binanceusdm(params)
-
-            if not S.PAPER:
-                client.apiKey = S.binance_api_key
-                client.secret = S.binance_api_secret
-            if (S.PAPER or use_testnet) and hasattr(client, 'set_sandbox_mode'):
-                client.set_sandbox_mode(True)
-
-            # Intentamos verificar si las credenciales funcionan cargando mercados
+            client = self._new_usdm_client()
+            client.apiKey = S.binance_api_key
+            client.secret = S.binance_api_secret
             client.load_markets()
             self.is_authenticated = True
             logger.info("Cliente de CCXT AUTENTICADO e inicializado correctamente.")
             return client
 
         except Exception as e:
-            # 2. FALLBACK: Si las claves fallan, inicializar cliente PÚBLICO (solo lectura)
             logger.warning(
-                f"ADVERTENCIA: Fallo de autenticación. El bot operará en modo SÓLO LECTURA. Error: {e}"
+                "ADVERTENCIA: Fallo de autenticación. El bot operará en modo SÓLO LECTURA. Error: %s",
+                e,
             )
             logger.warning("Verifique las claves de Testnet en su archivo .env.")
 
-            # Creamos un cliente que NO necesita claves para obtener precios públicos
-            public_client = ccxt.binanceusdm(params)
-            if (S.PAPER or use_testnet) and hasattr(public_client, 'set_sandbox_mode'):
-                public_client.set_sandbox_mode(True)
+            public_client = self._new_usdm_client()
             self.public_client = public_client
             return public_client
 
