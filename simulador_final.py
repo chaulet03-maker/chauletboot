@@ -715,6 +715,13 @@ class RiskSizingBacktester:
         if not (self.micro_rsi_band_low <= rsi <= self.micro_rsi_band_high):
             return None
 
+        ema200_4h = float(row.get("ema200_4h", np.nan))
+        if np.isfinite(ema200_4h):
+            same_side_up = c > ema200_4h
+            dev_sign = c - anchor
+            if (same_side_up and dev_sign > 0) or (not same_side_up and dev_sign < 0):
+                return None
+
         dev = c - anchor
         thr = self.micro_deviation_atr * atr
 
@@ -1448,15 +1455,15 @@ def main():
 
     # Micro trading
     ap.add_argument("--enable-micro", action="store_true", help="Activa estrategia micro en rango planchado")
-    ap.add_argument("--micro-equity-frac", type=float, default=0.10)
+    ap.add_argument("--micro-equity-frac", type=float, default=0.05)
     ap.add_argument("--micro-lev", type=float, default=3.0)
     ap.add_argument("--micro-anchor", type=str, default="ema50", choices=["ema30", "ema50"])
     ap.add_argument("--micro-rsi-band-low", type=float, default=45.0)
     ap.add_argument("--micro-rsi-band-high", type=float, default=55.0)
     ap.add_argument("--micro-target-on-invested", type=float, default=0.012)
     ap.add_argument("--micro-atrp-max", type=float, default=0.25)
-    ap.add_argument("--micro-adx-max", type=float, default=20.0)
-    ap.add_argument("--micro-deviation-atr", type=float, default=0.35)
+    ap.add_argument("--micro-adx-max", type=float, default=15.0)
+    ap.add_argument("--micro-deviation-atr", type=float, default=0.40)
     ap.add_argument("--micro-max-hold-bars", type=int, default=4)
     ap.add_argument("--micro-funding-gate-bps", type=int, default=120)
 
