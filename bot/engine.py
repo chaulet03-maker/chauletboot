@@ -76,8 +76,8 @@ class TradingApp:
             self._entry_lock_ttl_s = 12 * 60 * 60
         self._shock_guard_last_trade_id: Optional[Any] = None
 
-        schedule.every().day.at("08:00", "America/Argentina/Buenos_Aires").do(self._generate_daily_report)
-        schedule.every().sunday.at("00:00", "America/Argentina/Buenos_Aires").do(self._generate_weekly_report)
+        schedule.every().day.at("07:00", "America/Argentina/Buenos_Aires").do(self._generate_daily_report)
+        schedule.every().sunday.at("07:01", "America/Argentina/Buenos_Aires").do(self._generate_weekly_report)
         logging.info("Componentes y tareas de reporte inicializados.")
 
         if str(self.config.get("trading_mode", "simulado")).lower() == "simulado":
