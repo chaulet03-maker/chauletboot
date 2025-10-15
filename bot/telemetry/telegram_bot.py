@@ -694,6 +694,76 @@ async def posicion_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await message.reply_text(reply_text)
 
 
+async def posiciones_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Lista todas las posiciones abiertas; la del bot va en **negrita**."""
+    message = update.effective_message
+    if message is None:
+        return
+
+    engine = _get_engine_from_context(context)
+    if engine is None:
+        await message.reply_text("No pude acceder al engine para consultar posiciones.")
+        return
+
+    symbol_bot = (getattr(engine, "config", {}) or {}).get("symbol", "BTC/USDT")
+    exchange = getattr(engine, "exchange", None)
+    if exchange is None:
+        await message.reply_text("Exchange no disponible.")
+        return
+
+    try:
+        if hasattr(exchange, "upgrade_to_real_if_needed"):
+            await exchange.upgrade_to_real_if_needed()
+        positions = await exchange.fetch_positions(None)
+    except Exception as exc:  # pragma: no cover - robustez
+        await message.reply_text(f"No pude leer posiciones: {exc}")
+        return
+
+    if not positions:
+        await message.reply_text("No hay posiciones abiertas.")
+        return
+
+    def _num(val, decimals=2):
+        try:
+            return f"{float(val):,.{decimals}f}"
+        except Exception:
+            return str(val)
+
+    lines = ["📌 *Posiciones abiertas*"]
+    for pos in positions:
+        symbol = pos.get("symbol") or pos.get("info", {}).get("symbol") or "?"
+        size = (
+            pos.get("contracts")
+            or pos.get("size")
+            or pos.get("contractsSize")
+            or pos.get("amount")
+            or 0.0
+        )
+        try:
+            size_f = float(size or 0.0)
+        except Exception:
+            size_f = 0.0
+        side = pos.get("side") or ("LONG" if size_f > 0 else ("SHORT" if size_f < 0 else "FLAT"))
+        entry = (
+            pos.get("entryPrice")
+            or pos.get("entry_price")
+            or pos.get("avgPrice")
+            or pos.get("average")
+            or 0.0
+        )
+        upnl = pos.get("unrealizedPnl") or pos.get("unrealized_pnl") or 0.0
+        formatted = (
+            f"{symbol} | {side} | qty={_num(size, 4)} | "
+            f"entry=${_num(entry)} | uPnL=${_num(upnl)}"
+        )
+        if str(symbol).upper() == str(symbol_bot).upper() and abs(size_f) > 0:
+            lines.append(f"*{formatted}*")
+        else:
+            lines.append(formatted)
+
+    await message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
 async def estado_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.effective_message
     if message is None:
@@ -912,6 +982,14 @@ async def _modo_command(update: Update, context: ContextTypes.DEFAULT_TYPE, new_
     if result.ok:
         base_msg = f"✅ Modo cambiado a *{new_mode.upper()}*. El bot ya opera en {new_mode}."
         msg = f"{base_msg}\n{result.msg}" if result.msg else base_msg
+        if new_mode == "real":
+            engine = _get_engine_from_context(context)
+            try:
+                exchange = getattr(engine, "exchange", None) if engine is not None else None
+                if exchange is not None and hasattr(exchange, "upgrade_to_real_if_needed"):
+                    await exchange.upgrade_to_real_if_needed()
+            except Exception:
+                logger.debug("No se pudo reautenticar exchange tras cambio a REAL.", exc_info=True)
     else:
         msg = f"❌ No pude cambiar el modo: {result.msg}"
     message = update.effective_message
@@ -1064,13 +1142,18 @@ def _populate_registry() -> None:
         posicion_command,
         aliases=[
             "posición",
-            "posiciones",
             "position",
             "pos",
             "posicion actual",
             "posición actual",
         ],
         help_text="Muestra el estado de la posición abierta (si existe)",
+    )
+    REGISTRY.register(
+        "posiciones",
+        posiciones_command,
+        aliases=["positions", "open positions", "posicioness"],
+        help_text="Lista todas las posiciones abiertas (la del bot en negrita).",
     )
     REGISTRY.register(
         "rendimiento",

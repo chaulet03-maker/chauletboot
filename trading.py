@@ -139,6 +139,14 @@ def switch_mode(new_mode: Mode) -> ModeResult:
 
 def place_order_safe(side: str, qty: float, price: float, **kwargs):
     ensure_initialized()
+    try:
+        status = POSITION_SERVICE.get_status() if POSITION_SERVICE else None
+    except Exception:
+        status = None
+    if status and str(status.get("side", "FLAT")).upper() != "FLAT":
+        raise RuntimeError(
+            "Bloqueado: ya hay una posición abierta por el bot. Cerrá antes de abrir otra."
+        )
     logger.info(
         "ORDER PATH: %s",
         "PAPER/SimBroker" if ACTIVE_MODE == "simulado" else "LIVE/Binance",

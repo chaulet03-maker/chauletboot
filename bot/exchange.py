@@ -19,6 +19,40 @@ class Exchange:
         self.client = self._setup_client()
         if self.public_client is None:
             self.public_client = self.client
+        self.is_authenticated = getattr(self, "is_authenticated", False)
+
+    def _credentials_available(self) -> bool:
+        return (
+            (not S.PAPER)
+            and bool(getattr(S, "binance_api_key", None))
+            and bool(getattr(S, "binance_api_secret", None))
+        )
+
+    def _new_usdm_client(self):
+        params = {"enableRateLimit": True, "options": {"defaultType": "future"}}
+        client = ccxt.binanceusdm(params)
+        use_testnet = os.getenv("BINANCE_UMFUTURES_TESTNET", "false").lower() == "true"
+        if (S.PAPER or use_testnet) and hasattr(client, "set_sandbox_mode"):
+            client.set_sandbox_mode(True)
+        return client
+
+    async def upgrade_to_real_if_needed(self):
+        """Si cambiaste a REAL y este Exchange sigue 'público', lo reautentico en caliente."""
+        if not self._credentials_available():
+            return
+        if self.is_authenticated and getattr(self.client, "apiKey", None):
+            return
+        try:
+            client = self._new_usdm_client()
+            client.apiKey = S.binance_api_key
+            client.secret = S.binance_api_secret
+            await asyncio.to_thread(client.load_markets)
+            self.client = client
+            self.public_client = client
+            self.is_authenticated = True
+            logger.info("Cliente CCXT actualizado a AUTENTICADO tras cambio de modo.")
+        except Exception:
+            logger.warning("No pude reautenticar CCXT tras cambio a REAL.", exc_info=True)
 
     def _setup_client(self):
         """ Configura e inicializa el cliente del exchange. """
@@ -59,6 +93,11 @@ class Exchange:
                 public_client.set_sandbox_mode(True)
             self.public_client = public_client
             return public_client
+
+    async def _ensure_auth_for_private(self):
+        if S.PAPER:
+            return
+        await self.upgrade_to_real_if_needed()
 
     async def get_klines(self, timeframe: str = '1h', symbol: Optional[str] = None, limit: int = 300) -> List[List[Any]]:
         """Obtiene las velas (klines) de un par."""
@@ -111,6 +150,7 @@ class Exchange:
             logger.info("PAPER: skipping private endpoint set_leverage(%s, %s)", leverage, sym)
             return
 
+        await self._ensure_auth_for_private()
         await asyncio.to_thread(self.client.set_leverage, leverage, sym)
         logger.info("Apalancamiento establecido en x%s para %s", leverage, sym)
 
@@ -154,14 +194,19 @@ class Exchange:
             return None
         return rate_dec * 10000.0
 
-    async def fetch_positions(self, symbol: str):
+    async def fetch_positions(self, symbol: Optional[str] = None):
         """Obtiene posiciones abiertas evitando llamadas privadas en paper."""
-        if S.PAPER or self.client is None:
+        if self.client is None:
             return []
+        if S.PAPER:
+            return []
+        await self._ensure_auth_for_private()
         try:
-            return await asyncio.to_thread(self.client.fetch_positions, [symbol])
+            if symbol:
+                return await asyncio.to_thread(self.client.fetch_positions, [symbol])
+            return await asyncio.to_thread(self.client.fetch_positions)
         except Exception:
-            logger.debug("fetch_positions falló para %s", symbol, exc_info=True)
+            logger.debug("fetch_positions falló (symbol=%s)", symbol, exc_info=True)
             return []
 
     async def create_order(
