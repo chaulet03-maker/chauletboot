@@ -173,16 +173,26 @@ class Exchange:
                 return await asyncio.to_thread(self.client.fetch_ohlcv, fut_symbol, timeframe=timeframe, limit=limit)
             raise
 
+    def get_price_age_sec(self, symbol: Optional[str] = None) -> float:
+        """Edad (segundos) del último precio cacheado del WS; grande => stream frío."""
+
+        base_symbol = symbol or self.config.get('symbol', 'BTC/USDT')
+        with self._price_lock:
+            cached = self._price_cache.get(base_symbol)
+        if not cached:
+            return float("inf")
+        ts = float(cached.get("ts", 0.0))
+        return max(0.0, time.time() - ts)
+
     async def get_current_price(self, symbol: Optional[str] = None) -> Optional[float]:
         """Obtiene el precio actual del símbolo configurado."""
 
         base_symbol = symbol or self.config.get('symbol', 'BTC/USDT')
         with self._price_lock:
             cached = self._price_cache.get(base_symbol)
-        if cached:
-            age = time.time() - cached.get("ts", 0.0)
-            if age <= 2.0:
-                return float(cached.get("price", 0.0))
+        age = self.get_price_age_sec(base_symbol)
+        if cached and age <= 2.0:
+            return float(cached.get("price", 0.0))
         candidates = [base_symbol]
         if base_symbol.endswith('/USDT') and ':USDT' not in base_symbol:
             candidates.append(f"{base_symbol}:USDT")
