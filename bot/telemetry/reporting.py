@@ -8,10 +8,12 @@ class ReportingScheduler:
         self.app = app
         self.cfg = config
         self.local_tz = pytz.timezone(os.environ.get("TZ","America/Argentina/Buenos_Aires"))
-        self.daily_hour = int(config.get("reporting",{}).get("daily_hour_local",9))
-        self.weekly_weekday = int(config.get("reporting",{}).get("weekly_weekday_local",0))
-        self.weekly_hour = int(config.get("reporting",{}).get("weekly_hour_local",9))
-        self.weekly_minute = int(config.get("reporting",{}).get("weekly_minute_local",5))
+        reporting_cfg = config.get("reporting", {})
+        self.daily_hour = int(reporting_cfg.get("daily_hour_local", 7))
+        self.daily_minute = int(reporting_cfg.get("daily_minute_local", 0))
+        self.weekly_weekday = int(reporting_cfg.get("weekly_weekday_local", 0))
+        self.weekly_hour = int(reporting_cfg.get("weekly_hour_local", 7))
+        self.weekly_minute = int(reporting_cfg.get("weekly_minute_local", 1))
         self.bot = None
 
     def _bot(self):
@@ -42,7 +44,7 @@ class ReportingScheduler:
 
     async def maybe_send_daily(self):
         now_local = dt.datetime.now(self.local_tz)
-        if now_local.minute != 0 or now_local.hour != self.daily_hour:
+        if now_local.hour != self.daily_hour or now_local.minute != self.daily_minute:
             return
         txt = self.build_report(days=1, title="📣 Reporte diario")
         if txt:

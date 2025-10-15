@@ -1485,9 +1485,9 @@ async def start_telegram_bot(app, config):
             j = application.job_queue
             tz = _tz()
             j.run_daily(lambda c: notifier.app.create_task(_report_periodic(notifier, days=1)),
-                        time=dtime(hour=23, minute=59, tzinfo=tz), name="daily_report")
+                        time=dtime(hour=7, minute=0, tzinfo=tz), name="daily_report")
             j.run_daily(lambda c: notifier.app.create_task(_report_periodic(notifier, days=7)),
-                        time=dtime(hour=23, minute=59, tzinfo=tz), days=(6,), name="weekly_report")
+                        time=dtime(hour=7, minute=1, tzinfo=tz), days=(0,), name="weekly_report")
             logger.info("Reportes diarios/semanales programados en telegram_bot")
             setattr(application, "_chaulet_reports_scheduled", True)
         except Exception as e:
