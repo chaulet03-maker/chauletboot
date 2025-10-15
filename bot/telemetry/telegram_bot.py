@@ -1204,6 +1204,14 @@ async def diag_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             px = await ex.get_current_price()
             lines.append(f"• Precio cache: {px if px is not None else 'N/D'}")
+            try:
+                age = ex.get_price_age_sec()
+            except Exception:
+                age = None
+            if age is not None and age != float("inf"):
+                lines.append(f"• Edad precio WS: {age:.1f}s")
+                if age > 10:
+                    lines.append("⚠️ WS frío (>10s sin precio). Revisa conexión.")
         except Exception:
             lines.append("• Precio cache: error")
 

@@ -135,6 +135,8 @@ class BinanceBroker:
         self.client = client
         self._symbol_filters: dict[str, SymbolFilters] = {}
         self._filters_lock = Lock()
+        self._reject_count = 0
+        self._reject_window_ts = 0.0
 
     # ------------------------------------------------------------------
     # Exchange info helpers
@@ -222,6 +224,23 @@ class BinanceBroker:
     def _should_retry(self, classification: str) -> bool:
         return classification in {"ratelimit", "network"}
 
+    def _register_reject(self) -> None:
+        now = time.time()
+        if now - self._reject_window_ts > 60:
+            self._reject_window_ts = now
+            self._reject_count = 0
+        self._reject_count += 1
+        if self._reject_count >= 3:
+            logger.warning(
+                "⚠️ Múltiples rejects en <60s (=%s). Revisar cuantización/margen.",
+                self._reject_count,
+            )
+            # Si existe un notifier global, se puede enviar alerta aquí.
+            # try:
+            #     notifier.send(f"⚠️ Múltiples rejects en <60s (={self._reject_count})")
+            # except Exception:
+            #     pass
+
     def _call_with_backoff(self, fn, *args, **kwargs):
         retries = int(kwargs.pop("_retries", 4))
         base_delay = float(kwargs.pop("_base_delay", 0.25))
@@ -231,9 +250,12 @@ class BinanceBroker:
                 return fn(*args, **kwargs)
             except Exception as exc:
                 classification = self._classify_error(exc)
-                if not self._should_retry(classification) or attempt >= retries:
+                should_retry = self._should_retry(classification)
+                if not should_retry or attempt >= retries:
                     if classification in {"insufficient_margin", "invalid_order"}:
                         logger.error("Orden rechazada (%s): %s", classification, exc)
+                    if classification not in {"network", "ratelimit"}:
+                        self._register_reject()
                     raise
                 delay = base_delay * (1.8 ** attempt)
                 logger.warning(
