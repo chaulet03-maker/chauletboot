@@ -282,22 +282,27 @@ class TradingApp:
                 except Exception as exc:
                     logging.debug("No se pudo refrescar mark-to-market inicial: %s", exc)
 
-            position = await self.trader.check_open_position(self.exchange)
-            if (position is None) and (trading.POSITION_SERVICE is not None):
-                try:
-                    st = trading.POSITION_SERVICE.get_status()
-                    side = (st.get("side") or "FLAT").upper()
-                    if side != "FLAT":
-                        position = {
-                            "symbol": st.get("symbol", self.config.get("symbol")),
-                            "side": side,
-                            "contracts": float(st.get("qty") or st.get("size") or 0.0),
-                            "entryPrice": float(st.get("entry_price") or 0.0),
-                            "markPrice": float(st.get("mark") or 0.0),
-                        }
-                        await self.trader.set_position(position)
-                except Exception as exc:
-                    logging.debug("PositionService fallback fail: %s", exc)
+            position = None
+            bot_has_open = False
+            try:
+                st = trading.POSITION_SERVICE.get_status() if trading.POSITION_SERVICE else None
+            except Exception as exc:
+                st = None
+                logging.debug("PositionService status error: %s", exc)
+            try:
+                side = (st.get("side") or "FLAT").upper() if st else "FLAT"
+                bot_has_open = side != "FLAT"
+                if bot_has_open:
+                    position = {
+                        "symbol": st.get("symbol", self.config.get("symbol")),
+                        "side": side,
+                        "contracts": float(st.get("qty") or st.get("size") or 0.0),
+                        "entryPrice": float(st.get("entry_price") or 0.0),
+                        "markPrice": float(st.get("mark") or 0.0),
+                    }
+                    await self.trader.set_position(position)
+            except Exception as exc:
+                logging.debug("PositionService mapping fail: %s", exc)
 
             cooldown_active = bool(getattr(self, "cooldown_active", False))
             freeze_90_active = bool(getattr(self, "freeze_90_active", False))
@@ -315,7 +320,7 @@ class TradingApp:
                 "rsi4h": None,
                 "gate_ok": None,
                 "risk_ok": None,
-                "has_open": bool(position),
+                "has_open": bool(bot_has_open),
                 "cooldown": cooldown_active,
                 "freeze_90": freeze_90_active,
                 "blackout": blackout_active,
@@ -337,7 +342,7 @@ class TradingApp:
             self.risk_ok = None
             self.reasons = []
             self.side_pref = None
-            self.position_open = bool(position)
+            self.position_open = bool(bot_has_open)
             self.cooldown_active = cooldown_active
             self.freeze_90_active = freeze_90_active
             self.blackout_active = blackout_active
