@@ -149,7 +149,12 @@ async def _cmd_help(reply):
     return await reply(texto)
 
 async def _cmd_positions_detail(engine, reply):
-    # 1) Posiciones que el bot tiene registradas (las "propias")
+    """
+    Lista TODAS las posiciones abiertas en el exchange (si estamos en real)
+    y resalta en **negrita** las que son del bot (engine.trader.state.positions).
+    En modo papel o sin cliente live, muestra lo que guarda el bot.
+    """
+    # 1) posiciones del bot (para resaltar)
     st = getattr(engine.trader, "state", None)
     bot_positions = set()
     if st and isinstance(getattr(st, "positions", None), dict):
@@ -157,66 +162,67 @@ async def _cmd_positions_detail(engine, reply):
             if lots:
                 bot_positions.add(sym)
 
-    # 2) Intentamos leer TODAS las posiciones vivas del exchange (real)
-    from brokers import ACTIVE_LIVE_CLIENT
+    # 2) intentar traer todas del exchange (ccxt)
     all_positions = []
     try:
-        cli = ACTIVE_LIVE_CLIENT
-        if cli:
-            infos = cli.futures_position_information()  # todas
-            for info in infos:
-                qty = float(info.get("positionAmt") or 0.0)
-                if abs(qty) < 1e-12:
-                    continue
-                sym = info.get("symbol") or ""
-                entry = float(info.get("entryPrice") or 0.0)
-                mark = float(info.get("markPrice") or 0.0)
-                side = "long" if qty > 0 else "short"
-                all_positions.append({
-                    "symbol": sym,
-                    "side": side,
-                    "qty": abs(qty),
-                    "entry": entry,
-                    "mark": mark,
-                })
+        pos_list = await engine.exchange.fetch_positions(symbol=None)  # ccxt
+        for p in (pos_list or []):
+            sym = p.get("symbol") or p.get("info", {}).get("symbol") or ""
+            amt = p.get("contracts") or p.get("positionAmt") or p.get("info", {}).get("positionAmt") or 0
+            try:
+                amt = float(amt)
+            except Exception:
+                continue
+            if abs(amt) <= 0.0:
+                continue
+            entry = p.get("entryPrice") or p.get("entry_price") or p.get("info", {}).get("entryPrice") or 0
+            mark  = p.get("markPrice")  or p.get("mark_price")  or p.get("info", {}).get("markPrice")  or None
+            try:
+                entry = float(entry)
+            except Exception:
+                entry = 0.0
+            try:
+                mark = float(mark) if mark is not None else None
+            except Exception:
+                mark = None
+            side = "long" if amt > 0 else "short"
+            all_positions.append({"symbol": sym, "side": side, "qty": abs(amt), "entry": entry, "mark": mark})
     except Exception:
-        # 3) Si no hay cliente live (modo simulado), usamos lo que guarda el bot
-        if st and isinstance(getattr(st, "positions", None), dict):
-            price_cache = getattr(engine, "price_cache", {}) or {}
-            for sym, lots in st.positions.items():
-                for L in lots:
-                    side = L.get("side", "long")
-                    entry = float(L.get("entry", 0.0) or 0.0)
-                    qty = float(L.get("qty", 0.0) or 0.0)
-                    mark = float(price_cache.get(sym) or 0.0)
-                    all_positions.append({
-                        "symbol": sym,
-                        "side": side,
-                        "qty": qty,
-                        "entry": entry,
-                        "mark": mark,
-                    })
+        all_positions = []
 
+    # 3) fallback a estado interno (paper o sin live)
     if not all_positions:
-        return await reply("No hay posiciones abiertas.")
+        price_cache = getattr(engine, "price_cache", {}) or {}
+        positions = getattr(st, "positions", {}) if st else {}
+        if not positions:
+            return await reply("No hay posiciones abiertas.")
+        for sym, lots in positions.items():
+            px_now = price_cache.get(sym)
+            try:
+                px_now = float(px_now) if px_now is not None else None
+            except Exception:
+                px_now = None
+            for L in lots:
+                side = "long" if L.get("side","long") == "long" else "short"
+                entry = float(L.get("entry", 0.0) or 0.0)
+                qty   = float(L.get("qty", 0.0) or 0.0)
+                all_positions.append({"symbol": sym, "side": side, "qty": qty, "entry": entry, "mark": px_now})
 
-    # 4) Formato + negrita si es del bot
+    # 4) formateo + **negrita** para las del bot
     lines = ["📊 *Posiciones abiertas*"]
     for p in all_positions:
-        sym = p["symbol"]
-        side = p["side"]
-        qty  = float(p["qty"])
-        entry= float(p["entry"])
-        mark = float(p["mark"] or 0.0)
-        pnl  = 0.0
-        if entry > 0 and mark > 0:
+        sym, side, qty, entry, mark = p["symbol"], p["side"], float(p["qty"]), float(p["entry"]), p.get("mark")
+        pnl_abs = pnl_pct = 0.0
+        if mark is not None and entry > 0:
             if side == "long":
-                pnl = (mark - entry) * qty
+                pnl_abs = (mark - entry) * qty
+                pnl_pct = (mark / entry - 1.0) * 100.0
             else:
-                pnl = (entry - mark) * qty
-        row = f"• {sym} {side} qty={qty:.6f} entry={entry:.2f} PnL={pnl:+.2f}"
+                pnl_abs = (entry - mark) * qty
+                pnl_pct = (entry / mark - 1.0) * 100.0
+        row = f"• {sym} {side} qty={qty:.6f} entry={entry:.2f} PnL={pnl_abs:+.2f} ({pnl_pct:+.2f}%)"
         if sym in bot_positions:
-            row = f"*{row}*"  # resalta la(s) del bot
+            row = f"*{row}*"
         lines.append(row)
 
     return await reply("\n".join(lines), parse_mode="Markdown")
