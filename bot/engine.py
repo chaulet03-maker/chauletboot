@@ -920,6 +920,17 @@ class TradingApp:
         logging.info("Bucle de trading programado. Iniciando polling de Telegram.")
         self.telegram_app.run_polling()
 
+    async def close_all(self) -> bool:
+        """Cierra SOLO la posición del BOT (reduceOnly). No toca posiciones manuales del usuario."""
+        try:
+            # trading.close_now usa POSITION_SERVICE (store del bot) y reduceOnly=True
+            symbol = (self.config or {}).get("symbol", "BTC/USDT")
+            await asyncio.to_thread(trading.close_now, symbol)
+            return True
+        except Exception as exc:
+            self.logger.exception("close_all failed: %s", exc)
+            return False
+
     def _init_db(self):
         pass
 

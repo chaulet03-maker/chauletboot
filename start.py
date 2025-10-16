@@ -1,8 +1,14 @@
 import os
+import sys
 
 from dotenv import load_dotenv
 
 load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), ".env"))
+
+#+ Asegura que la carpeta raíz del proyecto esté en sys.path
+ROOT = os.path.dirname(os.path.abspath(__file__))
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
 
 import logging
 from typing import Any, Dict
