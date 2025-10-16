@@ -1,0 +1,134 @@
+from dataclasses import dataclass
+from typing import Dict, List, Tuple
+from bot.utils.time_utils import now_utc, to_iso
+from bot.storage.csv_store import append_csv
+from bot.logger import decision_event, log_exception, BOT_LOGGER
+from bot.settings import STRAT, ORDER, FEES
+from bot.utils.math_utils import pct
+
+@dataclass
+class Lot:
+    side: str
+    qty: float
+    entry: float
+    stop: float
+    lev: int
+    tp1: float
+    tp2: float
+    opened_ts: float
+    partial1_done: bool = False
+    partial2_done: bool = False
+
+class Trader:
+    def __init__(self, exchange):
+        self.ex = exchange
+        self.positions: Dict[str, List[Lot]] = {}
+
+    def equity(self) -> float:
+        """Equity USDT compatible con PaperExchange y ccxt (binanceusdm/spot)."""
+        try:
+            if hasattr(self.ex, "fetch_balance_usdt"):
+                BOT_LOGGER.info("equity(): using wrapper fetch_balance_usdt")
+                bal = self.ex.fetch_balance_usdt()
+                try: return float(bal)
+                except Exception:
+                    try: return float(bal.get("total", 0))
+                    except Exception: pass
+        except Exception as e:
+            log_exception("equity_wrapper_error", str(str(e)))
+        try:
+            BOT_LOGGER.info("equity(): using ccxt fetch_balance")
+            bal = self.ex.fetch_balance()
+            if isinstance(bal, dict):
+                if "USDT" in bal and isinstance(bal["USDT"], dict):
+                    usdt = bal["USDT"]
+                    if "total" in usdt: return float(usdt["total"])
+                    if "free" in usdt:  return float(usdt["free"])
+                if "total" in bal and isinstance(bal["total"], dict) and "USDT" in bal["total"]:
+                    return float(bal["total"]["USDT"])
+                if "free" in bal and isinstance(bal["free"], dict) and "USDT" in bal["free"]:
+                    return float(bal["free"]["USDT"])
+                info = bal.get("info") or {}
+                for k in ("totalWalletBalance","walletBalance","availableBalance","crossWalletBalance"):
+                    if k in info:
+                        try: return float(info[k])
+                        except Exception: pass
+            return float(bal)
+        except Exception as e:
+            log_exception("equity_ccxt_error", str(str(e)))
+            return 0.0
+
+    def snapshot_positions(self):
+        out=[]
+        for sym, lots in self.positions.items():
+            for L in lots:
+                out.append({"symbol":sym,"side":L.side,"qty":L.qty,"entry_price":L.entry,"stop_price":L.stop,"lev":L.lev,"tp1":L.tp1,"tp2":L.tp2})
+        return out
+
+    def open(self, symbol: str, side: str, qty: float, price: float, atr: float, lev: int) -> Tuple[bool,int,float]:
+        stop_mult=float(STRAT.get("stop_atr_mult",2.0))
+        tp1_R=float(STRAT.get("tp1_R",1.0)); tp2_R=float(STRAT.get("tp2_R",2.0))
+        if side=='long':
+            stop=price - stop_mult*atr; tp1=price + tp1_R*atr; tp2=price + tp2_R*atr
+        else:
+            stop=price + stop_mult*atr; tp1=price - tp1_R*atr; tp2=price - tp2_R*atr
+        try:
+            res = self.ex.open(symbol, side, qty, price, lev, ORDER.get("order_type","market"))
+            lat = int(res.get("latency_ms",0)); notional = float(res.get("notional", qty*price))
+        except Exception as e:
+            log_exception(BOT_LOGGER,f"ORDER_ERROR open {symbol}",err=str(e))
+            decision_event("ORDER_ERROR", f"{symbol} open error: {e}")
+            return False,0,0.0
+        lot = Lot(side=side, qty=qty, entry=price, stop=stop, lev=lev, tp1=tp1, tp2=tp2, opened_ts=now_utc().timestamp())
+        self.positions.setdefault(symbol,[]).append(lot)
+        append_csv("data/trades.csv", {"ts": to_iso(now_utc()), "symbol": symbol, "action": "OPEN", "side": side,
+                                       "qty": qty, "price": price, "stop": stop},
+                   header=["ts","symbol","action","side","qty","price","stop","reason","note"])
+        return True, lat, notional
+
+    def manage(self, symbol: str, last_price: float, atr: float):
+        if symbol not in self.positions: return []
+        events=[]
+        trail_mult=float(STRAT.get("trailing_atr_mult",2.5))
+        new_lots=[]
+        for L in self.positions[symbol]:
+            if L.side=='long':
+                new_stop = last_price - trail_mult*atr
+                if new_stop > L.stop: L.stop = new_stop
+            else:
+                new_stop = last_price + trail_mult*atr
+                if new_stop < L.stop: L.stop = new_stop
+
+            # TP escalonados
+            if not L.partial1_done and ((L.side=='long' and last_price>=L.tp1) or (L.side=='short' and last_price<=L.tp1)):
+                closed = self.ex.close_all(symbol, last_price)
+                for c in closed:
+                    append_csv("data/trades.csv", {"ts": to_iso(now_utc()), "symbol": symbol, "action": "CLOSE_TP1",
+                                                   "side": L.side, "qty": c["qty"], "price": last_price, "pnl_net": c["pnl_net"]},
+                               header=["ts","symbol","action","side","qty","price","pnl_net"])
+                events.append(("TP1", symbol, L.side, last_price))
+                continue
+
+            hit_stop = (L.side=='long' and last_price<=L.stop) or (L.side=='short' and last_price>=L.stop)
+            if hit_stop:
+                closed = self.ex.close_all(symbol, last_price)
+                for c in closed:
+                    append_csv("data/trades.csv", {"ts": to_iso(now_utc()), "symbol": symbol, "action": "CLOSE_STOP",
+                                                   "side": L.side, "qty": c["qty"], "price": last_price, "pnl_net": c["pnl_net"]},
+                               header=["ts","symbol","action","side","qty","price","pnl_net"])
+                events.append(("STOP", symbol, L.side, last_price))
+                continue
+            new_lots.append(L)
+        self.positions[symbol]=new_lots
+        return events
+
+    def close_symbol(self, symbol: str, price: float, label="CLOSE_MANUAL"):
+        if symbol not in self.positions: return []
+        lots = self.positions[symbol]
+        closed = self.ex.close_all(symbol, price)
+        self.positions[symbol]=[]
+        for c in closed:
+            append_csv("data/trades.csv", {"ts": to_iso(now_utc()), "symbol": symbol, "action": label,
+                                           "side": lots[0].side if lots else "", "qty": c["qty"], "price": price, "pnl_net": c["pnl_net"]},
+                       header=["ts","symbol","action","side","qty","price","pnl_net"])
+        return closed
