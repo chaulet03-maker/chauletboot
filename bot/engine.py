@@ -284,7 +284,7 @@ class TradingApp:
 
             position = await self.trader.check_open_position(self.exchange)
 
-            # Solo adoptar una posición del exchange si YA teníamos una propia registrada.
+            # Solo adoptá si YA EXISTE una posición PROPIA del bot registrada
             had_bot_position = False
             try:
                 st = getattr(self.trader, "state", None)
@@ -820,7 +820,16 @@ class TradingApp:
                     f"Apalancamiento: x{leverage}"
                 )
                 cached_position = order_result
-                if trading.POSITION_SERVICE is not None:
+
+                # Solo re-leer desde PositionService si YA había una posición propia del bot
+                had_bot_position = False
+                try:
+                    st = getattr(self.trader, "state", None)
+                    had_bot_position = bool(st and getattr(st, "positions", {}))
+                except Exception:
+                    had_bot_position = False
+
+                if had_bot_position and (trading.POSITION_SERVICE is not None):
                     try:
                         st = trading.POSITION_SERVICE.get_status()
                         side = (st.get("side") or "FLAT").upper()
@@ -883,7 +892,7 @@ class TradingApp:
         if side == "FLAT":
             return
 
-        # Solo si YA teníamos posición propia registrada
+        # Solo reatar si YA había una posición propia registrada del bot
         had_bot_position = False
         try:
             st = getattr(self.trader, "state", None)
