@@ -33,6 +33,20 @@ def _build_public_ccxt() -> Optional[Any]:
         return None
 
     try:
+        try:
+            import certifi
+
+            cert_path = certifi.where()
+            if os.path.exists(cert_path):
+                for env_var in ("SSL_CERT_FILE", "REQUESTS_CA_BUNDLE"):
+                    current = os.getenv(env_var)
+                    if not current or not os.path.exists(current):
+                        os.environ[env_var] = cert_path
+            else:  # pragma: no cover - defensive log
+                logger.debug("Certifi path not found: %s", cert_path)
+        except ImportError:
+            logger.debug("certifi no está disponible; se usa la configuración TLS por defecto")
+
         exchange = ccxt.binanceusdm(
             {
                 "enableRateLimit": True,
