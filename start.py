@@ -10,12 +10,18 @@ ROOT = os.path.dirname(os.path.abspath(__file__))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
+import certifi
 import logging
 from typing import Any, Dict
+
+CERT_BUNDLE = certifi.where()
+os.environ["SSL_CERT_FILE"] = CERT_BUNDLE
+os.environ["REQUESTS_CA_BUNDLE"] = CERT_BUNDLE
 
 from bot.engine import TradingApp
 from config import S, get_telegram_chat_id, get_telegram_token, load_raw_config
 from logging_setup import setup_logging
+
 
 def main():
     """Función principal que configura e inicia la aplicación."""
@@ -41,8 +47,9 @@ def main():
     else:
         cfg["binance_api_key_test"] = os.getenv("BINANCE_API_KEY_TEST") or S.binance_api_key
         cfg["binance_api_secret_test"] = os.getenv("BINANCE_API_SECRET_TEST") or S.binance_api_secret
-    
+
     setup_logging()
+    logging.info("TLS bundle: %s", CERT_BUNDLE)
 
     app = TradingApp(cfg)
     app.run()
