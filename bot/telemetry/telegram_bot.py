@@ -828,9 +828,9 @@ async def posiciones_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         )
         if str(symbol).upper() == str(symbol_bot).upper() and abs(size_f) > 0:
             if bot_qty and bot_qty > 0:
-                lines.append(f"*{formatted}* (bot_qty={_num(bot_qty, 4)})")
+                lines.append(f"*[BOT]* *{formatted}* (bot_qty={_num(bot_qty, 4)})")
             else:
-                lines.append(f"*{formatted}*")
+                lines.append(f"*[BOT]* *{formatted}*")
         else:
             lines.append(formatted)
 

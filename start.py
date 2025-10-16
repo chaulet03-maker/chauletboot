@@ -1,4 +1,10 @@
 import os
+import sys
+
+# Asegura que la carpeta raíz del proyecto esté primera en sys.path
+ROOT = os.path.dirname(os.path.abspath(__file__))
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
 
 from dotenv import load_dotenv
 
