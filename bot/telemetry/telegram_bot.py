@@ -154,6 +154,13 @@ def _fmt_num(x, nd=2):
         return str(x)
 
 
+def _num(val, decimals=2):
+    try:
+        return f"{float(val):,.{decimals}f}"
+    except Exception:
+        return str(val)
+
+
 def _get_equity_fraction(engine) -> float:
     """Devuelve el equity% configurado como fracción.
 
@@ -744,6 +751,7 @@ async def posicion_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await message.reply_text("No pude acceder al engine para consultar la posición.")
         return
 
+    # Forzar upgrade a real para coherencia con /posiciones
     exchange = getattr(engine, "exchange", None)
     if exchange is not None and hasattr(exchange, "upgrade_to_real_if_needed"):
         try:
@@ -751,8 +759,29 @@ async def posicion_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as exc:
             logger.debug("upgrade_to_real_if_needed desde /posicion falló: %s", exc)
 
-    reply_text = _position_status_message(engine)
-    await message.reply_text(reply_text)
+    # Mostrar SOLO la posición del BOT (store local)
+    try:
+        st = trading.POSITION_SERVICE.get_status() if trading.POSITION_SERVICE else None
+    except Exception:
+        st = None
+    if not st or (st.get("side", "FLAT").upper() == "FLAT"):
+        reply_text = "📍 Posición del BOT: *SIN POSICIÓN*"
+    else:
+        q = float(st.get("qty") or st.get("size") or 0.0)
+        side = (st.get("side") or "").upper()
+        entry = float(st.get("entry_price") or 0.0)
+        mark = float(st.get("mark") or 0.0)
+        pnl = float(st.get("pnl") or 0.0)
+        sym = st.get("symbol") or (engine.config or {}).get("symbol", "?")
+        reply_text = (
+            "📍 *Posición del BOT*\n"
+            f"• Símbolo: *{sym}*\n"
+            f"• Lado: *{side}*\n"
+            f"• Cantidad (bot_qty): *_{_num(q, 4)}_*\n"
+            f"• Entrada: {_num(entry)}  |  Mark: {_num(mark)}\n"
+            f"• PnL: *{_num(pnl)}*"
+        )
+    await message.reply_text(reply_text, parse_mode="Markdown")
 
 
 async def posiciones_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -772,9 +801,14 @@ async def posiciones_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await message.reply_text("Exchange no disponible.")
         return
 
+    # 1) Forzar upgrade a real
     try:
         if hasattr(exchange, "upgrade_to_real_if_needed"):
             await exchange.upgrade_to_real_if_needed()
+    except Exception as exc:
+        logger.debug("upgrade_to_real_if_needed desde /posiciones falló: %s", exc)
+    # 2) Traer TODAS las posiciones del exchange (usuario + bot)
+    try:
         positions = await exchange.fetch_positions(None)
     except Exception as exc:  # pragma: no cover - robustez
         await message.reply_text(f"No pude leer posiciones: {exc}")
@@ -783,12 +817,6 @@ async def posiciones_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if not positions:
         await message.reply_text("No hay posiciones abiertas.")
         return
-
-    def _num(val, decimals=2):
-        try:
-            return f"{float(val):,.{decimals}f}"
-        except Exception:
-            return str(val)
 
     bot_status = None
     bot_qty = 0.0
@@ -799,7 +827,7 @@ async def posiciones_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         bot_status = None
         bot_qty = 0.0
 
-    lines = ["📌 *Posiciones abiertas*"]
+    lines = ["📋 *Posiciones totales (usuario + BOT):*"]
     for pos in positions:
         symbol = pos.get("symbol") or pos.get("info", {}).get("symbol") or "?"
         size = (
@@ -826,11 +854,10 @@ async def posiciones_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
             f"{symbol} | {side} | qty={_num(size, 4)} | "
             f"entry=${_num(entry)} | uPnL=${_num(upnl)}"
         )
-        if str(symbol).upper() == str(symbol_bot).upper() and abs(size_f) > 0:
-            if bot_qty and bot_qty > 0:
-                lines.append(f"*{formatted}* (bot_qty={_num(bot_qty, 4)})")
-            else:
-                lines.append(f"*{formatted}*")
+        # Resaltar SOLO si el BOT tiene porción abierta en este símbolo
+        is_bot_symbol = str(symbol).upper() == str(symbol_bot).upper()
+        if is_bot_symbol and bot_qty and abs(bot_qty) > 0:
+            lines.append(f"*[BOT]* *{formatted}*  (bot_qty={_num(bot_qty, 4)})")
         else:
             lines.append(formatted)
 
