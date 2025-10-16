@@ -992,10 +992,13 @@ async def cerrar_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _reply_chunks(update, "Engine no disponible para cerrar posiciones.")
         return
     try:
-        await engine.close_all()
-        await _reply_chunks(update, "✅ Cerré todas las posiciones abiertas.")
+        ok = await engine.close_all()
+        if ok:
+            await _reply_chunks(update, "✅ Cerré la **posición del BOT**.")
+        else:
+            await _reply_chunks(update, "⚠️ No había **posición del BOT** para cerrar.")
     except Exception as exc:
-        await _reply_chunks(update, f"No pude cerrar las posiciones: {exc}")
+        await _reply_chunks(update, f"No pude cerrar la **posición del BOT**: {exc}")
 
 
 async def precio_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1118,20 +1121,20 @@ async def killswitch_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
     close_error: Optional[str] = None
     try:
-        await engine.close_all()
+        await engine.close_all()   # solo la del BOT
     except Exception as exc:  # pragma: no cover - defensivo
         close_error = str(exc)
     _set_killswitch(engine, True)
     if close_error:
         await _reply_chunks(
             update,
-            "⚠️ Activé el killswitch pero no pude cerrar todas las posiciones: "
+            "⚠️ Activé el killswitch pero no pude cerrar la **posición del BOT**: "
             f"{close_error}",
         )
     else:
         await _reply_chunks(
             update,
-            "🛑 Killswitch ACTIVADO: se cerró la posición actual y se pausó el bot.",
+            "🛑 Killswitch ACTIVADO: se cerró la **posición del BOT** y se pausó el bot.",
         )
 
 
