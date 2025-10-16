@@ -1,48 +1,41 @@
-import os
+#!/usr/bin/env python3
+import os, sys
+from pathlib import Path
 
-from dotenv import load_dotenv
+HERE = Path(__file__).resolve().parent
 
-load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), ".env"))
+# Candidatos típicos: raíz actual, subcarpeta "chauletboot-main/chauletboot-main",
+# y la carpeta padre por si lo corrés un nivel arriba.
+candidates = [
+    HERE,
+    HERE / "chauletboot-main" / "chauletboot-main",
+    HERE / "chauletboot-main",
+    HERE.parent,
+]
 
-import logging
-from typing import Any, Dict
+project_root = None
+for c in candidates:
+    if (c / "bot").is_dir() and (c / "core").is_dir():
+        project_root = c
+        break
 
-from bot.engine import TradingApp
-from config import S, get_telegram_chat_id, get_telegram_token, load_raw_config
-from logging_setup import setup_logging
+if not project_root:
+    sys.stderr.write(
+        "[ERROR] No encontré carpetas 'bot/' y 'core/'. "
+        "Parate en la raíz del proyecto o ajustá 'candidates'.\n"
+    )
+    sys.exit(1)
 
-def main():
-    """Función principal que configura e inicia la aplicación."""
-    cfg: Dict[str, Any] = load_raw_config()
-    cfg.setdefault("trading_mode", S.trading_mode)
-    cfg.setdefault("mode", "paper" if S.PAPER else "real")
-    cfg.setdefault("start_equity", S.start_equity)
+if str(project_root) not in sys.path:
+    sys.path.insert(0, str(project_root))
 
-    cfg["telegram_token"] = get_telegram_token(cfg.get("telegram_token"))
-    cfg["telegram_chat_id"] = get_telegram_chat_id(cfg.get("telegram_chat_id"))
+# Opcional: asegurá que sean paquetes
+for pkg in ("bot", "core"):
+    initp = project_root / pkg / "__init__.py"
+    if not initp.exists():
+        initp.write_text("")  # crea __init__.py si faltara
 
-    if S.LIVE:
-        cfg["binance_api_key_real"] = (
-            S.binance_api_key
-            or os.getenv("BINANCE_API_KEY")
-            or os.getenv("BINANCE_API_KEY_REAL")
-        )
-        cfg["binance_api_secret_real"] = (
-            S.binance_api_secret
-            or os.getenv("BINANCE_API_SECRET")
-            or os.getenv("BINANCE_API_SECRET_REAL")
-        )
-    else:
-        cfg["binance_api_key_test"] = os.getenv("BINANCE_API_KEY_TEST") or S.binance_api_key
-        cfg["binance_api_secret_test"] = os.getenv("BINANCE_API_SECRET_TEST") or S.binance_api_secret
-    
-    setup_logging()
-
-    app = TradingApp(cfg)
-    app.run()
-
+# --- arrancar app ---
+from bot.engine import TradingApp  # ahora sí resuelve core.strategy
 if __name__ == "__main__":
-    try:
-        main()
-    except KeyboardInterrupt:
-        logging.info("Bot detenido manualmente.")
+    TradingApp().run()
