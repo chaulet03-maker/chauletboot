@@ -744,6 +744,13 @@ async def posicion_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await message.reply_text("No pude acceder al engine para consultar la posición.")
         return
 
+    # Forzar upgrade a real si corresponde (simetría con /posiciones)
+    exchange = getattr(engine, "exchange", None)
+    if exchange is not None and hasattr(exchange, "upgrade_to_real_if_needed"):
+        try:
+            await exchange.upgrade_to_real_if_needed()
+        except Exception as exc:
+            logger.debug("upgrade_to_real_if_needed desde /posicion falló: %s", exc)
     reply_text = _position_status_message(engine)
     await message.reply_text(reply_text)
 
