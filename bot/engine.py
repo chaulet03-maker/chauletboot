@@ -283,7 +283,16 @@ class TradingApp:
                     logging.debug("No se pudo refrescar mark-to-market inicial: %s", exc)
 
             position = await self.trader.check_open_position(self.exchange)
-            if (position is None) and (trading.POSITION_SERVICE is not None):
+
+            # Solo adoptar una posición del exchange si YA teníamos una propia registrada.
+            had_bot_position = False
+            try:
+                st = getattr(self.trader, "state", None)
+                had_bot_position = bool(st and getattr(st, "positions", {}))
+            except Exception:
+                had_bot_position = False
+
+            if (position is None) and had_bot_position and (trading.POSITION_SERVICE is not None):
                 try:
                     st = trading.POSITION_SERVICE.get_status()
                     side = (st.get("side") or "FLAT").upper()
@@ -873,6 +882,17 @@ class TradingApp:
         side = (status.get("side") or "FLAT").upper()
         if side == "FLAT":
             return
+
+        # Solo si YA teníamos posición propia registrada
+        had_bot_position = False
+        try:
+            st = getattr(self.trader, "state", None)
+            had_bot_position = bool(st and getattr(st, "positions", {}))
+        except Exception:
+            had_bot_position = False
+
+        if not had_bot_position:
+            return  # no adoptes posiciones manuales del usuario
 
         symbol = status.get("symbol", self.config.get("symbol", "BTC/USDT"))
         qty = float(status.get("qty") or status.get("size") or 0.0)

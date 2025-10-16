@@ -149,44 +149,77 @@ async def _cmd_help(reply):
     return await reply(texto)
 
 async def _cmd_positions_detail(engine, reply):
+    # 1) Posiciones que el bot tiene registradas (las "propias")
     st = getattr(engine.trader, "state", None)
-    positions = getattr(st, "positions", {}) if st else {}
-    if not positions:
+    bot_positions = set()
+    if st and isinstance(getattr(st, "positions", None), dict):
+        for sym, lots in st.positions.items():
+            if lots:
+                bot_positions.add(sym)
+
+    # 2) Intentamos leer TODAS las posiciones vivas del exchange (real)
+    from brokers import ACTIVE_LIVE_CLIENT
+    all_positions = []
+    try:
+        cli = ACTIVE_LIVE_CLIENT
+        if cli:
+            infos = cli.futures_position_information()  # todas
+            for info in infos:
+                qty = float(info.get("positionAmt") or 0.0)
+                if abs(qty) < 1e-12:
+                    continue
+                sym = info.get("symbol") or ""
+                entry = float(info.get("entryPrice") or 0.0)
+                mark = float(info.get("markPrice") or 0.0)
+                side = "long" if qty > 0 else "short"
+                all_positions.append({
+                    "symbol": sym,
+                    "side": side,
+                    "qty": abs(qty),
+                    "entry": entry,
+                    "mark": mark,
+                })
+    except Exception:
+        # 3) Si no hay cliente live (modo simulado), usamos lo que guarda el bot
+        if st and isinstance(getattr(st, "positions", None), dict):
+            price_cache = getattr(engine, "price_cache", {}) or {}
+            for sym, lots in st.positions.items():
+                for L in lots:
+                    side = L.get("side", "long")
+                    entry = float(L.get("entry", 0.0) or 0.0)
+                    qty = float(L.get("qty", 0.0) or 0.0)
+                    mark = float(price_cache.get(sym) or 0.0)
+                    all_positions.append({
+                        "symbol": sym,
+                        "side": side,
+                        "qty": qty,
+                        "entry": entry,
+                        "mark": mark,
+                    })
+
+    if not all_positions:
         return await reply("No hay posiciones abiertas.")
-    price_cache = getattr(engine, "price_cache", {}) or {}
-    lines = []
-    for sym, lots in positions.items():
-        px_now = price_cache.get(sym)
-        try:
-            px_now = float(px_now) if px_now is not None else None
-        except Exception:
-            px_now = None
-        for L in lots:
-            side = L.get("side","long")
-            s_side = "long" if side == "long" else "short"
-            lev = int(L.get("lev", 1) or 1)
-            entry = float(L.get("entry", 0.0) or 0.0)
-            qty = float(L.get("qty", 0.0) or 0.0)
-            sl = float(L.get("sl", 0.0) or 0.0)
-            tp = float(L.get("tp2", L.get("tp1", 0.0)) or 0.0)
-            pnl_abs = 0.0
-            pnl_pct = 0.0
-            if px_now and entry:
-                if side == "long":
-                    pnl_abs = (px_now - entry) * qty * max(1, lev)
-                    pnl_pct = (px_now / entry - 1.0) * 100.0 * max(1, lev)
-                else:
-                    pnl_abs = (entry - px_now) * qty * max(1, lev)
-                    pnl_pct = (entry / px_now - 1.0) * 100.0 * max(1, lev)
-            lines.append(
-                f"{sym} {s_side} x{lev}\n"
-                f"entrada: {entry:.2f}\n"
-                f"pnl: {pnl_abs:+.2f} ({pnl_pct:+.2f}%)\n"
-                f"sl: {sl:.2f}\n"
-                f"tp: {tp:.2f}"
-            )
-            lines.append("")
-    return await reply("\n".join(lines).strip())
+
+    # 4) Formato + negrita si es del bot
+    lines = ["📊 *Posiciones abiertas*"]
+    for p in all_positions:
+        sym = p["symbol"]
+        side = p["side"]
+        qty  = float(p["qty"])
+        entry= float(p["entry"])
+        mark = float(p["mark"] or 0.0)
+        pnl  = 0.0
+        if entry > 0 and mark > 0:
+            if side == "long":
+                pnl = (mark - entry) * qty
+            else:
+                pnl = (entry - mark) * qty
+        row = f"• {sym} {side} qty={qty:.6f} entry={entry:.2f} PnL={pnl:+.2f}"
+        if sym in bot_positions:
+            row = f"*{row}*"  # resalta la(s) del bot
+        lines.append(row)
+
+    return await reply("\n".join(lines), parse_mode="Markdown")
 
 
 async def _cmd_precio(engine, reply, symbol: Optional[str] = None):
