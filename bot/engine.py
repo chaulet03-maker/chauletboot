@@ -19,8 +19,8 @@ from bot.telemetry.notifier import Notifier
 from bot.telemetry.telegram_bot import setup_telegram_bot
 from brokers import ACTIVE_LIVE_CLIENT
 from bot.motives import MOTIVES, MotiveItem, compute_codes
-from .core.strategy import Strategy
-from .core.indicators import add_indicators
+from core.strategy import Strategy
+from core.indicators import add_indicators
 from config import S
 import trading
 from risk_guards import (
