@@ -34,7 +34,7 @@ class PositionService:
         try:
             self.store.save(mark=float(mark))
         except Exception:
-            logger.debug("No se pudo actualizar mark-to-market en store paper.", exc_info=True)
+            logger.debug("No se pudo actualizar mark del store paper.", exc_info=True)
 
     # ------------------------------------------------------------------
     def _fetch_public_mark(self) -> Optional[float]:
@@ -179,77 +179,115 @@ class PositionService:
         return equity
 
     def _status_live(self) -> dict[str, Any]:
-        client = self.client or self.public_client
-        if not client:
-            raise RuntimeError("Cliente live no inicializado.")
+        pos_qty = 0.0
+        avg_price = 0.0
+        if self.store:
+            try:
+                state = self.store.load()
+                pos_qty = float(state.get("pos_qty") or 0.0)
+                avg_price = float(state.get("avg_price") or 0.0)
+            except Exception:
+                logger.debug("No se pudo leer store live", exc_info=True)
 
-        symbol_no_slash = self.symbol.replace("/", "")
-        entry = 0.0
-        qty = 0.0
-        amt = 0.0
         mark = 0.0
-
-        if hasattr(client, "fapiPrivateGetPositionRisk") or hasattr(client, "fapiPrivate_get_positionrisk"):
+        client = self.client
+        symbol_no_slash = self.symbol.replace("/", "")
+        if client and hasattr(client, "futures_mark_price"):
             try:
-                if hasattr(client, "fapiPrivateGetPositionRisk"):
-                    positions = client.fapiPrivateGetPositionRisk({"symbol": symbol_no_slash})
-                else:
-                    positions = client.fapiPrivate_get_positionrisk({"symbol": symbol_no_slash})
-            except Exception as exc:  # pragma: no cover - live only
-                raise RuntimeError(f"No se pudo obtener la posición live: {exc}") from exc
-            pos = positions[0] if isinstance(positions, list) and positions else positions
-            if isinstance(pos, dict):
-                entry = float(pos.get("entryPrice") or pos.get("entry_price") or 0.0)
-                amt = float(pos.get("positionAmt") or pos.get("position_amt") or 0.0)
-                qty = abs(amt)
-                mark = float(pos.get("markPrice") or pos.get("mark_price") or 0.0)
-        else:
-            try:
-                positions = client.futures_position_information(symbol=symbol_no_slash)
-            except Exception as exc:  # pragma: no cover - live only
-                raise RuntimeError(f"No se pudo obtener la posición live: {exc}") from exc
-            pos = positions[0] if positions else {}
-            entry = float(pos.get("entryPrice") or 0.0)
-            amt = float(pos.get("positionAmt") or 0.0)
-            qty = abs(amt)
-            mark = float(pos.get("markPrice") or 0.0)
-            if mark <= 0 and hasattr(client, "futures_mark_price"):
-                try:
-                    mp = client.futures_mark_price(symbol=symbol_no_slash)
-                    if isinstance(mp, dict):
-                        mark = float(mp.get("markPrice") or 0.0)
-                except Exception:
-                    logger.debug("No se pudo obtener markPrice desde endpoint dedicado.", exc_info=True)
-
-        side = "FLAT"
-        if amt > 0:
-            side = "LONG"
-        elif amt < 0:
-            side = "SHORT"
+                mp = client.futures_mark_price(symbol=symbol_no_slash)
+                if isinstance(mp, dict):
+                    mark = float(mp.get("markPrice") or 0.0)
+            except Exception:
+                logger.debug("No se pudo obtener markPrice privado.", exc_info=True)
 
         if mark <= 0:
             public_mark = self._fetch_public_mark()
             if public_mark is not None:
                 mark = float(public_mark)
 
-        equity = self._fetch_live_equity(client)
+        side = "FLAT"
+        if pos_qty > 0:
+            side = "LONG"
+        elif pos_qty < 0:
+            side = "SHORT"
+
+        equity = 0.0
+        if client:
+            try:
+                equity = self._fetch_live_equity(client)
+            except Exception:
+                logger.debug("No se pudo obtener equity live.", exc_info=True)
 
         pnl = 0.0
-        if qty > 0 and entry > 0 and mark > 0:
+        qty = abs(pos_qty)
+        if qty > 0 and avg_price > 0 and mark > 0:
             if side == "LONG":
-                pnl = (mark - entry) * qty
-            elif side == "SHORT":
-                pnl = (entry - mark) * qty
+                pnl = (mark - avg_price) * qty
+            else:
+                pnl = (avg_price - mark) * qty
 
         return {
             "symbol": self.symbol,
             "side": side,
-            "entry_price": round(entry, 2),
+            "entry_price": round(avg_price, 2),
             "qty": float(qty),
             "pnl": round(pnl, 2),
-            "equity": round(equity, 2),
-            "mark": round(mark, 2),
+            "equity": round(float(equity or 0.0), 2),
+            "mark": round(float(mark or 0.0), 2),
         }
+
+    def apply_fill(
+        self, side: str, qty: float, price: float, fee: float = 0.0
+    ) -> dict[str, Any] | None:
+        """Actualiza el store local con un fill ejecutado."""
+        if not self.store:
+            return None
+        try:
+            state = self.store.load()
+            pos_qty = float(state.get("pos_qty") or 0.0)
+            avg_price = float(state.get("avg_price") or 0.0)
+            direction = str(side).upper()
+            dq = float(qty) if direction in {"LONG", "BUY"} else -float(qty)
+            new_qty = pos_qty + dq
+            price_f = float(price or 0.0)
+            realized = 0.0
+
+            if pos_qty * dq < 0:
+                closing_qty = min(abs(dq), abs(pos_qty))
+                if closing_qty > 0:
+                    if pos_qty > 0:
+                        realized = (price_f - avg_price) * closing_qty
+                    else:
+                        realized = (avg_price - price_f) * closing_qty
+                if abs(new_qty) < 1e-12:
+                    avg_new = 0.0
+                elif abs(abs(dq) - closing_qty) > 1e-12:
+                    avg_new = price_f
+                else:
+                    avg_new = avg_price
+            else:
+                total = abs(pos_qty) + abs(dq)
+                if total <= 1e-12:
+                    avg_new = 0.0
+                elif abs(pos_qty) < 1e-12:
+                    avg_new = price_f
+                else:
+                    avg_new = (
+                        (abs(pos_qty) * avg_price) + (abs(dq) * price_f)
+                    ) / total
+
+            changes: dict[str, Any] = {
+                "pos_qty": float(new_qty),
+                "avg_price": float(avg_new),
+            }
+            if fee:
+                changes["fees"] = float(state.get("fees") or 0.0) + float(fee)
+            if realized:
+                changes["realized_pnl"] = float(state.get("realized_pnl") or 0.0) + float(realized)
+            return self.store.save(**changes)
+        except Exception:
+            logger.debug("apply_fill fallo", exc_info=True)
+            return None
 
     # ------------------------------------------------------------------
     def get_status(self) -> dict[str, Any]:

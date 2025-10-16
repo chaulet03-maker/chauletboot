@@ -744,6 +744,13 @@ async def posicion_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await message.reply_text("No pude acceder al engine para consultar la posición.")
         return
 
+    exchange = getattr(engine, "exchange", None)
+    if exchange is not None and hasattr(exchange, "upgrade_to_real_if_needed"):
+        try:
+            await exchange.upgrade_to_real_if_needed()
+        except Exception as exc:
+            logger.debug("upgrade_to_real_if_needed desde /posicion falló: %s", exc)
+
     reply_text = _position_status_message(engine)
     await message.reply_text(reply_text)
 
@@ -783,6 +790,15 @@ async def posiciones_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         except Exception:
             return str(val)
 
+    bot_status = None
+    bot_qty = 0.0
+    try:
+        bot_status = trading.POSITION_SERVICE.get_status() if trading.POSITION_SERVICE else None
+        bot_qty = float(bot_status.get("qty") or 0.0) if bot_status else 0.0
+    except Exception:
+        bot_status = None
+        bot_qty = 0.0
+
     lines = ["📌 *Posiciones abiertas*"]
     for pos in positions:
         symbol = pos.get("symbol") or pos.get("info", {}).get("symbol") or "?"
@@ -811,7 +827,10 @@ async def posiciones_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
             f"entry=${_num(entry)} | uPnL=${_num(upnl)}"
         )
         if str(symbol).upper() == str(symbol_bot).upper() and abs(size_f) > 0:
-            lines.append(f"*{formatted}*")
+            if bot_qty and bot_qty > 0:
+                lines.append(f"*{formatted}* (bot_qty={_num(bot_qty, 4)})")
+            else:
+                lines.append(f"*{formatted}*")
         else:
             lines.append(formatted)
 

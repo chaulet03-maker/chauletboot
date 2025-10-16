@@ -9,6 +9,7 @@ from config import S
 from brokers import ACTIVE_LIVE_CLIENT, ACTIVE_PAPER_STORE, build_broker
 from binance_client import client_factory
 from position_service import PositionService
+from paper_store import PaperStore
 
 logger = logging.getLogger(__name__)
 
@@ -89,11 +90,20 @@ def rebuild(mode: Mode) -> None:
     _sync_settings_mode(mode)
     PUBLIC_CCXT_CLIENT = _build_public_ccxt()
     BROKER = build_broker(S, client_factory)
+    bot_store = ACTIVE_PAPER_STORE
+    if mode != "simulado":
+        try:
+            os.makedirs("data", exist_ok=True)
+        except Exception:
+            pass
+        live_store_path = os.path.join(os.getcwd(), "data", "live_bot_position.json")
+        bot_store = PaperStore(path=live_store_path, start_equity=S.start_equity)
+
     POSITION_SERVICE = PositionService(
-        paper_store=ACTIVE_PAPER_STORE,
+        paper_store=bot_store,
         live_client=ACTIVE_LIVE_CLIENT,
         ccxt_client=PUBLIC_CCXT_CLIENT,
-        symbol="BTC/USDT",
+        symbol=S.symbol if hasattr(S, "symbol") else "BTC/USDT",
     )
     logger.info("Trading stack reconstruido para modo %s", mode.upper())
     _INITIALIZED = True
@@ -153,7 +163,16 @@ def place_order_safe(side: str, qty: float, price: float | None = None, **kwargs
     )
     if BROKER is None:
         raise RuntimeError("Broker no inicializado")
-    return BROKER.place_order(side, qty, price, **kwargs)
+    result = BROKER.place_order(side, qty, price, **kwargs)
+    try:
+        if POSITION_SERVICE is not None and getattr(POSITION_SERVICE, "store", None):
+            fill_price = _infer_fill_price(result, price)
+            if fill_price is not None:
+                fill_side = "LONG" if str(side).upper() in {"BUY", "LONG"} else "SHORT"
+                POSITION_SERVICE.apply_fill(fill_side, float(qty), float(fill_price))
+    except Exception:
+        logger.debug("No se pudo reflejar fill en store tras abrir.", exc_info=True)
+    return result
 
 
 def close_now(symbol: str | None = None):
@@ -174,7 +193,7 @@ def close_now(symbol: str | None = None):
 
     close_side = "SELL" if side == "LONG" else "BUY"
     target_symbol = symbol or status.get("symbol")
-    return BROKER.place_order(
+    result = BROKER.place_order(
         close_side,
         qty,
         None,
@@ -182,3 +201,59 @@ def close_now(symbol: str | None = None):
         order_type="market",
         symbol=target_symbol,
     )
+    try:
+        if POSITION_SERVICE is not None and getattr(POSITION_SERVICE, "store", None):
+            close_price = _infer_fill_price(result, status.get("mark"))
+            bot_side = "SHORT" if side == "LONG" else "LONG"
+            if close_price is not None:
+                POSITION_SERVICE.apply_fill(bot_side, float(qty), float(close_price))
+    except Exception:
+        logger.debug("No se pudo reflejar cierre en store.", exc_info=True)
+    return result
+
+
+def _infer_fill_price(order_result: Any, fallback: float | None = None) -> float | None:
+    """Intenta inferir el precio de fill a partir de la respuesta del broker."""
+    if fallback is not None:
+        try:
+            fallback_f = float(fallback)
+        except Exception:
+            fallback_f = None
+        else:
+            if fallback_f and fallback_f > 0:
+                return fallback_f
+    if isinstance(order_result, dict):
+        for key in ("avgPrice", "avg_price", "avgExecutionPrice", "price", "fills_price"):
+            value = order_result.get(key)
+            if value not in (None, ""):
+                try:
+                    candidate = float(value)
+                except Exception:
+                    continue
+                if candidate and candidate > 0:
+                    return candidate
+        fills = order_result.get("fills")
+        if isinstance(fills, list) and fills:
+            total_qty = 0.0
+            total_notional = 0.0
+            for fill in fills:
+                try:
+                    f_price = float(fill.get("price"))
+                    qty_candidate = (
+                        fill.get("qty")
+                        or fill.get("quantity")
+                        or fill.get("size")
+                        or fill.get("amount")
+                        or fill.get("executedQty")
+                        or fill.get("filled")
+                    )
+                    f_qty = float(qty_candidate)
+                except Exception:
+                    continue
+                if f_price <= 0 or abs(f_qty) <= 0:
+                    continue
+                total_qty += abs(f_qty)
+                total_notional += abs(f_qty) * f_price
+            if total_qty > 0:
+                return total_notional / total_qty
+    return None
