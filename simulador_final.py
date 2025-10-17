@@ -255,19 +255,6 @@ class RiskSizingBacktester:
         funding_default: float = 0.0001,
         funding_interval_hours: int = 8,
         funding_gate_bps: int = 80,
-        # --- MICRO trading (scalp en mercado planchado) ---
-        enable_micro: bool = True,
-        micro_equity_frac: float = 0.10,
-        micro_lev: float = 3.0,
-        micro_anchor: str = "ema50",
-        micro_rsi_band_low: float = 45.0,
-        micro_rsi_band_high: float = 55.0,
-        micro_target_on_invested: float = 0.012,
-        micro_atrp_max: float = 0.25,
-        micro_adx_max: float = 20.0,
-        micro_deviation_atr: float = 0.35,
-        micro_max_hold_bars: int = 4,
-        micro_funding_gate_bps: int = 120,
         # Filtros tendencia 4h + confirmación 1h
         trend_filter: str = "ema200_4h",
         rsi4h_gate: Optional[float] = 52.0,
@@ -289,6 +276,11 @@ class RiskSizingBacktester:
         grid_anchor: str = "ema30",
         grid_side: str = "auto",
         anchor_bias_frac: float = 1.0,
+        # ---- Grid tolerance / snap ----
+        grid_step_tolerance_bps: float = 30.0,
+        min_abs_grid_tolerance: float = 0.0,
+        grid_snap_to_nearest: bool = False,
+        grid_debug: bool = False,
         # tagging
         tag: Optional[str] = None,
         # --- Shock pause ---
@@ -390,20 +382,6 @@ class RiskSizingBacktester:
         self.funding_series = self._load_funding_series(funding_csv) if funding_csv else None
         self.funding_gate_frac = float(funding_gate_bps)/10000.0 if funding_gate_bps is not None else 0.0
 
-        # Micro trading config
-        self.enable_micro = bool(enable_micro)
-        self.micro_equity_frac = float(micro_equity_frac)
-        self.micro_lev = float(micro_lev)
-        self.micro_anchor = str(micro_anchor).lower()
-        self.micro_rsi_band_low = float(micro_rsi_band_low)
-        self.micro_rsi_band_high = float(micro_rsi_band_high)
-        self.micro_target_on_invested = float(micro_target_on_invested)
-        self.micro_atrp_max = float(micro_atrp_max)
-        self.micro_adx_max = float(micro_adx_max)
-        self.micro_deviation_atr = float(micro_deviation_atr)
-        self.micro_max_hold_bars = int(micro_max_hold_bars)
-        self.micro_funding_gate_frac = float(micro_funding_gate_bps)/10000.0 if micro_funding_gate_bps is not None else 0.0
-
         # Filtros
         self.trend_filter = trend_filter.lower() if trend_filter else "none"
         self.rsi4h_gate = rsi4h_gate
@@ -433,6 +411,11 @@ class RiskSizingBacktester:
             raise ValueError("grid_side debe ser 'auto', 'long' o 'short'")
         # Sesgo del anchor hacia el precio (k=1 sin cambio; k=0.5 = 50% hacia price)
         self.anchor_bias_frac = float(anchor_bias_frac)
+        # Tolerancia/snap
+        self.grid_step_tolerance_bps = float(grid_step_tolerance_bps)
+        self.min_abs_grid_tolerance = float(min_abs_grid_tolerance)
+        self.grid_snap_to_nearest = bool(grid_snap_to_nearest)
+        self.grid_debug = bool(grid_debug)
 
         # Tag
         self.tag = (tag or "").strip()
@@ -467,6 +450,13 @@ class RiskSizingBacktester:
             f"use_atr={self.use_atr} SL%={self.sl_pct} SL_ATR={self.sl_atr_mult} "
             f"TP%={self.tp_pct} TP_ATR={self.tp_atr_mult} entry_mode={self.entry_mode}"
         )
+        if self.entry_mode == "pullback_grid":
+            logging.info(
+                f"Grid config → step_atr={self.grid_step_atr:.3f} span_atr={self.grid_span_atr:.3f} "
+                f"anchor={self.grid_anchor} side={self.grid_side} bias={self.anchor_bias_frac:.2f} "
+                f"tol_bps={self.grid_step_tolerance_bps:.1f} min_abs_tol={self.min_abs_grid_tolerance:.4f} "
+                f"snap={self.grid_snap_to_nearest}"
+            )
 
     def _init_db(self) -> None:
         os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
@@ -729,15 +719,6 @@ class RiskSizingBacktester:
         k = float(getattr(self, "anchor_bias_frac", 1.0))
         return float(price + k * (float(raw) - price))
 
-    def _micro_anchor_price(self, row: pd.Series) -> Optional[float]:
-        import numpy as np
-
-        if self.micro_anchor == "ema50":
-            val = row.get("ema50", np.nan)
-        else:
-            val = row.get("ema30", np.nan)
-        return float(val) if np.isfinite(val) else None
-
     def _signal_pullback_grid(self, row: pd.Series) -> Optional[str]:
         atr = float(row["atr"])
         if not np.isfinite(atr) or atr <= 0:
@@ -745,6 +726,7 @@ class RiskSizingBacktester:
         anchor = self._anchor_price(row)
         if anchor is None or not np.isfinite(anchor):
             return None
+
         price = float(row["close"])
         side_pref = self._decide_grid_side(row)
         if side_pref is None:
@@ -752,50 +734,46 @@ class RiskSizingBacktester:
 
         step = self.grid_step_atr * atr
         half_span = self.grid_span_atr * atr
+
+        # Tolerancia absoluta: max(bps*price, piso absoluto)
+        tol_abs = max(self.grid_step_tolerance_bps * 1e-4 * price, self.min_abs_grid_tolerance)
+
+        # Helper: ¿la distancia cae en un múltiplo de step con tolerancia?
+        def step_ok(dist_signed: float) -> bool:
+            d_abs = abs(dist_signed)
+            if d_abs < 1e-12:
+                return False
+            rem = d_abs % step
+            return (rem <= tol_abs) or ((step - rem) <= tol_abs) or (d_abs >= (step - tol_abs))
+
+        # Snap al escalón más cercano (opcional)
+        def snapped_distance(d: float) -> float:
+            sign = 1.0 if d >= 0 else -1.0
+            k = round(abs(d) / step)
+            k = max(1, k)  # al menos un escalón
+            return sign * (k * step)
+
         if side_pref == "LONG":
-            if (price < anchor) and (anchor - price >= step) and (anchor - price <= half_span):
+            # Precio por debajo del anchor, buscamos pullback hacia abajo
+            d = anchor - price  # magnitud de pullback
+            d_eff = abs(snapped_distance(-d)) if self.grid_snap_to_nearest else d
+            in_span = (d_eff >= (step - tol_abs)) and (d_eff <= (half_span + tol_abs))
+            if (price < anchor) and in_span and step_ok(-d):
+                if self.grid_debug:
+                    logging.debug(f"[GRID LONG] price={price:.2f} anchor={anchor:.2f} d={d:.2f} d_eff={d_eff:.2f} step={step:.2f} span={half_span:.2f} tol={tol_abs:.4f}")
                 return "LONG"
         else:
-            if (price > anchor) and (price - anchor >= step) and (price - anchor <= half_span):
+            # SHORT: precio por encima del anchor
+            d = price - anchor
+            d_eff = abs(snapped_distance(d)) if self.grid_snap_to_nearest else d
+            in_span = (d_eff >= (step - tol_abs)) and (d_eff <= (half_span + tol_abs))
+            if (price > anchor) and in_span and step_ok(d):
+                if self.grid_debug:
+                    logging.debug(f"[GRID SHORT] price={price:.2f} anchor={anchor:.2f} d={d:.2f} d_eff={d_eff:.2f} step={step:.2f} span={half_span:.2f} tol={tol_abs:.4f}")
                 return "SHORT"
-        return None
 
-    def _signal_micro(self, row: pd.Series) -> Optional[str]:
-        if not self.enable_micro:
-            return None
-
-        import numpy as np
-
-        c = float(row["close"])
-        atr = float(row["atr"])
-        adx = float(row.get("adx", np.nan))
-        rsi = float(row.get("rsi", np.nan))
-        anchor = self._micro_anchor_price(row)
-
-        if any(np.isnan(x) for x in (atr, adx, rsi)) or anchor is None or atr <= 0:
-            return None
-
-        atrp = (atr / c) * 100.0
-        if atrp > self.micro_atrp_max or adx > self.micro_adx_max:
-            return None
-
-        if not (self.micro_rsi_band_low <= rsi <= self.micro_rsi_band_high):
-            return None
-
-        ema200_4h = float(row.get("ema200_4h", np.nan))
-        if np.isfinite(ema200_4h):
-            same_side_up = c > ema200_4h
-            dev_sign = c - anchor
-            if (same_side_up and dev_sign > 0) or (not same_side_up and dev_sign < 0):
-                return None
-
-        dev = c - anchor
-        thr = self.micro_deviation_atr * atr
-
-        if dev <= -thr and not self.only_shorts:
-            return "LONG"
-        if dev >= +thr and not self.only_longs:
-            return "SHORT"
+        if self.grid_debug:
+            logging.debug(f"[GRID] NO SIGNAL | side_pref={side_pref} price={price:.2f} anchor={anchor:.2f} step={step:.2f} span={half_span:.2f} tol={tol_abs:.4f}")
         return None
 
     # ------------- Fuerza de señal -> target dinámico -------------
@@ -876,12 +854,6 @@ class RiskSizingBacktester:
             return 0.0
         qty = risk_usd / dollar_per_unit
         return max(qty, 0.0)
-
-    def _qty_fraction_equity(self, price: float, equity_now: float, frac: float, lev: float) -> float:
-        """Usa una fracción del equity como margen y aplica leverage."""
-        invested = max(equity_now * max(min(frac, 1.0), 0.0), 0.0)
-        notional = invested * lev
-        return max(notional / max(price, 1e-12), 0.0)
 
     def _qty_full_equity(self, price: float) -> float:
         # notional = equity * lev  => qty = notional / price
@@ -1028,51 +1000,31 @@ class RiskSizingBacktester:
                         leverage_for_this_trade = self.lev
                         self.risk_usd_trade = None
                         self.max_hold_bars = self.base_max_hold_bars
-                        sl_price: Optional[float] = None
-                        tp_price: Optional[float] = None
+                        # --- ÚNICO CAMINO (sin micro) ---
+                        target_pct = self._dynamic_target_pct(ind, None)
 
-                        margin_used: Optional[float] = None
+                        # Leverage dinámico en base a la PREVIA
+                        leverage_for_this_trade = self._get_dynamic_leverage(ind)
 
-                        if mode == "MICRO":
-                            leverage_for_this_trade = self.micro_lev
-                            qty = self._qty_fraction_equity(entry_fill, eq_now, self.micro_equity_frac, leverage_for_this_trade)
-
-                            margin_used = max(eq_now * max(min(self.micro_equity_frac, 1.0), 0.0), 0.0)
-
-                            tp_pct_micro = self.micro_target_on_invested / leverage_for_this_trade
-                            sl_pct_micro = tp_pct_micro * 0.75
-
-                            sl_price = entry_fill * (1 - sl_pct_micro) if side == "LONG" else entry_fill * (1 + sl_pct_micro)
-                            tp_price = entry_fill * (1 + tp_pct_micro) if side == "LONG" else entry_fill * (1 - tp_pct_micro)
-                            self.max_hold_bars = self.micro_max_hold_bars
-                            self.last_sl_multiplier = None
+                        if self.size_mode in ("full_equity", "fraction"):
+                            risk_frac = 1.0 if self.size_mode == "full_equity" else max(min(self.size_fraction, 1.0), 0.0)
+                            margin = max(self.balance * risk_frac, 0.0)
+                            notional = margin * leverage_for_this_trade
+                            qty = notional / max(entry_fill, 1e-12)
                         else:
-                            # Target dinámico en base a la PREVIA
-                            target_pct = self._dynamic_target_pct(ind, None)
-
-                            # Leverage dinámico en base a la PREVIA
-                            leverage_for_this_trade = self._get_dynamic_leverage(ind)
-
-                            if self.size_mode in ("full_equity", "fraction"):
-                                risk_frac = 1.0 if self.size_mode == "full_equity" else max(min(self.size_fraction, 1.0), 0.0)
-                                margin = max(self.balance * risk_frac, 0.0)
-                                margin_used = margin
-                                notional = margin * leverage_for_this_trade
-                                qty = notional / max(entry_fill, 1e-12)
+                            # modo risk: necesito SL provisional para sizing
+                            if self.use_atr and self.sl_atr_mult is not None:
+                                move = self.sl_atr_mult * atr_prev
+                                sl_tmp = entry_fill - move if side == "LONG" else entry_fill + move
+                            elif (not self.use_atr) and self.sl_pct is not None:
+                                sl_tmp = entry_fill * (1 - self.sl_pct) if side == "LONG" else entry_fill * (1 + self.sl_pct)
                             else:
-                                # modo risk: necesito SL provisional para sizing
-                                if self.use_atr and self.sl_atr_mult is not None:
-                                    move = self.sl_atr_mult * atr_prev
-                                    sl_tmp = entry_fill - move if side == "LONG" else entry_fill + move
-                                elif (not self.use_atr) and self.sl_pct is not None:
-                                    sl_tmp = entry_fill * (1 - self.sl_pct) if side == "LONG" else entry_fill * (1 + self.sl_pct)
-                                else:
-                                    sl_tmp = None
-                                if sl_tmp is None:
-                                    self.pending_order = None
-                                    continue
-                                risk_u = self._risk_usd(eq_now)
-                                qty = self._qty_from_risk(entry_fill, sl_tmp, risk_u)
+                                sl_tmp = None
+                            if sl_tmp is None:
+                                self.pending_order = None
+                                continue
+                            risk_u = self._risk_usd(eq_now)
+                            qty = self._qty_from_risk(entry_fill, sl_tmp, risk_u)
 
                         # Cap por liquidez
                         qty = self._cap_qty_by_liquidity(qty, entry_fill, row)
@@ -1094,14 +1046,10 @@ class RiskSizingBacktester:
                         self.entry_ts = ts
                         self._last_entry_ts = ts
                         self.entry_atr = atr_prev  # ATR de la PREVIA
-                        if mode == "MICRO":
-                            self.sl_price = sl_price
-                            self.tp_price = tp_price
-                        else:
-                            # SL/TP usando ATR de la PREVIA
-                            self.sl_price, self.tp_price = self._calc_sl_tp(
-                                side, entry_fill, atr_prev, eq_now, target_pct
-                            )
+                        # SL/TP usando ATR de la PREVIA
+                        self.sl_price, self.tp_price = self._calc_sl_tp(
+                            side, entry_fill, atr_prev, eq_now, target_pct
+                        )
                         self.bars_in_position = 0
                         self.eq_on_open = eq_now
                         self.current_mode = mode
@@ -1110,12 +1058,11 @@ class RiskSizingBacktester:
                         self.initial_margin = (self.qty * self.entry) / max(leverage_for_this_trade, 1e-12)
 
                         # R real en full_equity
-                        if mode != "MICRO" and self.size_mode in ("full_equity", "fraction"):
+                        if self.size_mode == "full_equity":
                             if self.sl_price is not None:
                                 self.risk_usd_trade = abs(self.entry - self.sl_price) * self.qty
                             else:
-                                base_equity = margin_used if margin_used is not None else self.balance
-                                self.risk_usd_trade = base_equity * (self.risk_pct if self.risk_pct is not None else 0.01)
+                                self.risk_usd_trade = self.balance * (self.risk_pct if self.risk_pct is not None else 0.01)
 
                         note_msg = (
                             f"lev={leverage_for_this_trade:.2f} "
@@ -1216,23 +1163,8 @@ class RiskSizingBacktester:
                         (sig_main == "LONG" and open_rate > self.funding_gate_frac)
                         or (sig_main == "SHORT" and open_rate < -self.funding_gate_frac)
                     ):
-                        if self.active and self.current_mode == "MICRO":
-                            exit_px = self._apply_slippage_close(c, self.side)
-                            self._close(ts, exit_px, note="PROMOTE_TO_TREND")
                         if self._last_entry_ts != ts:
                             self.pending_order = {"side": sig_main, "mode": "RISK"}
-
-            # --- Si NO hubo señal principal aprobada, consideramos MICRO ---
-            if (self.pending_order is None) and self.enable_micro:
-                msig = self._signal_micro(row)
-                if msig is not None:
-                    mrate = self._funding_rate_at(ts)
-                    if not (
-                        (msig == "LONG" and mrate > self.micro_funding_gate_frac)
-                        or (msig == "SHORT" and mrate < -self.micro_funding_gate_frac)
-                    ):
-                        if self._last_entry_ts != ts:
-                            self.pending_order = {"side": msig, "mode": "MICRO"}
 
         # Cierre al final
         if self.active:
@@ -1461,15 +1393,6 @@ PRESETS = {
         "max_hold_bars": 8,
         "daily_stop_R": 2.0,
         "emerg_trade_stop_R": 1.8,
-        "enable_micro": True,
-        "micro_equity_frac": 0.10,
-        "micro_lev": 3.0,
-        "micro_target_on_invested": 0.02,
-        "micro_atrp_max": 0.30,
-        "micro_adx_max": 18.0,
-        "micro_deviation_atr": 0.5,
-        "micro_max_hold_bars": 6,
-        "micro_funding_gate_bps": 120,
     },
     "agresivo": {
         "entry_mode": "pullback_grid",
@@ -1491,15 +1414,6 @@ PRESETS = {
         "max_hold_bars": 8,
         "daily_stop_R": 2.2,
         "emerg_trade_stop_R": 2.0,
-        "enable_micro": True,
-        "micro_equity_frac": 0.10,
-        "micro_lev": 3.0,
-        "micro_target_on_invested": 0.02,
-        "micro_atrp_max": 0.30,
-        "micro_adx_max": 18.0,
-        "micro_deviation_atr": 0.5,
-        "micro_max_hold_bars": 6,
-        "micro_funding_gate_bps": 120,
     }
 }
 
@@ -1604,20 +1518,6 @@ def main():
     ap.add_argument("--funding-interval-hours", type=int, default=8, help="Intervalo de funding (8h)")
     ap.add_argument("--funding-gate-bps", type=int, default=80, help="Evitar abrir si |rate| > gate (bps por 8h)")
 
-    # Micro trading
-    ap.add_argument("--enable-micro", action="store_true", help="Activa estrategia micro en rango planchado")
-    ap.add_argument("--micro-equity-frac", type=float, default=0.05)
-    ap.add_argument("--micro-lev", type=float, default=3.0)
-    ap.add_argument("--micro-anchor", type=str, default="ema50", choices=["ema30", "ema50"])
-    ap.add_argument("--micro-rsi-band-low", type=float, default=45.0)
-    ap.add_argument("--micro-rsi-band-high", type=float, default=55.0)
-    ap.add_argument("--micro-target-on-invested", type=float, default=0.012)
-    ap.add_argument("--micro-atrp-max", type=float, default=0.25)
-    ap.add_argument("--micro-adx-max", type=float, default=15.0)
-    ap.add_argument("--micro-deviation-atr", type=float, default=0.40)
-    ap.add_argument("--micro-max-hold-bars", type=int, default=4)
-    ap.add_argument("--micro-funding-gate-bps", type=int, default=120)
-
     # Filtros tendencia 4h + confirmación 1h
     ap.add_argument("--trend-filter", type=str, default="ema200_4h", choices=["none", "ema200_4h"], help="Filtro de tendencia 4h")
     ap.add_argument("--rsi4h-gate", type=float, default=52.0, help="RSI 4h mínimo para LONG y (100-valor) para SHORT")
@@ -1660,6 +1560,11 @@ def main():
         default=1.0,
         help="Sesgo del anchor hacia el precio: anchor'=price + k*(anchor-price). Usa 0.5 para mover el anchor 50% hacia price.",
     )
+    # Grid tolerance & snap
+    ap.add_argument("--grid-step-tolerance-bps", type=float, default=30.0, help="Tolerancia al múltiplo de step (en bps del precio). Ej 30 = 0.30%")
+    ap.add_argument("--min-abs-grid-tolerance", type=float, default=0.0, help="Piso absoluto de tolerancia (USD) para validar el step.")
+    ap.add_argument("--grid-snap-to-nearest", action="store_true", help="Activa 'snap-to-nearest' del nivel de grid más cercano.")
+    ap.add_argument("--grid-debug", action="store_true", help="Logs DEBUG del grid (distancias, step, span, tol).")
 
     # Fees por lado y slippage
     ap.add_argument("--taker-fee", type=float, default=None, help="Fee taker por lado (ej 0.0006)")
@@ -1713,18 +1618,6 @@ def main():
         funding_default=args.funding_default,
         funding_interval_hours=args.funding_interval_hours,
         funding_gate_bps=args.funding_gate_bps,
-        enable_micro=bool(args.enable_micro),
-        micro_equity_frac=args.micro_equity_frac,
-        micro_lev=args.micro_lev,
-        micro_anchor=args.micro_anchor,
-        micro_rsi_band_low=args.micro_rsi_band_low,
-        micro_rsi_band_high=args.micro_rsi_band_high,
-        micro_target_on_invested=args.micro_target_on_invested,
-        micro_atrp_max=args.micro_atrp_max,
-        micro_adx_max=args.micro_adx_max,
-        micro_deviation_atr=args.micro_deviation_atr,
-        micro_max_hold_bars=args.micro_max_hold_bars,
-        micro_funding_gate_bps=args.micro_funding_gate_bps,
         trend_filter=args.trend_filter,
         rsi4h_gate=args.rsi4h_gate,
         ema200_1h_confirm=bool(args.ema200_1h_confirm),
@@ -1740,6 +1633,10 @@ def main():
         grid_anchor=args.grid_anchor,
         grid_side=args.grid_side,
         anchor_bias_frac=args.anchor_bias_frac,
+        grid_step_tolerance_bps=args.grid_step_tolerance_bps,
+        min_abs_grid_tolerance=args.min_abs_grid_tolerance,
+        grid_snap_to_nearest=bool(args.grid_snap_to_nearest),
+        grid_debug=bool(args.grid_debug),
         tag=(args.tag or "").strip(),
         shock_move_threshold_pct=args.shock_move_threshold_pct,
         shock_pause_hours=args.shock_pause_hours,
