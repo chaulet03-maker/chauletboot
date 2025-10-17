@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 Backtester con:
-- Position sizing: modo "risk" (por R) o "full_equity" (usa todo el equity como margen * lev)
+- Position sizing: modo "risk" (por R), "full_equity" (usa todo el equity como margen * lev) o "fraction" (usa fracción del equity)
 - TP / SL reales (por % o ATR)
 - TP objetivo como % del equity al abrir (fijo) o dinámico en rango [min,max] según fuerza de señal
 - Filtros de tendencia (EMA200 4h + confirmación 1h), gate de RSI 4h
@@ -242,7 +242,8 @@ class RiskSizingBacktester:
         tp_atr_mult: Optional[float] = None,
         max_hold_bars: int = 24,
         # Position sizing
-        size_mode: str = "risk",  # "risk" | "full_equity"
+        size_mode: str = "risk",  # "risk" | "full_equity" | "fraction"
+        size_fraction: float = 1.0,
         risk_pct: Optional[float] = 0.01,
         risk_usd: Optional[float] = None,
         # TP como % de equity
@@ -357,6 +358,10 @@ class RiskSizingBacktester:
         # Margen inicial de la posición (para safety)
         self.initial_margin: Optional[float] = None
 
+        # Guardas de control operacional
+        self._last_trade_qty: float = 0.0
+        self._last_entry_ts: Optional[pd.Timestamp] = None
+
         # TP/SL
         self.use_atr = bool(use_atr)
         self.sl_pct = sl_pct
@@ -367,7 +372,10 @@ class RiskSizingBacktester:
         self.base_max_hold_bars = int(max_hold_bars)
 
         # Sizing
+        if size_mode not in ("risk", "full_equity", "fraction"):
+            raise ValueError("size_mode debe ser 'risk', 'full_equity' o 'fraction'")
         self.size_mode = size_mode
+        self.size_fraction = max(min(float(size_fraction), 1.0), 0.0)
         self.risk_pct = risk_pct
         self.risk_usd_fixed = risk_usd
 
@@ -1022,9 +1030,13 @@ class RiskSizingBacktester:
                         sl_price: Optional[float] = None
                         tp_price: Optional[float] = None
 
+                        margin_used: Optional[float] = None
+
                         if mode == "MICRO":
                             leverage_for_this_trade = self.micro_lev
                             qty = self._qty_fraction_equity(entry_fill, eq_now, self.micro_equity_frac, leverage_for_this_trade)
+
+                            margin_used = max(eq_now * max(min(self.micro_equity_frac, 1.0), 0.0), 0.0)
 
                             tp_pct_micro = self.micro_target_on_invested / leverage_for_this_trade
                             sl_pct_micro = tp_pct_micro * 0.75
@@ -1036,9 +1048,15 @@ class RiskSizingBacktester:
                         else:
                             target_pct = self._dynamic_target_pct(row, prev)
                             leverage_for_this_trade = self.lev
-                            if self.size_mode == "full_equity":
-                                leverage_for_this_trade = self._get_dynamic_leverage(row)
-                                notional = self.balance * leverage_for_this_trade
+                            if self.size_mode in ("full_equity", "fraction"):
+                                if self.size_mode == "full_equity":
+                                    leverage_for_this_trade = self._get_dynamic_leverage(row)
+                                    risk_frac = 1.0
+                                else:
+                                    risk_frac = max(min(self.size_fraction, 1.0), 0.0)
+                                margin = max(self.balance * risk_frac, 0.0)
+                                margin_used = margin
+                                notional = margin * leverage_for_this_trade
                                 qty = notional / max(entry_fill, 1e-12)
                             else:
                                 # modo risk: necesito SL provisional para sizing
@@ -1057,6 +1075,7 @@ class RiskSizingBacktester:
 
                         # Cap por liquidez
                         qty = self._cap_qty_by_liquidity(qty, entry_fill, row)
+                        self._last_trade_qty = qty
                         self.qty = qty
                         if self.qty <= 0:
                             self.pending_order = None
@@ -1072,6 +1091,7 @@ class RiskSizingBacktester:
                         self.side = side
                         self.entry = entry_fill
                         self.entry_ts = ts
+                        self._last_entry_ts = ts
                         self.entry_atr = atr
                         if mode == "MICRO":
                             self.sl_price = sl_price
@@ -1088,11 +1108,12 @@ class RiskSizingBacktester:
                         self.initial_margin = (self.qty * self.entry) / max(leverage_for_this_trade, 1e-12)
 
                         # R real en full_equity
-                        if mode != "MICRO" and self.size_mode == "full_equity":
+                        if mode != "MICRO" and self.size_mode in ("full_equity", "fraction"):
                             if self.sl_price is not None:
                                 self.risk_usd_trade = abs(self.entry - self.sl_price) * self.qty
                             else:
-                                self.risk_usd_trade = self.balance * (self.risk_pct if self.risk_pct is not None else 0.01)
+                                base_equity = margin_used if margin_used is not None else self.balance
+                                self.risk_usd_trade = base_equity * (self.risk_pct if self.risk_pct is not None else 0.01)
 
                         note_msg = (
                             f"lev={leverage_for_this_trade:.2f} "
@@ -1188,7 +1209,8 @@ class RiskSizingBacktester:
                         if self.active and self.current_mode == "MICRO":
                             exit_px = self._apply_slippage_close(c, self.side)
                             self._close(ts, exit_px, note="PROMOTE_TO_TREND")
-                        self.pending_order = {"side": sig_main, "mode": "RISK"}
+                        if self._last_entry_ts != ts:
+                            self.pending_order = {"side": sig_main, "mode": "RISK"}
 
             # --- Si NO hubo señal principal aprobada, consideramos MICRO ---
             if (self.pending_order is None) and self.enable_micro:
@@ -1199,7 +1221,8 @@ class RiskSizingBacktester:
                         (msig == "LONG" and mrate > self.micro_funding_gate_frac)
                         or (msig == "SHORT" and mrate < -self.micro_funding_gate_frac)
                     ):
-                        self.pending_order = {"side": msig, "mode": "MICRO"}
+                        if self._last_entry_ts != ts:
+                            self.pending_order = {"side": msig, "mode": "MICRO"}
 
         # Cierre al final
         if self.active:
@@ -1325,6 +1348,7 @@ class RiskSizingBacktester:
         self.entry_atr = None
         self.current_mode = None
         self.max_hold_bars = self.base_max_hold_bars
+        self._last_trade_qty = 0.0
 
     # ------------- Reporte -------------
     def _suffix(self) -> str:
@@ -1554,7 +1578,8 @@ def main():
     ap.add_argument("--max-hold-bars", type=int, default=24, help="Time stop (velas 1h)")
 
     # Position sizing
-    ap.add_argument("--size-mode", type=str, default="risk", choices=["risk", "full_equity"], help="risk = por R; full_equity = usa todo el equity")
+    ap.add_argument("--size-mode", type=str, default="risk", choices=["risk", "full_equity", "fraction"], help="risk = por R; full_equity = usa todo el equity; fraction = usa fracción del equity")
+    ap.add_argument("--size-fraction", type=float, default=1.0, help="Fracción del equity usada como margen (modo fraction)")
     ap.add_argument("--risk-pct", type=float, default=0.01, help="Riesgo por trade como % del balance (modo risk)")
     ap.add_argument("--risk-usd", type=float, default=None, help="Riesgo fijo por trade en USD (anula risk-pct)")
 
@@ -1668,6 +1693,7 @@ def main():
         tp_atr_mult=args.tp_atr_mult,
         max_hold_bars=args.max_hold_bars,
         size_mode=args.size_mode,
+        size_fraction=args.size_fraction,
         risk_pct=args.risk_pct,
         risk_usd=args.risk_usd,
         target_eq_pnl_pct=args.target_eq_pnl_pct,
