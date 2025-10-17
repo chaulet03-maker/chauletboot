@@ -20,6 +20,8 @@ import os
 import json
 import logging
 import sqlite3
+from datetime import datetime, timezone, timedelta
+from math import sqrt
 from typing import Optional, Tuple, List, Dict
 
 import numpy as np
@@ -31,6 +33,59 @@ from ta.volatility import AverageTrueRange
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 np.random.seed(42)
+
+# ============================
+# Predicción próximo OPEN 4H (sidecar)
+# ============================
+# Activá/desactivá la evaluación del pronóstico en backtest
+PRED_EVAL_ENABLE = True
+# Ventana para estimar volatilidad (en cierres 1h ya disponibles)
+PRED_VOL_WINDOW_1H = 200            # >= 30 recomendado
+# Cuándo tomar snapshot: si falta <= X minutos para el próximo boundary 4H
+PRED_SNAPSHOT_MAX_MIN = 60          # como estamos en 1h, 60 tiene sentido
+
+def _next_4h_boundary_utc(ts: datetime) -> datetime:
+    """Próximo múltiplo de 4h (00/04/08/12/16/20) desde ts (UTC)."""
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+    h = ts.hour
+    next_block = ((h // 4) + 1) * 4
+    add_h = (next_block - h) % 24
+    b = ts.replace(minute=0, second=0, microsecond=0) + timedelta(hours=add_h)
+    if b <= ts.replace(second=0, microsecond=0):
+        b += timedelta(hours=4)
+    return b
+
+def _sigma_from_1h(closes_1h: np.ndarray) -> float:
+    """Desv. estándar poblacional de retornos 1h (fracción)."""
+    if closes_1h is None or len(closes_1h) < 30:
+        return 0.0
+    rets = np.diff(closes_1h) / closes_1h[:-1]
+    if len(rets) < 5:
+        return 0.0
+    return float(np.std(rets, ddof=0))
+
+def forecast_next_open_4h_from_1h(mark_price: float,
+                                  recent_1h_closes: np.ndarray,
+                                  horizon_h: float,
+                                  drift_bias_per_hour: float = 0.0):
+    """
+    Punto central: mark * (1 + drift * h)
+    Bandas: sigma_h = sigma_1h * sqrt(h)  → 68% ±1σ, 95% ±1.96σ
+    Devuelve dict con: point, b68=(lo,hi), b95=(lo,hi), h=horizon_h
+    """
+    if not np.isfinite(mark_price) or mark_price <= 0 or horizon_h <= 0:
+        return {"point": mark_price, "b68": (mark_price, mark_price),
+                "b95": (mark_price, mark_price), "h": max(0.0, float(horizon_h))}
+    sigma_1h = _sigma_from_1h(recent_1h_closes)
+    point = mark_price * (1.0 + drift_bias_per_hour * horizon_h)
+    if sigma_1h <= 0:
+        return {"point": point, "b68": (point, point), "b95": (point, point), "h": float(horizon_h)}
+    sigma_h = sigma_1h * sqrt(horizon_h)
+    b68 = (point * (1 - 1.0 * sigma_h),  point * (1 + 1.0 * sigma_h))
+    b95 = (point * (1 - 1.96 * sigma_h), point * (1 + 1.96 * sigma_h))
+    return {"point": float(point), "b68": (float(b68[0]), float(b68[1])),
+            "b95": (float(b95[0]), float(b95[1])), "h": float(horizon_h)}
 
 # ============================
 # Utilidades de carga / normalización OHLCV
@@ -273,6 +328,10 @@ class RiskSizingBacktester:
         self.rsi_gate = float(rsi_gate)
         self.only_longs = bool(only_longs)
         self.only_shorts = bool(only_shorts)
+
+        # ---- NUEVO: buffers de evaluación del pronóstico OPEN 4H ----
+        self.pred_buffer = {}
+        self.pred_stats = {"n": 0, "hit68": 0, "hit95": 0, "mae_abs": 0.0, "mae_pct": 0.0}
 
         # Shock-pause config y estado
         self.shock_move_threshold_pct = float(shock_move_threshold_pct)
@@ -875,6 +934,47 @@ class RiskSizingBacktester:
             prev = df.iloc[i - 1]
             ts = pd.to_datetime(row["timestamp"], utc=True)
             o = float(row["open"]); h = float(row["high"]); l = float(row["low"]); c = float(row["close"])
+            # ===== Predicción próximo OPEN 4H (sidecar causal) =====
+            if PRED_EVAL_ENABLE:
+                # 1) boundary y horizonte restante (en horas) desde este ts (1h)
+                ts_dt = ts.to_pydatetime()
+                boundary = _next_4h_boundary_utc(ts_dt)
+                horizon_h = max(0.0, (boundary - ts_dt).total_seconds() / 3600.0)
+                horizon_min = int((boundary - ts_dt).total_seconds() // 60)
+                # 2) si falta <= X minutos, tomamos snapshot con info disponible
+                if 0 < horizon_min <= PRED_SNAPSHOT_MAX_MIN:
+                    # recent 1h closes CAUSALES: hasta el índice i (incluye c)
+                    start_idx = max(0, i - PRED_VOL_WINDOW_1H + 1)
+                    recent_1h = df["close"].iloc[start_idx:i+1].astype(float).to_numpy()
+                    # punto central con deriva neutra (0.0). Si querés, podés sesgar por side_pref.
+                    fb = forecast_next_open_4h_from_1h(mark_price=c,
+                                                       recent_1h_closes=recent_1h,
+                                                       horizon_h=horizon_h,
+                                                       drift_bias_per_hour=0.0)
+                    self.pred_buffer[boundary] = {
+                        "t0": ts_dt,
+                        "point": fb["point"],
+                        "b68": fb["b68"],
+                        "b95": fb["b95"],
+                    }
+                # 3) si ESTE ts es boundary 4H exacto, evaluamos contra el open real 4H
+                if ts_dt.minute == 0 and ts_dt.second == 0 and (ts_dt.hour % 4 == 0):
+                    # En 1h, el OPEN de la 4H que comienza ahora es el OPEN de esta barra (o)
+                    open_real_4h = o
+                    snap = self.pred_buffer.pop(ts_dt, None)
+                    if snap is not None and open_real_4h and np.isfinite(open_real_4h):
+                        self.pred_stats["n"] += 1
+                        pt = float(snap["point"])
+                        l68, h68 = snap["b68"]
+                        l95, h95 = snap["b95"]
+                        err_abs = abs(open_real_4h - pt)
+                        err_pct = err_abs / open_real_4h
+                        self.pred_stats["mae_abs"] += err_abs
+                        self.pred_stats["mae_pct"] += err_pct
+                        if l68 <= open_real_4h <= h68:
+                            self.pred_stats["hit68"] += 1
+                        if l95 <= open_real_4h <= h95:
+                            self.pred_stats["hit95"] += 1
 
             # Actualizar métricas de shock de esta barra
             chg24 = float(row.get("chg_24h_pct", np.nan))
@@ -1113,6 +1213,22 @@ class RiskSizingBacktester:
                 self._close(ts, exit_px, note="END")
 
         self._report()
+
+        # Resumen de evaluación del pronóstico OPEN 4H
+        if PRED_EVAL_ENABLE and self.pred_stats["n"] > 0:
+            n = self.pred_stats["n"]
+            hit68 = self.pred_stats["hit68"] / n
+            hit95 = self.pred_stats["hit95"] / n
+            mae_abs = self.pred_stats["mae_abs"] / n
+            mae_pct = (self.pred_stats["mae_pct"] / n) * 100.0
+            logging.info(
+                "PRED 4H next-open eval: n=%d | hit68=%.2f | hit95=%.2f | MAE=%.2f (%.2f%%)",
+                n,
+                hit68,
+                hit95,
+                mae_abs,
+                mae_pct,
+            )
 
     # ------------- Cerrar posición -------------
     def _close(self, ts: pd.Timestamp, price: float, note: str):
