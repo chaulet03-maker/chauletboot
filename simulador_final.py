@@ -1018,8 +1018,9 @@ class RiskSizingBacktester:
                         entry_raw = o
                         entry_fill = self._apply_slippage_open(entry_raw, side)
 
-                        # ATR actual para SL/TP
-                        atr = float(row["atr"]) if not np.isnan(row["atr"]) else 0.0
+                        # === USAR INDICADORES DE LA BARRA PREVIA (ANTI LOOK-AHEAD) ===
+                        ind = prev
+                        atr_prev = float(ind["atr"]) if not np.isnan(ind["atr"]) else 0.0
                         self.last_sl_regime = None
                         self.last_sl_multiplier = self.sl_atr_mult if self.use_atr else None
 
@@ -1046,14 +1047,14 @@ class RiskSizingBacktester:
                             self.max_hold_bars = self.micro_max_hold_bars
                             self.last_sl_multiplier = None
                         else:
-                            target_pct = self._dynamic_target_pct(row, prev)
-                            leverage_for_this_trade = self.lev
+                            # Target dinámico en base a la PREVIA
+                            target_pct = self._dynamic_target_pct(ind, None)
+
+                            # Leverage dinámico en base a la PREVIA
+                            leverage_for_this_trade = self._get_dynamic_leverage(ind)
+
                             if self.size_mode in ("full_equity", "fraction"):
-                                if self.size_mode == "full_equity":
-                                    leverage_for_this_trade = self._get_dynamic_leverage(row)
-                                    risk_frac = 1.0
-                                else:
-                                    risk_frac = max(min(self.size_fraction, 1.0), 0.0)
+                                risk_frac = 1.0 if self.size_mode == "full_equity" else max(min(self.size_fraction, 1.0), 0.0)
                                 margin = max(self.balance * risk_frac, 0.0)
                                 margin_used = margin
                                 notional = margin * leverage_for_this_trade
@@ -1061,7 +1062,7 @@ class RiskSizingBacktester:
                             else:
                                 # modo risk: necesito SL provisional para sizing
                                 if self.use_atr and self.sl_atr_mult is not None:
-                                    move = self.sl_atr_mult * atr
+                                    move = self.sl_atr_mult * atr_prev
                                     sl_tmp = entry_fill - move if side == "LONG" else entry_fill + move
                                 elif (not self.use_atr) and self.sl_pct is not None:
                                     sl_tmp = entry_fill * (1 - self.sl_pct) if side == "LONG" else entry_fill * (1 + self.sl_pct)
@@ -1092,13 +1093,14 @@ class RiskSizingBacktester:
                         self.entry = entry_fill
                         self.entry_ts = ts
                         self._last_entry_ts = ts
-                        self.entry_atr = atr
+                        self.entry_atr = atr_prev  # ATR de la PREVIA
                         if mode == "MICRO":
                             self.sl_price = sl_price
                             self.tp_price = tp_price
                         else:
+                            # SL/TP usando ATR de la PREVIA
                             self.sl_price, self.tp_price = self._calc_sl_tp(
-                                side, entry_fill, atr, eq_now, target_pct
+                                side, entry_fill, atr_prev, eq_now, target_pct
                             )
                         self.bars_in_position = 0
                         self.eq_on_open = eq_now
@@ -1154,6 +1156,14 @@ class RiskSizingBacktester:
                             fill = self._apply_slippage_close(fill, self.side)
                             self._close(ts, fill, note="MARGIN_SAFETY")
                             continue
+
+                # --- Stop de emergencia en R (pérdida latente) ---
+                if self.emerg_trade_stop_R is not None and self.risk_usd_trade and self.risk_usd_trade > 0:
+                    unreal = (c - self.entry) * self.qty if self.side == "LONG" else (self.entry - c) * self.qty
+                    if unreal <= -float(self.emerg_trade_stop_R) * float(self.risk_usd_trade):
+                        exit_px = self._apply_slippage_close(c, self.side)
+                        self._close(ts, exit_px, note="EMERG_STOP_R")
+                        continue
 
                 # Trailing a BE (igual que antes, usando 'c' para medir progreso)
                 if self.trail_to_be and self.tp_price is not None and self.sl_price is not None and self.entry is not None:
@@ -1269,8 +1279,8 @@ class RiskSizingBacktester:
         notional_close = self.qty * price
         mode = self.current_mode or "RISK"
 
-        # Fee de cierre: maker para TP (limit), taker para el resto (market)
-        fee_rate = self.maker_fee if note == "TP" else self.taker_fee
+        # Fee de cierre: siempre taker (conservador)
+        fee_rate = self.taker_fee
         fee_close = self._fee_cost(notional_close, fee_rate)
         trade_pnl = pnl_gross - fee_close
         self.balance += trade_pnl
