@@ -34,6 +34,149 @@ from ta.volatility import AverageTrueRange
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 np.random.seed(42)
 
+# --- [GRID TUNING – PATCH 0001] ---------------------------------------------
+# Configuraciones activables por ENV (dejan TODO igual si no las usás)
+# Tolerancia para calzar en el escalón de grid (en basis points sobre el precio)
+# Ej: 50 = 0.50%. Default conservador: 30 bps (0.30%) si no hay ENV.
+GRID_STEP_TOLERANCE_BPS = int(os.getenv("GRID_STEP_TOLERANCE_BPS", "30"))
+
+# Si True, aproxima el nivel efectivo al escalón de grid más cercano (snap-to-grid)
+GRID_SNAP_TO_NEAREST = bool(int(os.getenv("GRID_SNAP_TO_NEAREST", "0")))
+
+# Tolerancia mínima absoluta opcional (USD). Útil en precios muy bajos/altos.
+GRID_MIN_ABS_TOL = float(os.getenv("GRID_MIN_ABS_TOL", "0"))
+
+
+def _diag_log(logger, **kv):
+    """Log compacto de diagnóstico para entender por qué no dispara."""
+    if logger:
+        try:
+            parts = [f"{k}={v}" for k, v in kv.items()]
+            logger.debug("GRID_DIAG " + " ".join(parts))
+        except Exception:
+            pass
+
+
+def within_step_tolerance(
+    anchor: float,
+    price: float,
+    step: float,
+    price_ref: float,
+    tol_bps: int,
+    min_abs_tol: float = 0.0,
+    logger=None,
+) -> bool:
+    """
+    Verifica si |anchor - price| cae en un múltiplo de 'step' dentro de una tolerancia.
+    Tolerancia = max( (tol_bps/10000)*price_ref , min_abs_tol )
+    """
+
+    if step <= 0:
+        return False
+
+    dist = abs(anchor - price)
+    rem = dist % step
+    tol_abs = max((tol_bps / 10000.0) * max(price_ref, 1.0), float(min_abs_tol or 0.0))
+    ok = (rem <= tol_abs) or ((step - rem) <= tol_abs)
+    _diag_log(
+        logger,
+        anchor=round(anchor, 2),
+        price=round(price, 2),
+        step=round(step, 2),
+        dist=round(dist, 2),
+        rem=round(rem, 4),
+        tol_abs=round(tol_abs, 4),
+        ok_step=ok,
+    )
+    return ok
+
+
+def snap_to_grid(anchor: float, price: float, step: float) -> float:
+    """Acerca el precio al escalón más cercano de la grilla medida desde anchor."""
+
+    if step <= 0:
+        return price
+
+    idx = round((anchor - price) / step)
+    return anchor - idx * step
+
+
+# --- [END PATCH 0001] --------------------------------------------------------
+
+# --- [DIRECTION FLEX – PATCH 0003] ------------------------------------------
+# Activación y umbrales (opt-in)
+DIR_FLEX_ENABLE = bool(int(os.getenv("DIR_FLEX_ENABLE", "1")))
+DIR_FLEX_RSI_HIGH = float(os.getenv("DIR_FLEX_RSI_HIGH", "52"))  # sobre esto, apertura a LONG
+DIR_FLEX_RSI_LOW = float(os.getenv("DIR_FLEX_RSI_LOW", "48"))  # bajo esto, apertura a SHORT
+DIR_FLEX_ADX_MIN = float(os.getenv("DIR_FLEX_ADX_MIN", "20"))  # tendencia mínima
+
+
+def maybe_relax_direction(
+    side_pref: Optional[str],
+    long_allowed: bool,
+    short_allowed: bool,
+    rsi4h: float,
+    adx: float,
+    price: float,
+    grid_LONG: Tuple[Optional[float], Optional[float]],
+    grid_SHORT: Tuple[Optional[float], Optional[float]],
+    logger=None,
+):
+    """
+    Si el mercado muestra señales de giro **fuertes**, abrimos la puerta a la
+    dirección opuesta (sólo en simulador), sin obligar la entrada.
+    """
+
+    if not DIR_FLEX_ENABLE:
+        return side_pref, long_allowed, short_allowed
+
+    try:
+        if not np.isfinite(adx) or not np.isfinite(rsi4h) or not np.isfinite(price):
+            return side_pref, long_allowed, short_allowed
+
+        if adx >= DIR_FLEX_ADX_MIN:
+            long_zone_low, long_zone_high = grid_LONG if grid_LONG else (None, None)
+            short_zone_low, short_zone_high = grid_SHORT if grid_SHORT else (None, None)
+
+            if (
+                side_pref == "SHORT"
+                and (rsi4h >= DIR_FLEX_RSI_HIGH)
+                and long_zone_low is not None
+                and long_zone_high is not None
+                and long_zone_low <= price <= long_zone_high
+            ):
+                long_allowed = True
+                _diag_log(
+                    logger,
+                    flex="enable_long",
+                    rsi4h=round(rsi4h, 2),
+                    adx=round(adx, 2),
+                    price=round(price, 2),
+                )
+
+            if (
+                side_pref == "LONG"
+                and (rsi4h <= DIR_FLEX_RSI_LOW)
+                and short_zone_low is not None
+                and short_zone_high is not None
+                and short_zone_low <= price <= short_zone_high
+            ):
+                short_allowed = True
+                _diag_log(
+                    logger,
+                    flex="enable_short",
+                    rsi4h=round(rsi4h, 2),
+                    adx=round(adx, 2),
+                    price=round(price, 2),
+                )
+    except Exception:
+        pass
+
+    return side_pref, long_allowed, short_allowed
+
+
+# --- [END PATCH 0003] --------------------------------------------------------
+
 # ============================
 # Predicción próximo OPEN 4H (sidecar)
 # ============================
@@ -752,12 +895,59 @@ class RiskSizingBacktester:
 
         step = self.grid_step_atr * atr
         half_span = self.grid_span_atr * atr
-        if side_pref == "LONG":
-            if (price < anchor) and (anchor - price >= step) and (anchor - price <= half_span):
-                return "LONG"
-        else:
-            if (price > anchor) and (price - anchor >= step) and (price - anchor <= half_span):
-                return "SHORT"
+
+        if step <= 0 or half_span <= 0:
+            return None
+
+        logger = logging.getLogger(__name__)
+
+        long_zone = (anchor - half_span, anchor - step)
+        short_zone = (anchor + step, anchor + half_span)
+
+        long_allowed = side_pref == "LONG"
+        short_allowed = side_pref == "SHORT"
+
+        side_pref, long_allowed, short_allowed = maybe_relax_direction(
+            side_pref=side_pref,
+            long_allowed=long_allowed,
+            short_allowed=short_allowed,
+            rsi4h=float(row.get("rsi4h", np.nan)),
+            adx=float(row.get("adx", np.nan)),
+            price=price,
+            grid_LONG=long_zone,
+            grid_SHORT=short_zone,
+            logger=logger,
+        )
+
+        if long_allowed and (price < anchor):
+            dist = anchor - price
+            if dist >= step and dist <= half_span:
+                price_eff = snap_to_grid(anchor, price, step) if GRID_SNAP_TO_NEAREST else price
+                if within_step_tolerance(
+                    anchor=anchor,
+                    price=price_eff,
+                    step=step,
+                    price_ref=price,
+                    tol_bps=GRID_STEP_TOLERANCE_BPS,
+                    min_abs_tol=GRID_MIN_ABS_TOL,
+                    logger=logger,
+                ):
+                    return "LONG"
+
+        if short_allowed and (price > anchor):
+            dist = price - anchor
+            if dist >= step and dist <= half_span:
+                price_eff = snap_to_grid(anchor, price, step) if GRID_SNAP_TO_NEAREST else price
+                if within_step_tolerance(
+                    anchor=anchor,
+                    price=price_eff,
+                    step=step,
+                    price_ref=price,
+                    tol_bps=GRID_STEP_TOLERANCE_BPS,
+                    min_abs_tol=GRID_MIN_ABS_TOL,
+                    logger=logger,
+                ):
+                    return "SHORT"
         return None
 
     def _signal_micro(self, row: pd.Series) -> Optional[str]:
