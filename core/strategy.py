@@ -77,20 +77,20 @@ class Strategy:
         return (entry_price + move) if side == "LONG" else (entry_price - move)
 
     # Apalancamiento dinámico por ADX (x5 base / x10 fuerte)
-    def dynamic_leverage(self, last_candle: pd.Series) -> float:
+    def dynamic_leverage(self, last_candle: pd.Series) -> int:
         adx_raw = last_candle.get("adx", np.nan)
         adx = float(adx_raw) if np.isfinite(adx_raw) else np.nan
         thr = float(self.config.get("adx_strong_threshold", 25.0))
-        weak = float(
+        weak = float(   # se leen como float por config, pero...
             self.config.get(
                 "lev_weak",
-                self.config.get("leverage_base", 5.0),
+                self.config.get("leverage_base", 5),
             )
         )
         strong = float(
             self.config.get(
                 "lev_strong",
-                self.config.get("leverage_strong", 10.0),
+                self.config.get("leverage_strong", 10),
             )
         )
         adx_for_calc: float | None
@@ -98,7 +98,7 @@ class Strategy:
             adx_for_calc = float(adx)
         else:
             adx_for_calc = None
-        return float(dyn_leverage_from_adx(adx_for_calc, weak_thr=thr, strong_x=strong, weak_x=weak))
+        return int(dyn_leverage_from_adx(adx_for_calc, weak_thr=thr, strong_x=int(strong), weak_x=int(weak)))
 
     # Filtros auxiliares
     def _passes_filters(self, row: pd.Series, ts: pd.Timestamp, side: str) -> bool:
