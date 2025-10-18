@@ -124,9 +124,11 @@ class Exchange:
             if isinstance(user_options, Mapping):
                 options.update(user_options)
 
-        options.setdefault("defaultType", "future")
-        if self._hedge_mode:
-            options["hedgeMode"] = True
+        default_type = str(options.get("defaultType") or options.get("default_type") or "").lower()
+        if default_type not in {"future", "swap"}:
+            default_type = "future"
+        options["defaultType"] = default_type
+        options["hedgeMode"] = bool(self._hedge_mode)
 
         params["options"] = options
 
@@ -197,6 +199,52 @@ class Exchange:
             public_client = self._new_usdm_client()
             self.public_client = public_client
             return public_client
+
+    @property
+    def hedge_mode(self) -> bool:
+        """Indica si el exchange opera en modo hedge (dual side)."""
+
+        return bool(self._hedge_mode)
+
+    async def set_position_mode(self, one_way: Optional[bool] = None) -> None:
+        """Configura el modo de posición (one-way o hedge) en el exchange."""
+
+        if one_way is None:
+            one_way = not self.hedge_mode
+
+        if self.client is None:
+            return
+
+        if S.PAPER:
+            logger.debug(
+                "PAPER: omitiendo set_position_mode(one_way=%s) (no aplica en paper)",
+                one_way,
+            )
+            return
+
+        await self._ensure_auth_for_private()
+
+        hedged = not bool(one_way)
+        try:
+            client = self.client
+            if hasattr(client, "set_position_mode"):
+                await asyncio.to_thread(client.set_position_mode, hedged)
+                return
+            if hasattr(client, "setPositionMode"):
+                await asyncio.to_thread(client.setPositionMode, hedged)
+                return
+
+            request = {"dualSidePosition": "true" if hedged else "false"}
+            rest_method = getattr(client, "fapiPrivate_post_positionside_dual", None)
+            if rest_method is None:
+                rest_method = getattr(client, "fapiPrivatePostPositionSideDual", None)
+            if rest_method is None:
+                raise AttributeError("Método PositionSideDual no disponible en el cliente CCXT")
+            await asyncio.to_thread(rest_method, request)
+        except Exception:
+            logger.warning(
+                "set_position_mode(one_way=%s) falló", one_way, exc_info=True
+            )
 
     async def _ensure_auth_for_private(self):
         if S.PAPER:
