@@ -2,6 +2,9 @@ import asyncio, logging, hashlib
 from dataclasses import dataclass
 from time import time as _t
 
+from .order_store import OrderStore
+from .side_map import normalize_side
+
 @dataclass
 class Fill:
     price: float
@@ -10,10 +13,11 @@ class Fill:
     ts: float
 
 class RealExchange:
-    def __init__(self, ccxt_client, fees: dict):
+    def __init__(self, ccxt_client, fees: dict, store_path: str = "./runtime/orders.json"):
         self.client = ccxt_client
         self.fees = fees or {"taker": 0.0002, "maker": 0.0002}
         self.log = logging.getLogger("RealExchange")
+        self.store = OrderStore(store_path)
 
     def _idemp_key(self, prefix: str, **fields) -> str:
         raw = prefix + "|" + "|".join(f"{k}={fields[k]}" for k in sorted(fields.keys()))
@@ -69,6 +73,80 @@ class RealExchange:
         )
         fee = abs(price * qty) * self.fees.get("taker", 0.0002)
         return Fill(price=price, qty=qty, side=side, ts=_t()), fee
+
+    async def create_order(
+        self,
+        symbol: str,
+        internal_side: str,
+        qty: float,
+        price: float | None = None,
+        type_: str = "market",
+        params: dict | None = None,
+    ):
+        params = dict(params or {})
+
+        options = getattr(self.client, "options", {}) or {}
+        default_type = options.get("defaultType") or options.get("default_type")
+        client_type = getattr(self.client, "type", None)
+        is_futures = (default_type in {"future", "swap", "delivery"}) or (
+            client_type in {"future", "swap", "delivery"}
+        )
+        hedge_mode = bool(options.get("hedgeMode") or options.get("hedge_mode"))
+
+        side_map = normalize_side(internal_side, futures=is_futures, hedge_mode=hedge_mode)
+
+        order_type = (type_ or "market").upper()
+        binance_type = order_type.lower()
+        if order_type not in {"MARKET", "LIMIT"}:
+            self.log.warning("Tipo de orden no contemplado (%s), usando CCXT tal cual", order_type)
+
+        binance_side = side_map.order_side
+        if side_map.position_side:
+            params.setdefault("positionSide", side_map.position_side)
+
+        price_arg = price if order_type == "LIMIT" else None
+
+        try:
+            order = await self._place(
+                self.client.create_order,
+                symbol,
+                binance_type,
+                binance_side,
+                qty,
+                price_arg,
+                params,
+            )
+        except Exception as e:
+            self.log.exception("Fallo creando orden real: %s", e)
+            raise
+
+        oid = (
+            order.get("id")
+            or order.get("orderId")
+            or order.get("clientOrderId")
+            or (order.get("info", {}) or {}).get("orderId")
+            or (order.get("info", {}) or {}).get("clientOrderId")
+        )
+        status = (order.get("status") or (order.get("info", {}) or {}).get("status") or "").upper()
+        if not oid:
+            raise RuntimeError(f"Binance no devolvió id de orden: {order}")
+
+        self.store.append(
+            {
+                "ts": _t(),
+                "symbol": symbol,
+                "internal_side": side_map.internal,
+                "side": binance_side,
+                "positionSide": params.get("positionSide"),
+                "type": order_type,
+                "qty": qty,
+                "price": price_arg,
+                "status": status,
+                "order": order,
+            }
+        )
+
+        return order
 
     # =============================================================
     # === PARCHE APLICADO AQUÍ ===
