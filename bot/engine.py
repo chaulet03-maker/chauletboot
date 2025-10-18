@@ -802,6 +802,14 @@ class TradingApp:
                 return
             entry_price = float(entry_price)
             qty = (eq_on_open * leverage) / max(entry_price, 1e-12)
+            if qty <= 0:
+                logging.warning(
+                    "Qty=0: eq=%.2f lev=%.2f px=%.2f → no se abre.",
+                    eq_on_open,
+                    leverage,
+                    entry_price,
+                )
+                return
 
             sl_price = self.strategy.calculate_sl(entry_price, last_candle, signal)
             side = signal
@@ -810,63 +818,59 @@ class TradingApp:
             # Log para ver con qué qty abrimos
             logging.info("[OPEN] eq=%.2f lev=%.2f px=%.2f -> qty=%.6f",
                          eq_on_open, leverage, entry_price, qty)
-
-            # Guard: no avisar ni intentar abrir con qty <= 0
-            if qty is None or qty <= 0:
-                self.record_rejection(
-                    symbol=self.config.get("symbol", ""),
-                    side=signal,
-                    code="qty_zero",
-                    detail=f"eq={eq_on_open:.2f}, px={entry_price:.2f}, lev={leverage}"
-                )
-                return
-
             order_result = await self.exchange.create_order(signal, qty, sl_price, tp_price)
 
-            # Detectar órdenes sin fill (paper o live) y no anunciar apertura
+            # 1) Validar fill real
             filled = 0.0
             try:
-                filled = float(order_result.get("executedQty")
-                               or order_result.get("filled")
-                               or order_result.get("size")
-                               or 0.0)
+                filled = float(
+                    (order_result or {}).get("executedQty")
+                    or (order_result or {}).get("filled")
+                    or (order_result or {}).get("size")
+                    or 0.0
+                )
             except Exception:
                 filled = 0.0
-            if not order_result or filled <= 0:
-                self.record_rejection(
-                    symbol=self.config.get("symbol", ""),
-                    side=signal,
-                    code="not_filled",
-                    detail=f"executedQty={filled}"
-                )
+            if filled <= 0:
+                logging.warning("Orden enviada pero SIN FILL. No se anuncia apertura.")
                 return
 
-            # Mensaje con el formato acordado
-            symbol_base = str(self.config.get("symbol", "BTC/USDT")).split("/")[0]
+            # 2) Esperar a que el store refleje la posición (race con hilo)
+            st = None
+            if trading.POSITION_SERVICE is not None:
+                for _ in range(5):  # hasta ~250 ms
+                    try:
+                        st = trading.POSITION_SERVICE.get_status()
+                        if st and (str(st.get("side", "FLAT")).upper() != "FLAT"):
+                            break
+                    except Exception:
+                        pass
+                    await asyncio.sleep(0.05)
+
+            # 3) Construir cache a partir del store si está disponible
+            cached_position = order_result
+            try:
+                if st and (str(st.get("side", "FLAT")).upper() != "FLAT"):
+                    cached_position = {
+                        "symbol": st.get("symbol", self.config.get("symbol")),
+                        "side": str(st.get("side")).upper(),
+                        "contracts": float(st.get("qty") or 0.0),
+                        "entryPrice": float(st.get("entry_price") or entry_price),
+                        "markPrice": float(st.get("mark") or 0.0),
+                    }
+            except Exception as e:
+                logging.debug("post-open cache position fail: %s", e)
+            await self.trader.set_position(cached_position)
+
+            # 4) Mensaje en el formato acordado (recién ahora)
+            base = str(self.config.get("symbol", "BTC/USDT")).split("/")[0]
             await self.notifier.send(
-                "🚀 operacion " + f"{symbol_base} Abierta: {signal}\n"
+                "🚀 operacion " + f"{base} Abierta: {signal}\n"
                 + f"Apalancamiento: x{leverage:.1f}\n"
                 + f"precio: ${entry_price:.2f}\n"
                 + f"tp : ${tp_price:.2f}\n"
                 + f"sl:  ${sl_price:.2f}"
             )
-
-            cached_position = order_result
-            if trading.POSITION_SERVICE is not None:
-                try:
-                    st = trading.POSITION_SERVICE.get_status()
-                    side = (st.get("side") or "FLAT").upper()
-                    if side != "FLAT":
-                        cached_position = {
-                            "symbol": st.get("symbol", self.config.get("symbol")),
-                            "side": side,
-                            "contracts": float(st.get("qty") or 0.0),
-                            "entryPrice": float(st.get("entry_price") or 0.0),
-                            "markPrice": float(st.get("mark") or 0.0),
-                        }
-                except Exception as e:
-                    logging.debug("post-open cache position fail: %s", e)
-            await self.trader.set_position(cached_position)
             self._risk_usd_trade = abs(entry_price - sl_price) * qty
             self._eq_on_open = eq_on_open
             self._entry_ts = now_ts
