@@ -2,10 +2,10 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Any, Optional
+from typing import Any, Mapping, Optional
 
 from bot.mode_manager import Mode, ModeResult, get_mode
-from config import S
+from config import RAW_CONFIG, S
 from brokers import ACTIVE_LIVE_CLIENT, ACTIVE_PAPER_STORE, build_broker
 from binance_client import client_factory
 from position_service import PositionService
@@ -18,6 +18,33 @@ POSITION_SERVICE: PositionService | None = None
 PUBLIC_CCXT_CLIENT: Optional[Any] = None
 ACTIVE_MODE: Mode = "simulado"
 _INITIALIZED: bool = False
+
+
+def _config_uses_hedge(raw_config: Mapping[str, Any] | None) -> bool:
+    """Determina si la configuración global habilita el hedge mode."""
+
+    if not isinstance(raw_config, Mapping):
+        return True
+
+    exchange_cfg = raw_config.get("exchange")
+    if isinstance(exchange_cfg, Mapping):
+        options = exchange_cfg.get("options")
+        if isinstance(options, Mapping):
+            if "hedgeMode" in options:
+                return bool(options.get("hedgeMode"))
+            if "hedge_mode" in options:
+                return bool(options.get("hedge_mode"))
+        if "hedgeMode" in exchange_cfg:
+            return bool(exchange_cfg.get("hedgeMode"))
+        if "hedge_mode" in exchange_cfg:
+            return bool(exchange_cfg.get("hedge_mode"))
+
+    limits_cfg = raw_config.get("limits")
+    if isinstance(limits_cfg, Mapping):
+        if "no_hedge" in limits_cfg:
+            return not bool(limits_cfg.get("no_hedge"))
+
+    return True
 
 
 def _build_public_ccxt() -> Optional[Any]:
@@ -47,12 +74,11 @@ def _build_public_ccxt() -> Optional[Any]:
         except ImportError:
             logger.debug("certifi no está disponible; se usa la configuración TLS por defecto")
 
-        exchange = ccxt.binanceusdm(
-            {
-                "enableRateLimit": True,
-                "options": {"defaultType": "future"},
-            }
-        )
+        options: dict[str, Any] = {"defaultType": "future"}
+        if _config_uses_hedge(RAW_CONFIG):
+            options["hedgeMode"] = True
+
+        exchange = ccxt.binanceusdm({"enableRateLimit": True, "options": options})
 
         from config import S
 

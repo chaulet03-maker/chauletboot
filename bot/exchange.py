@@ -3,7 +3,7 @@ import logging
 import os
 import threading
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Mapping, Optional
 
 import ccxt
 
@@ -17,6 +17,7 @@ logger = logging.getLogger(__name__)
 class Exchange:
     def __init__(self, cfg):
         self.config = cfg
+        self._hedge_mode = self._determine_hedge_mode()
         self.public_client = None
         self.client = self._setup_client()
         if self.public_client is None:
@@ -78,6 +79,30 @@ class Exchange:
             pass
         self._price_stream = None
 
+    def _determine_hedge_mode(self) -> bool:
+        cfg: Mapping[str, Any] = (
+            self.config if isinstance(self.config, Mapping) else {}
+        )
+
+        exchange_cfg = cfg.get("exchange")
+        if isinstance(exchange_cfg, Mapping):
+            options = exchange_cfg.get("options")
+            if isinstance(options, Mapping):
+                if "hedgeMode" in options:
+                    return bool(options.get("hedgeMode"))
+                if "hedge_mode" in options:
+                    return bool(options.get("hedge_mode"))
+            if "hedgeMode" in exchange_cfg:
+                return bool(exchange_cfg.get("hedgeMode"))
+            if "hedge_mode" in exchange_cfg:
+                return bool(exchange_cfg.get("hedge_mode"))
+
+        limits_cfg = cfg.get("limits")
+        if isinstance(limits_cfg, Mapping) and "no_hedge" in limits_cfg:
+            return not bool(limits_cfg.get("no_hedge"))
+
+        return True
+
     def _credentials_available(self) -> bool:
         return (
             (not S.PAPER)
@@ -86,7 +111,25 @@ class Exchange:
         )
 
     def _new_usdm_client(self):
-        params = {"enableRateLimit": True, "options": {"defaultType": "future"}}
+        exchange_cfg = self.config.get("exchange") if isinstance(self.config, Mapping) else None
+
+        params: Dict[str, Any] = {"enableRateLimit": True}
+        options: Dict[str, Any] = {}
+
+        if isinstance(exchange_cfg, Mapping):
+            user_params = exchange_cfg.get("params") or exchange_cfg.get("ccxt_params")
+            if isinstance(user_params, Mapping):
+                params.update(user_params)
+            user_options = exchange_cfg.get("options")
+            if isinstance(user_options, Mapping):
+                options.update(user_options)
+
+        options.setdefault("defaultType", "future")
+        if self._hedge_mode:
+            options["hedgeMode"] = True
+
+        params["options"] = options
+
         client = ccxt.binanceusdm(params)
         use_testnet = os.getenv("BINANCE_UMFUTURES_TESTNET", "false").lower() == "true"
         if use_testnet and hasattr(client, "set_sandbox_mode"):
