@@ -303,9 +303,20 @@ class BinanceBroker:
                 client_order_id = f"bot-{int(time.time() * 1000)}-{os.getpid()}"
         params["newClientOrderId"] = client_order_id
 
+        side_clean = str(side).strip().upper()
+        side_map = {
+            "BUY": "BUY",
+            "SELL": "SELL",
+            "LONG": "BUY",
+            "SHORT": "SELL",
+        }
+        normalized_side = side_map.get(side_clean)
+        if normalized_side is None:
+            raise ValueError(f"Lado de orden desconocido: {side}")
+
         order_payload = dict(
             symbol=self._normalize_symbol(symbol),
-            side=side.upper(),
+            side=normalized_side,
             type=order_type,
             quantity=qty_f,
             **params,
@@ -322,7 +333,7 @@ class BinanceBroker:
         if tp_price:
             protections["TP"] = tp_price
         if protections:
-            self._place_protections(filters, side, qty_f, protections, position_side)
+            self._place_protections(filters, side_clean, qty_f, protections, position_side)
 
         return response
 
@@ -337,7 +348,16 @@ class BinanceBroker:
         protections: dict[str, float],
         position_side: Optional[str] = None,
     ) -> None:
-        closing_side = "SELL" if side.upper() == "BUY" else "BUY"
+        side_clean = str(side).strip().upper()
+        closing_map = {
+            "BUY": "SELL",
+            "LONG": "SELL",
+            "SELL": "BUY",
+            "SHORT": "BUY",
+        }
+        closing_side = closing_map.get(side_clean)
+        if closing_side is None:
+            raise ValueError(f"Lado de cierre desconocido: {side}")
         for label, raw_price in protections.items():
             if raw_price is None:
                 continue
