@@ -815,12 +815,9 @@ class TradingApp:
             side = signal
             tp_price = self.strategy.calculate_tp(entry_price, qty, eq_on_open, side)
 
-            # Log para ver con qué qty abrimos
-            logging.info("[OPEN] eq=%.2f lev=%.2f px=%.2f -> qty=%.6f",
-                         eq_on_open, leverage, entry_price, qty)
             order_result = await self.exchange.create_order(signal, qty, sl_price, tp_price)
 
-            # 1) Validar fill real
+            # 1) Verificar FILL > 0 (evita anuncios falsos)
             filled = 0.0
             try:
                 filled = float(
@@ -832,37 +829,37 @@ class TradingApp:
             except Exception:
                 filled = 0.0
             if filled <= 0:
-                logging.warning("Orden enviada pero SIN FILL. No se anuncia apertura.")
+                logging.warning("Orden enviada pero SIN FILL (>0). No se anuncia apertura.")
                 return
 
-            # 2) Esperar a que el store refleje la posición (race con hilo)
+            # 2) Esperar a que el store (POSITION_SERVICE) deje de estar FLAT
             st = None
             if trading.POSITION_SERVICE is not None:
-                for _ in range(5):  # hasta ~250 ms
+                for _ in range(6):  # espera total ~300 ms
                     try:
                         st = trading.POSITION_SERVICE.get_status()
-                        if st and (str(st.get("side", "FLAT")).upper() != "FLAT"):
+                        if st and str(st.get("side", "FLAT")).upper() != "FLAT":
                             break
                     except Exception:
                         pass
                     await asyncio.sleep(0.05)
 
-            # 3) Construir cache a partir del store si está disponible
+            # 3) Cachear desde el store si está disponible
             cached_position = order_result
             try:
-                if st and (str(st.get("side", "FLAT")).upper() != "FLAT"):
+                if st and str(st.get("side", "FLAT")).upper() != "FLAT":
                     cached_position = {
                         "symbol": st.get("symbol", self.config.get("symbol")),
                         "side": str(st.get("side")).upper(),
                         "contracts": float(st.get("qty") or 0.0),
-                        "entryPrice": float(st.get("entry_price") or entry_price),
+                        "entryPrice": float(st.get("entry_price") or 0.0),
                         "markPrice": float(st.get("mark") or 0.0),
                     }
             except Exception as e:
                 logging.debug("post-open cache position fail: %s", e)
             await self.trader.set_position(cached_position)
 
-            # 4) Mensaje en el formato acordado (recién ahora)
+            # 4) Ahora sí: anunciar la apertura (usá tu formato nuevo si ya lo tenés)
             base = str(self.config.get("symbol", "BTC/USDT")).split("/")[0]
             await self.notifier.send(
                 "🚀 operacion " + f"{base} Abierta: {signal}\n"

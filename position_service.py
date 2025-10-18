@@ -284,6 +284,11 @@ class PositionService:
                 changes["fees"] = float(state.get("fees") or 0.0) + float(fee)
             if realized:
                 changes["realized_pnl"] = float(state.get("realized_pnl") or 0.0) + float(realized)
+            logger.info(
+                "STORE SAVE: pos_qty=%.6f avg=%.2f",
+                changes["pos_qty"],
+                changes["avg_price"],
+            )
             return self.store.save(**changes)
         except Exception:
             logger.debug("apply_fill fallo", exc_info=True)
