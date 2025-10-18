@@ -230,19 +230,19 @@ class Exchange:
         logger.warning(f"No pude obtener precio para {base_symbol}")
         return None
 
-    async def set_leverage(self, leverage: float, symbol: Optional[str] = None) -> None:
+    async def set_leverage(self, leverage: float | int, symbol: Optional[str] = None) -> None:
         """Establece el apalancamiento para un par."""
         sym = symbol or self.config.get('symbol', 'BTC/USDT')
-        if sym.endswith('/USDT') and ':USDT' not in sym:
-            sym = f"{sym}:USDT"
+        # CCXT acepta 'BTC/USDT' y lo mapea a 'BTCUSDT'. No sumar ':USDT'.
+        lev_int = int(float(str(leverage).lower().replace("x", "").strip()))
 
         if S.PAPER:
-            logger.info("PAPER: skipping private endpoint set_leverage(%s, %s)", leverage, sym)
+            logger.info("PAPER: skipping set_leverage(%s, %s)", lev_int, sym)
             return
 
         await self._ensure_auth_for_private()
-        await asyncio.to_thread(self.client.set_leverage, leverage, sym)
-        logger.info("Apalancamiento establecido en x%s para %s", leverage, sym)
+        await asyncio.to_thread(self.client.set_leverage, lev_int, sym)
+        logger.info("Apalancamiento establecido en x%s para %s", lev_int, sym)
 
     async def fetch_current_funding_rate(self, symbol: Optional[str] = None) -> Optional[float]:
         """Obtiene el funding rate actual en formato decimal (por intervalo de funding)."""

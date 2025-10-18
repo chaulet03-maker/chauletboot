@@ -40,13 +40,22 @@ class RealExchange:
             self.log.warning("set_position_mode failed: %s", e)
 
     async def set_leverage(self, symbol: str, lev: int):
+        """Wrapper compatible con CCXT Python para USDM."""
         try:
-            if hasattr(self.client, "setLeverage"):
-                return await self.client.setLeverage(lev, symbol)
-            m = self.client.market(symbol)
-            return await self.client.fapiPrivate_post_leverage({"symbol": m["id"], "leverage": lev})
+            lev_int = int(float(lev))
+            # Preferir la API de alto nivel de CCXT
+            return await asyncio.to_thread(self.client.set_leverage, lev_int, symbol)
         except Exception as e:
-            self.log.warning("set_leverage(%s,%s) failed: %s", symbol, lev, e)
+            # Fallback explícito al endpoint oficial si hiciera falta
+            try:
+                m = self.client.market(symbol)  # m["id"] -> 'BTCUSDT'
+                return await asyncio.to_thread(
+                    self.client.fapiPrivatePostLeverage,
+                    {"symbol": m["id"], "leverage": lev_int},
+                )
+            except Exception as ex:
+                self.log.warning("set_leverage(%s,%s) failed: %s / %s", symbol, lev_int, e, ex)
+                raise
 
     async def market_order(self, symbol: str, side: str, qty: float, price_hint: float = None):
         params = {"newClientOrderId": self._idemp_key("MO", symbol=symbol, side=side, qty=qty)}
