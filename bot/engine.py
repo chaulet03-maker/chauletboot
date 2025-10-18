@@ -934,11 +934,15 @@ class TradingApp:
         job_queue.run_repeating(self.trading_loop, interval=60, first=5)
 
         loop = asyncio.get_event_loop()
-        preload_task = self._preload_position_from_store()
-        if loop.is_running():
-            loop.create_task(preload_task)
-        else:
-            loop.run_until_complete(preload_task)
+        bootstrap_tasks = [
+            self.exchange.set_position_mode(one_way=not self.exchange.hedge_mode),
+            self._preload_position_from_store(),
+        ]
+        for task in bootstrap_tasks:
+            if loop.is_running():
+                loop.create_task(task)
+            else:
+                loop.run_until_complete(task)
 
         mode_msg = "🧪 Modo SIMULADO activo" if S.PAPER else "🔴 Modo REAL activo"
         if S.PAPER:
