@@ -184,6 +184,13 @@ def place_order_safe(side: str, qty: float, price: float | None = None, **kwargs
             if fill_price is not None:
                 fill_side = "LONG" if str(side).upper() in {"BUY", "LONG"} else "SHORT"
                 POSITION_SERVICE.apply_fill(fill_side, float(qty), float(fill_price))
+                logging.info(
+                    "apply_fill(open): side=%s qty=%.6f price=%.2f -> %s",
+                    fill_side,
+                    float(qty),
+                    float(fill_price),
+                    POSITION_SERVICE.get_status(),
+                )
     except Exception:
         logger.debug("No se pudo reflejar fill en store tras abrir.", exc_info=True)
     return result
