@@ -139,6 +139,10 @@ def rebuild(mode: Mode) -> None:
         live_store_path = os.path.join(os.getcwd(), "data", "live_bot_position.json")
         bot_store = PaperStore(path=live_store_path, start_equity=S.start_equity)
 
+    shared_store = getattr(BROKER, "store", None)
+    if shared_store is not None:
+        bot_store = shared_store
+
     POSITION_SERVICE = PositionService(
         paper_store=bot_store,
         live_client=ACTIVE_LIVE_CLIENT,
@@ -217,19 +221,29 @@ def place_order_safe(side: str, qty: float, price: float | None = None, **kwargs
     result = BROKER.place_order(side, qty, price, **kwargs)
     try:
         if POSITION_SERVICE is not None and getattr(POSITION_SERVICE, "store", None):
-            fill_price = _infer_fill_price(result, price)
-            if fill_price is not None:
-                fill_side = "LONG" if str(side).upper() in {"BUY", "LONG"} else "SHORT"
-                POSITION_SERVICE.apply_fill(fill_side, float(qty), float(fill_price))
-                logging.info(
-                    "apply_fill(open): side=%s qty=%.6f price=%.2f -> %s",
-                    fill_side,
-                    float(qty),
-                    float(fill_price),
-                    POSITION_SERVICE.get_status(),
-                )
+            if isinstance(result, dict) and result.get("sim"):
+                try:
+                    POSITION_SERVICE.refresh()
+                    logging.info("paper refresh -> %s", POSITION_SERVICE.get_status())
+                except Exception:
+                    logging.warning("paper refresh falló (store)", exc_info=True)
+            else:
+                fill_price = _infer_fill_price(result, price)
+                if fill_price is not None:
+                    fill_side = "LONG" if str(side).upper() in {"BUY", "LONG"} else "SHORT"
+                    POSITION_SERVICE.apply_fill(fill_side, float(qty), float(fill_price))
+                    logging.info(
+                        "apply_fill(open): side=%s qty=%.6f price=%.2f -> %s",
+                        fill_side,
+                        float(qty),
+                        float(fill_price),
+                        POSITION_SERVICE.get_status(),
+                    )
     except Exception:
-        logger.debug("No se pudo reflejar fill en store tras abrir.", exc_info=True)
+        if isinstance(result, dict) and result.get("sim"):
+            logger.warning("PAPER: no se pudo reflejar estado tras abrir.", exc_info=True)
+        else:
+            logger.debug("No se pudo reflejar fill en store tras abrir.", exc_info=True)
     return result
 
 
@@ -261,12 +275,21 @@ def close_now(symbol: str | None = None):
     )
     try:
         if POSITION_SERVICE is not None and getattr(POSITION_SERVICE, "store", None):
-            close_price = _infer_fill_price(result, status.get("mark"))
-            bot_side = "SHORT" if side == "LONG" else "LONG"
-            if close_price is not None:
-                POSITION_SERVICE.apply_fill(bot_side, float(qty), float(close_price))
+            if isinstance(result, dict) and result.get("sim"):
+                try:
+                    POSITION_SERVICE.refresh()
+                except Exception:
+                    logger.warning("PAPER: refresh tras cierre falló", exc_info=True)
+            else:
+                close_price = _infer_fill_price(result, status.get("mark"))
+                bot_side = "SHORT" if side == "LONG" else "LONG"
+                if close_price is not None:
+                    POSITION_SERVICE.apply_fill(bot_side, float(qty), float(close_price))
     except Exception:
-        logger.debug("No se pudo reflejar cierre en store.", exc_info=True)
+        if isinstance(result, dict) and result.get("sim"):
+            logger.warning("PAPER: no se pudo reflejar cierre en store.", exc_info=True)
+        else:
+            logger.debug("No se pudo reflejar cierre en store.", exc_info=True)
     return result
 
 
