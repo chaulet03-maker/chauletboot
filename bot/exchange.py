@@ -409,14 +409,17 @@ class Exchange:
         if price is None:
             raise RuntimeError(f"No se pudo obtener precio para ejecutar la orden de {symbol}.")
 
+        # Ejecutar a mercado (no LIMIT implícito), y enviar positionSide si Hedge
+        order_kwargs = dict(symbol=symbol, sl=sl_price, tp=tp_price, order_type="MARKET")
+        if self.hedge_mode:
+            side_upper = str(side).upper()
+            order_kwargs["positionSide"] = ("SHORT" if side_upper in ("SELL", "SHORT") else "LONG")
         order = await asyncio.to_thread(
             place_order_safe,
             side,
             quantity,
-            float(price),
-            symbol=symbol,
-            sl=sl_price,
-            tp=tp_price,
+            None,          # MARKET ⇒ sin price
+            **order_kwargs
         )
 
         logger.info("Orden ejecutada vía broker seguro: %s", order)

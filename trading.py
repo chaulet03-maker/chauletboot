@@ -240,11 +240,11 @@ def close_now(symbol: str | None = None):
 
     close_side = "SELL" if side == "LONG" else "BUY"
     target_symbol = symbol or status.get("symbol")
+    # Cierre a mercado. En Hedge, `reduceOnly` no está permitido; sin él igual reduce si qty = pos.
     result = BROKER.place_order(
         close_side,
         qty,
         None,
-        reduce_only=True,
         order_type="market",
         symbol=target_symbol,
     )

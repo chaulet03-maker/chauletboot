@@ -286,11 +286,14 @@ class BinanceBroker:
                 raise ValueError("Orden LIMIT requiere precio")
             px_f = quantize_price(filters, price)
             params["price"] = px_f
+            # Binance: LIMIT exige timeInForce (GTC/IOC/FOK/GTX)
+            params["timeInForce"] = params.get("timeInForce", "GTC")
         else:
             params.pop("price", None)
+            params.pop("timeInForce", None)
 
         if reduce_only:
-            params["reduceOnly"] = True
+            params["reduceOnly"] = True  # OJO: no usar en Hedge Mode (ver Patch 3)
 
         validate_order(filters, qty_f, px_f)
 
@@ -319,6 +322,8 @@ class BinanceBroker:
             side=normalized_side,
             type=order_type,
             quantity=qty_f,
+            # Devolvé el fill final en MARKET para evitar polling extra
+            newOrderRespType=params.pop("newOrderRespType", "RESULT"),
             **params,
         )
 
