@@ -201,10 +201,10 @@ class RealExchange:
                     exch_sym = str(info.get("symbol") or entry.get("symbol") or "").upper()
                     if exch_sym != target.upper():
                         continue
-                    amt = info.get("positionAmt") or info.get("positionamt")
-                    if amt is None:
-                        amt = entry.get("contracts") or entry.get("size") or 0
-                    amt_f = float(amt or 0)
+                    raw_amt = info.get("positionAmt") or info.get("positionamt")
+                    if raw_amt is None:
+                        raw_amt = entry.get("contracts") or entry.get("size") or 0
+                    amt_f = float(raw_amt or "0")
                     if abs(amt_f) == 0.0:
                         return None
                     side = "LONG" if amt_f > 0 else "SHORT"
@@ -238,7 +238,7 @@ class RealExchange:
                 exch_sym = str(pos.get("symbol") or "").upper()
                 if exch_sym != target.upper():
                     continue
-                amt_f = float(pos.get("positionAmt") or 0)
+                amt_f = float(pos.get("positionAmt") or "0")
                 if abs(amt_f) == 0.0:
                     return None
                 side = "LONG" if amt_f > 0 else "SHORT"
@@ -274,10 +274,10 @@ class RealExchange:
                 pos_list = await self._place(ccxt_client.fetch_positions)
                 for entry in pos_list or []:
                     info = entry.get("info") or {}
-                    amt = info.get("positionAmt") or info.get("positionamt")
-                    if amt is None:
-                        amt = entry.get("contracts") or entry.get("size") or 0
-                    amt_f = float(amt or 0)
+                    raw_amt = info.get("positionAmt") or info.get("positionamt")
+                    if raw_amt is None:
+                        raw_amt = entry.get("contracts") or entry.get("size") or 0
+                    amt_f = float(raw_amt or "0")
                     if abs(amt_f) == 0.0:
                         continue
                     side = "LONG" if amt_f > 0 else "SHORT"
@@ -310,7 +310,7 @@ class RealExchange:
             if not account:
                 return []
             for pos in account.get("positions", []):
-                amt_f = float(pos.get("positionAmt") or 0)
+                amt_f = float(pos.get("positionAmt") or "0")
                 if abs(amt_f) == 0.0:
                     continue
                 side = "LONG" if amt_f > 0 else "SHORT"
