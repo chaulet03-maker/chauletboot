@@ -203,6 +203,17 @@ def place_order_safe(side: str, qty: float, price: float | None = None, **kwargs
     )
     if BROKER is None:
         raise RuntimeError("Broker no inicializado")
+
+    desired_type = kwargs.get("order_type")
+    if desired_type is not None:
+        desired_type = str(desired_type).upper()
+        kwargs["order_type"] = desired_type
+        if desired_type == "MARKET":
+            price = None
+    elif price in (None, 0, "0"):
+        kwargs["order_type"] = "MARKET"
+        price = None
+
     result = BROKER.place_order(side, qty, price, **kwargs)
     try:
         if POSITION_SERVICE is not None and getattr(POSITION_SERVICE, "store", None):
