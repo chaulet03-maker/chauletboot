@@ -108,12 +108,15 @@ class SimBroker:
 
         oid = f"sim-{int(time.time() * 1000)}"
         new_state = self._apply_fill(side, qty, float(fill_price))
+        avg_price = float(new_state.get("avg_price", fill_price)) if isinstance(new_state, dict) else float(fill_price)
         logger.info("PAPER ORDER %s %.6f @ %.2f → FILLED [%s]", side, qty, float(fill_price), oid)
         payload: dict[str, Any] = {
             "orderId": oid,
             "status": "FILLED",
             "price": float(fill_price),
             "executedQty": float(qty),
+            "avgPrice": float(avg_price),
+            "avg_price": float(avg_price),
             "side": str(side).upper(),
             "sim": True,
             "state": new_state,
@@ -286,8 +289,10 @@ class BinanceBroker:
                 raise ValueError("Orden LIMIT requiere precio")
             px_f = quantize_price(filters, price)
             params["price"] = px_f
+            params.setdefault("timeInForce", "GTC")
         else:
             params.pop("price", None)
+            params.pop("timeInForce", None)
 
         if reduce_only:
             params["reduceOnly"] = True

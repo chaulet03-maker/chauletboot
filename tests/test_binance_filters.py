@@ -86,6 +86,7 @@ def test_binance_broker_quantizes_and_sets_ids(monkeypatch):
     assert entry["price"] == pytest.approx(68234.1)
     assert entry["newClientOrderId"] == "test-123"
     assert entry["type"] == "LIMIT"
+    assert entry["timeInForce"] == "GTC"
     # Protections should be reduce-only and quantized
     protection_orders = client._orders[1:]
     assert protection_orders, "Stop loss/TP orders were not placed"
@@ -126,3 +127,13 @@ def test_binance_broker_does_not_retry_margin(monkeypatch):
     broker = BinanceBroker(MarginClient())
     with pytest.raises(MarginError):
         broker.place_order("BUY", 0.01, 25000.0, symbol="BTCUSDT", order_type="LIMIT")
+
+
+def test_binance_broker_market_defaults(monkeypatch):
+    client = DummyClient()
+    broker = BinanceBroker(client)
+    broker.place_order("SELL", 0.01, None, symbol="BTC/USDT", order_type="market")
+    entry = client._orders[0]
+    assert entry["type"] == "MARKET"
+    assert "price" not in entry
+    assert "timeInForce" not in entry
