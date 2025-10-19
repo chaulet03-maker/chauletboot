@@ -1342,7 +1342,9 @@ async def _modo_command(update: Update, context: ContextTypes.DEFAULT_TYPE, new_
     result = trading.switch_mode("real" if new_mode == "real" else "simulado")
     if result.ok:
         base_msg = f"✅ Modo cambiado a *{new_mode.upper()}*. El bot ya opera en {new_mode}."
-        msg = f"{base_msg}\n{result.msg}" if result.msg else base_msg
+        # Si querés mantener el warning en la misma burbuja: descomentar la línea de abajo
+        # msg = f"{base_msg}\n{result.msg}" if result.msg else base_msg
+        msg = base_msg
         if new_mode == "real":
             try:
                 if engine and hasattr(engine, "exchange") and engine.exchange:
@@ -1363,26 +1365,22 @@ async def _modo_command(update: Update, context: ContextTypes.DEFAULT_TYPE, new_
             logger.debug("No se pudo resetear caches del trader tras cambio de modo.", exc_info=True)
         if message is not None:
             await message.reply_text(msg, parse_mode="Markdown")
-        if new_mode == "real" and engine is not None and message is not None:
-            if rescue_needed and hasattr(engine, "sync_live_position"):
-                await message.reply_text(
-                    "⚠️ Rescate: activé modo REAL y sincronizo la posición del exchange…"
-                )
+        if new_mode == "real" and engine is not None and rescue_needed:
+            sync_fn = getattr(engine, "sync_live_position", None)
+            if callable(sync_fn):
                 try:
-                    synced = await asyncio.to_thread(engine.sync_live_position)
-                except Exception as exc:
-                    await message.reply_text(
-                        f"⚠️ Activé REAL pero falló la sincronización automática: {exc}"
-                    )
-                else:
-                    if synced:
-                        await message.reply_text(
-                            "✅ Posición LIVE sincronizada. El bot ya la controla."
-                        )
+                    if inspect.iscoroutinefunction(sync_fn):
+                        ok = await sync_fn()
                     else:
-                        await message.reply_text(
-                            "ℹ️ No hay posición LIVE en el exchange. Estado local limpiado."
-                        )
+                        ok = await asyncio.to_thread(sync_fn)
+                    logger.info(
+                        "Rescate modo REAL: sync_live_position -> %s",
+                        "OK" if ok else "SIN_POS",
+                    )
+                except Exception:
+                    logger.debug("Rescate modo REAL falló durante sync.", exc_info=True)
+            else:
+                logger.warning("Rescate modo REAL: engine no soporta sync_live_position()")
         return
     else:
         msg = f"❌ No pude cambiar el modo: {result.msg}"
