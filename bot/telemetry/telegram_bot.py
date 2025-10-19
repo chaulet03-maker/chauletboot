@@ -877,41 +877,60 @@ async def posiciones_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         bot_status = None
         bot_qty = 0.0
 
-    lines = ["📋 *Posiciones totales (usuario + BOT):*"]
+    lines = ["📋 *Posiciones abiertas (BOT + usuario):*"]
     for pos in positions:
         symbol = pos.get("symbol") or pos.get("info", {}).get("symbol") or "?"
-        size = (
-            pos.get("contracts")
-            or pos.get("size")
-            or pos.get("contractsSize")
-            or pos.get("amount")
-            or 0.0
+        qty = _first_float(
+            pos.get("contracts"),
+            pos.get("size"),
+            pos.get("contractsSize"),
+            pos.get("amount"),
+            default=0.0,
         )
-        try:
-            size_f = float(size or 0.0)
-        except Exception:
-            size_f = 0.0
-        side = pos.get("side") or ("LONG" if size_f > 0 else ("SHORT" if size_f < 0 else "FLAT"))
-        entry = (
-            pos.get("entryPrice")
-            or pos.get("entry_price")
-            or pos.get("avgPrice")
-            or pos.get("average")
-            or 0.0
+        side = (pos.get("side") or ("LONG" if qty > 0 else ("SHORT" if qty < 0 else "FLAT"))).upper()
+        entry = _first_float(
+            pos.get("entryPrice"),
+            pos.get("entry_price"),
+            pos.get("avgPrice"),
+            pos.get("average"),
+            default=0.0,
         )
-        upnl = pos.get("unrealizedPnl") or pos.get("unrealized_pnl") or 0.0
-        formatted = (
-            f"{symbol} | {side} | qty={_num(size, 4)} | "
-            f"entry=${_num(entry)} | uPnL=${_num(upnl)}"
+        mark = _first_float(
+            pos.get("markPrice"),
+            pos.get("mark"),
+            pos.get("marketPrice"),
+            default=0.0,
         )
-        # Resaltar SOLO si el BOT tiene porción abierta en este símbolo
-        is_bot_symbol = str(symbol).upper() == str(symbol_bot).upper()
-        if is_bot_symbol and bot_qty and abs(bot_qty) > 0:
-            lines.append(f"*[BOT]* *{formatted}*  (bot qty={_num(bot_qty, 4)})")
-        else:
-            lines.append(formatted)
+        upnl = _first_float(pos.get("unrealizedPnl"), pos.get("unrealized_pnl"), default=0.0)
 
-    await message.reply_text("\n".join(lines), parse_mode="Markdown")
+        opened_at = pos.get("opened_at")
+        mode_txt = (pos.get("mode") or ("real" if not S.PAPER else "simulado")).title()
+        opened_line = ""
+        if opened_at:
+            try:
+                opened_local = fmt_ar(datetime.fromtimestamp(float(opened_at), tz=timezone.utc))
+                opened_line = f"• Apertura: {opened_local}\n"
+            except Exception:
+                opened_line = ""
+
+        is_bot_symbol = str(symbol).upper() == str(symbol_bot).upper()
+        header = "📍 *Posición del BOT*\n" if is_bot_symbol and abs(bot_qty) > 0 else "📍 *Posición*\n"
+        qty_line = f"• Cantidad: *{_num(qty, 4)}*"
+        if is_bot_symbol and abs(bot_qty) > 0:
+            qty_line += f"  (bot qty={_num(bot_qty, 4)})"
+
+        text = (
+            f"{header}"
+            f"{opened_line}"
+            f"• Símbolo: *{symbol}* ({mode_txt})\n"
+            f"• Lado: *{side}*\n"
+            f"{qty_line}\n"
+            f"• Entrada: {_num(entry)}  |  Mark: {_num(mark)}\n"
+            f"• PnL: *{_num(upnl)}*"
+        )
+        lines.append(text.strip())
+
+    await message.reply_text("\n\n".join(lines), parse_mode="Markdown")
 
 
 async def estado_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
