@@ -248,7 +248,7 @@ def place_order_safe(side: str, qty: float, price: float | None = None, **kwargs
 
 
 def close_now(symbol: str | None = None):
-    """Cierra la posición actual de inmediato usando orden MARKET reduce-only."""
+    """Cierra la posición actual de inmediato usando orden MARKET compatible con hedge."""
 
     ensure_initialized()
     if POSITION_SERVICE is None or BROKER is None:
@@ -265,14 +265,14 @@ def close_now(symbol: str | None = None):
 
     close_side = "SELL" if side == "LONG" else "BUY"
     target_symbol = symbol or status.get("symbol")
-    result = BROKER.place_order(
-        close_side,
-        qty,
-        None,
-        reduce_only=True,
-        order_type="market",
-        symbol=target_symbol,
-    )
+    hedged = _config_uses_hedge(RAW_CONFIG)
+    kwargs = dict(order_type="market", symbol=target_symbol)
+    if hedged:
+        kwargs["positionSide"] = "SHORT" if close_side == "SELL" else "LONG"
+    else:
+        kwargs["reduce_only"] = True
+
+    result = BROKER.place_order(close_side, qty, None, **kwargs)
     try:
         if POSITION_SERVICE is not None and getattr(POSITION_SERVICE, "store", None):
             if isinstance(result, dict) and result.get("sim"):
