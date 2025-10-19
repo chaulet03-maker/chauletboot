@@ -191,6 +191,7 @@ class RealExchange:
     async def get_open_position(self, symbol: Optional[str] = None) -> Optional[Dict[str, Any]]:
         sym = symbol or self.symbol or "BTC/USDT"
         target = sym.replace("/", "")
+        target_upper = target.upper()
 
         ccxt_client = getattr(self, "ccxt", None) or self.client
         if ccxt_client is not None and hasattr(ccxt_client, "fetch_positions"):
@@ -199,7 +200,8 @@ class RealExchange:
                 for entry in pos_list or []:
                     info = entry.get("info") or {}
                     exch_sym = str(info.get("symbol") or entry.get("symbol") or "").upper()
-                    if exch_sym != target.upper():
+                    exch_id = exch_sym.replace("/", "")
+                    if exch_id != target_upper:
                         continue
                     raw_amt = info.get("positionAmt") or info.get("positionamt")
                     if raw_amt is None:
@@ -236,7 +238,8 @@ class RealExchange:
                 return None
             for pos in account.get("positions", []):
                 exch_sym = str(pos.get("symbol") or "").upper()
-                if exch_sym != target.upper():
+                exch_id = exch_sym.replace("/", "")
+                if exch_id != target_upper:
                     continue
                 raw_amt = pos.get("positionAmt") or pos.get("positionamt")
                 amt_f = float(raw_amt or "0")
@@ -248,7 +251,10 @@ class RealExchange:
                 mark_price = float(mark_raw or 0.0)
                 if mark_price == 0.0 and hasattr(native_client, "futures_mark_price"):
                     try:
-                        mp = await self._call_native(native_client.futures_mark_price, symbol=target)
+                        mp = await self._call_native(
+                            native_client.futures_mark_price,
+                            symbol=target,
+                        )
                     except Exception:
                         mp = None
                     if mp:
@@ -320,7 +326,10 @@ class RealExchange:
                 mark_price = float(pos.get("markPrice") or 0.0)
                 if mark_price == 0.0 and hasattr(native_client, "futures_mark_price"):
                     try:
-                        mp = await self._call_native(native_client.futures_mark_price, symbol=sym_raw)
+                        mp = await self._call_native(
+                            native_client.futures_mark_price,
+                            symbol=str(sym_raw).replace("/", ""),
+                        )
                     except Exception:
                         mp = None
                     if mp:
@@ -357,7 +366,8 @@ class RealExchange:
 
         # Determina el TP final, dando prioridad a tp2.
         tp_final = tp2 if tp2 and tp2 > 0 else (tp1 if tp1 and tp1 > 0 else None)
-        closing_side = "sell" if side == "long" else "buy"
+        s = (side or "").lower()
+        closing_side = "sell" if s == "long" else "buy"
         params_base = {"reduceOnly": True}
         if position_side:
             params_base["positionSide"] = position_side
