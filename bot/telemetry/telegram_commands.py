@@ -6,6 +6,8 @@ import unicodedata
 import trading
 from config import S
 from bot.motives import MOTIVES
+from state_store import load_state as load_bot_state
+from state_store import position_status as store_position_status
 
 from .telegram_bot import (
     _build_config_text,
@@ -220,23 +222,25 @@ async def _cmd_posicion(engine, reply):
     symbol_default = "BTC/USDT"
     if isinstance(cfg, dict):
         symbol_default = cfg.get("symbol", symbol_default)
-    if not st or (st.get("side", "FLAT").upper() == "FLAT"):
-        return await reply(
-            f"Estado Actual: Sin posición\n----------------\nSímbolo: {st.get('symbol', symbol_default) if st else symbol_default}"
-        )
-    side = (st.get("side") or "").upper()
-    symbol = st.get("symbol", symbol_default)
-    entry_price = float(st.get("entry_price", 0.0) or 0.0)
-    pnl = float(st.get("pnl", 0.0) or 0.0)
-    msg = (
-        "Estado Actual: Posición Abierta\n"
-        "----------------\n"
-        f"Símbolo: {symbol}\n"
-        f"Lado: {side}\n"
-        f"Precio de Entrada: ${entry_price:.2f}\n"
-        f"PNL Actual: ${pnl:+.2f}\n"
+    mode = "live" if str(trading.ACTIVE_MODE).lower() == "real" else "paper"
+    state = load_bot_state()
+    symbol_candidates = []
+    if st and st.get("symbol"):
+        symbol_candidates.append(str(st.get("symbol")))
+    symbol_candidates.extend(state.get("open_positions", {}).keys())
+    if symbol_default not in symbol_candidates:
+        symbol_candidates.append(symbol_default)
+    for symbol in symbol_candidates:
+        try:
+            msg = store_position_status(symbol, mode)
+        except Exception:
+            log.debug("state_store position_status falló", exc_info=True)
+            continue
+        if msg != "SIN POSICIÓN":
+            return await reply(msg)
+    return await reply(
+        f"Estado Actual: Sin posición\n----------------\nSímbolo: {st.get('symbol', symbol_default) if st else symbol_default}"
     )
-    return await reply(msg)
 
 
 async def _cmd_motivos(engine, reply, n: int = 10):

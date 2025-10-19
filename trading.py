@@ -10,6 +10,7 @@ from brokers import ACTIVE_LIVE_CLIENT, ACTIVE_PAPER_STORE, build_broker
 from binance_client import client_factory
 from position_service import PositionService
 from paper_store import PaperStore
+from state_store import on_close_filled, on_open_filled
 
 logger = logging.getLogger(__name__)
 
@@ -219,6 +220,23 @@ def place_order_safe(side: str, qty: float, price: float | None = None, **kwargs
         price = None
 
     result = BROKER.place_order(side, qty, price, **kwargs)
+    inferred_price = _infer_fill_price(result, price)
+    symbol = kwargs.get("symbol") or getattr(S, "symbol", None) or "BTC/USDT"
+    try:
+        lev_source = (
+            kwargs.get("leverage")
+            or kwargs.get("lev")
+            or getattr(S, "leverage", None)
+            or getattr(S, "default_leverage", None)
+            or getattr(S, "leverage_default", None)
+            or 1.0
+        )
+        lev_value = float(lev_source)
+    except Exception:
+        lev_value = 1.0
+    tp_value = kwargs.get("tp")
+    sl_value = kwargs.get("sl")
+    mode_label = "live" if str(ACTIVE_MODE).lower() == "real" else "paper"
     try:
         if POSITION_SERVICE is not None and getattr(POSITION_SERVICE, "store", None):
             if isinstance(result, dict) and result.get("sim"):
@@ -239,6 +257,21 @@ def place_order_safe(side: str, qty: float, price: float | None = None, **kwargs
                         float(fill_price),
                         POSITION_SERVICE.get_status(),
                     )
+                    inferred_price = fill_price
+        if inferred_price is not None:
+            try:
+                on_open_filled(
+                    symbol,
+                    "LONG" if str(side).upper() in {"BUY", "LONG"} else "SHORT",
+                    float(qty),
+                    float(inferred_price),
+                    lev_value,
+                    tp=tp_value,
+                    sl=sl_value,
+                    mode=mode_label,
+                )
+            except Exception:
+                logger.debug("No se pudo persistir estado en state_store al abrir.", exc_info=True)
     except Exception:
         if isinstance(result, dict) and result.get("sim"):
             logger.warning("PAPER: no se pudo reflejar estado tras abrir.", exc_info=True)
@@ -273,6 +306,7 @@ def close_now(symbol: str | None = None):
         kwargs["reduce_only"] = True
 
     result = BROKER.place_order(close_side, qty, None, **kwargs)
+    close_price = _infer_fill_price(result, status.get("mark"))
     try:
         if POSITION_SERVICE is not None and getattr(POSITION_SERVICE, "store", None):
             if isinstance(result, dict) and result.get("sim"):
@@ -281,10 +315,15 @@ def close_now(symbol: str | None = None):
                 except Exception:
                     logger.warning("PAPER: refresh tras cierre falló", exc_info=True)
             else:
-                close_price = _infer_fill_price(result, status.get("mark"))
                 bot_side = "SHORT" if side == "LONG" else "LONG"
                 if close_price is not None:
                     POSITION_SERVICE.apply_fill(bot_side, float(qty), float(close_price))
+        if close_price is not None:
+            try:
+                target = target_symbol or symbol or getattr(S, "symbol", None) or "BTC/USDT"
+                on_close_filled(str(target), float(close_price))
+            except Exception:
+                logger.debug("No se pudo persistir cierre en state_store.", exc_info=True)
     except Exception:
         if isinstance(result, dict) and result.get("sim"):
             logger.warning("PAPER: no se pudo reflejar cierre en store.", exc_info=True)
