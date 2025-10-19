@@ -1015,6 +1015,25 @@ class RiskSizingBacktester:
         s = self._signal_strength(row, prev)
         return float(self.target_eq_pnl_pct_min + s * (self.target_eq_pnl_pct_max - self.target_eq_pnl_pct_min))
 
+    # --- NUEVO: target de PnL según apalancamiento ---
+    def _target_pct_for_leverage(self, lev: Optional[float]) -> Optional[float]:
+        """
+        Mapear leverage -> objetivo sobre equity al abrir:
+          x5  => 10%
+          x10 => 25%
+        """
+        if lev is None:
+            return None
+        try:
+            lv = float(lev)
+        except Exception:
+            return None
+        if abs(lv - 5.0) < 1e-6:
+            return 0.10
+        if abs(lv - 10.0) < 1e-6:
+            return 0.25
+        return None
+
     # ------------- Mark-to-market -------------
     def _mark_equity(self, price: float) -> float:
         eq = self.balance
@@ -1041,10 +1060,10 @@ class RiskSizingBacktester:
         elif (not self.use_atr) and self.sl_pct is not None:
             sl = entry * (1 - self.sl_pct) if side == "LONG" else entry * (1 + self.sl_pct)
         # TP
-        if target_pct is not None and self.size_mode == "full_equity":
-            # fijar tp para alcanzar target_pct * equity
-            # (tp - entry) * qty = target_pct * eq_now  => move = (target_pct * eq_now) / qty
-            move = (target_pct * eq_now) / max(self.qty, 1e-12)
+        # Si viene target_pct (fijado por leverage), usarlo SIEMPRE:
+        # (tp - entry) * qty = target_pct * eq_now  => move = (target_pct * eq_now) / qty
+        if target_pct is not None:
+            move = (float(target_pct) * float(eq_now)) / max(self.qty, 1e-12)
             tp = entry + move if side == "LONG" else entry - move
         elif self.use_atr and self.tp_atr_mult is not None:
             move = self.tp_atr_mult * atr
@@ -1237,11 +1256,14 @@ class RiskSizingBacktester:
                             self.max_hold_bars = self.micro_max_hold_bars
                             self.last_sl_multiplier = None
                         else:
-                            # Target dinámico en base a la PREVIA
-                            target_pct = self._dynamic_target_pct(ind, None)
-
                             # Leverage dinámico en base a la PREVIA
                             leverage_for_this_trade = self._get_dynamic_leverage(ind)
+
+                            # Objetivo por leverage: x5→10%, x10→25%.
+                            # Si no coincide, caemos al esquema dinámico previo.
+                            target_pct = self._target_pct_for_leverage(leverage_for_this_trade)
+                            if target_pct is None:
+                                target_pct = self._dynamic_target_pct(ind, None)
 
                             if self.size_mode in ("full_equity", "fraction"):
                                 risk_frac = 1.0 if self.size_mode == "full_equity" else max(min(self.size_fraction, 1.0), 0.0)
