@@ -12,6 +12,7 @@ from zoneinfo import ZoneInfo
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import pandas as pd
+import yaml
 from telegram import Update
 from telegram.ext import Application, ContextTypes, MessageHandler, filters
 from telegram.request import HTTPXRequest
@@ -773,9 +774,28 @@ async def posicion_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         mark = float(st.get("mark") or 0.0)
         pnl = float(st.get("pnl") or 0.0)
         sym = st.get("symbol") or (engine.config or {}).get("symbol", "?")
+        # Fecha/hora apertura y modo (si existen)
+        opened_at = st.get("opened_at")
+        mode_txt = (st.get("mode") or "").strip().lower()
+        if not mode_txt:
+            try:
+                mr = get_mode()
+                mode_txt = getattr(mr, "mode", "") or ("real" if not S.PAPER else "simulado")
+            except Exception:
+                mode_txt = "real" if not S.PAPER else "simulado"
+        opened_line = ""
+        if opened_at:
+            try:
+                from datetime import datetime, timezone
+
+                opened_local = fmt_ar(datetime.fromtimestamp(float(opened_at), tz=timezone.utc))
+                opened_line = f"• apertura: {opened_local}\n\n"
+            except Exception:
+                opened_line = ""
         reply_text = (
             "📍 *Posición del BOT*\n"
-            f"• Símbolo: *{sym}*\n"
+            f"{opened_line}"
+            f"• Símbolo: *{sym}* ({mode_txt.title()})\n"
             f"• Lado: *{side}*\n"
             f"• Cantidad (bot qty): *{_num(q, 4)}*\n"
             f"• Entrada: {_num(entry)}  |  Mark: {_num(mark)}\n"
@@ -815,6 +835,36 @@ async def posiciones_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
 
     if not positions:
+        # Respaldo: si el exchange no reporta, pero el BOT sí tiene abierta en PositionService, mostrarla
+        try:
+            st = trading.POSITION_SERVICE.get_status() if trading.POSITION_SERVICE else None
+        except Exception:
+            st = None
+        if st and (st.get("side", "FLAT").upper() != "FLAT"):
+            q = float(st.get("qty") or st.get("size") or 0.0)
+            side = (st.get("side") or "").upper()
+            entry = float(st.get("entry_price") or 0.0)
+            mark = float(st.get("mark") or 0.0)
+            sym = st.get("symbol") or symbol_bot
+            upnl = float(st.get("pnl") or 0.0)
+            opened_at = st.get("opened_at")
+            mode_txt = (st.get("mode") or ("real" if not S.PAPER else "simulado")).title()
+            opened_line = ""
+            if opened_at:
+                try:
+                    from datetime import datetime, timezone
+
+                    opened_local = fmt_ar(datetime.fromtimestamp(float(opened_at), tz=timezone.utc))
+                    opened_line = f" (apertura: {opened_local})"
+                except Exception:
+                    opened_line = ""
+            fallback = (
+                f"*[BOT]* *{sym}* | {side} | qty={_num(q, 4)} | "
+                f"entry=${_num(entry)} | mark=${_num(mark)} | uPnL=${_num(upnl)} "
+                f"({mode_txt}){opened_line}"
+            )
+            await message.reply_text(fallback, parse_mode="Markdown")
+            return
         await message.reply_text("No hay posiciones abiertas.")
         return
 
@@ -1439,6 +1489,27 @@ async def equity_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     frac = round(pct / 100.0, 4)
     _find_and_set_config(engine, "order_sizing.default_pct", frac)
     os.environ["EQUITY_PCT"] = str(frac)
+
+    # --- Persistencia en YAML si estamos en REAL ---
+    try:
+        mode_result = get_mode()
+        is_real = getattr(mode_result, "mode", None) == "real"
+    except Exception:
+        is_real = False
+
+    if is_real:
+        try:
+            # Leemos YAML actual, actualizamos order_sizing.default_pct y guardamos
+            cfg_path = os.getenv("CONFIG_PATH", "config.yaml")
+            raw = read_config_raw(cfg_path) or {}
+            raw.setdefault("order_sizing", {})
+            raw["order_sizing"]["default_pct"] = float(frac)
+            with open(cfg_path, "w", encoding="utf-8") as fh:
+                yaml.safe_dump(raw, fh, sort_keys=False, allow_unicode=True)
+        except Exception:
+            # No rompemos la UX si falló el guardado; queda al menos en memoria/env
+            pass
+
     await message.reply_text(f"✅ Porcentaje de equity seteado: {pct:.2f}% (frac={frac})")
 
 

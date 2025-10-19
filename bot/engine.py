@@ -862,8 +862,10 @@ class TradingApp:
 
             # 4) Ahora sí: anunciar la apertura (usá tu formato nuevo si ya lo tenés)
             base = str(self.config.get("symbol", "BTC/USDT")).split("/")[0]
+            mode_txt = "real" if not S.PAPER else "simulado"
             await self.notifier.send(
-                "🚀 operacion " + f"{base} Abierta: {signal}\n"
+                "🚀 operacion "
+                + f"{base} Abierta: {signal} ({mode_txt})\n"
                 + f"Apalancamiento: x{leverage:.1f}\n"
                 + f"precio: ${entry_price:.2f}\n"
                 + f"tp : ${tp_price:.2f}\n"
