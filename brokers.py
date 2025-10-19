@@ -327,11 +327,14 @@ class BinanceBroker:
         if normalized_side is None:
             raise ValueError(f"Lado de orden desconocido: {side}")
 
+        new_order_resp_type = params.pop("newOrderRespType", "RESULT")
+
         order_payload = dict(
             symbol=self._normalize_symbol(symbol),
             side=normalized_side,
             type=order_type,
             quantity=qty_f,
+            newOrderRespType=new_order_resp_type,
             **params,
         )
 
@@ -387,13 +390,16 @@ class BinanceBroker:
                 "type": order_type,
                 "stopPrice": px,
                 "closePosition": False,
-                "reduceOnly": True,
                 "quantity": qty,
                 "workingType": "CONTRACT_PRICE",
                 "newClientOrderId": f"bot-{label.lower()}-{int(time.time() * 1000)}",
             }
             if position_side:
+                # Hedge: se explicita positionSide y NO se usa reduceOnly
                 params["positionSide"] = position_side
+            else:
+                # One-way: sí usamos reduceOnly para asegurar cierre parcial
+                params["reduceOnly"] = True
             try:
                 self._call_with_backoff(self.client.futures_create_order, **params)
             except Exception as exc:
