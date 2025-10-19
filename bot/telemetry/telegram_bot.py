@@ -848,34 +848,46 @@ async def posiciones_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
             sym = st.get("symbol") or symbol_bot
             upnl = float(st.get("pnl") or 0.0)
             opened_at = st.get("opened_at")
-            mode_txt = (st.get("mode") or ("real" if not S.PAPER else "simulado")).title()
+            mode_txt = (st.get("mode") or "").strip().lower()
+            if not mode_txt:
+                try:
+                    mr = get_mode()
+                    mode_txt = getattr(mr, "mode", "") or ("real" if not S.PAPER else "simulado")
+                except Exception:
+                    mode_txt = "real" if not S.PAPER else "simulado"
             opened_line = ""
             if opened_at:
                 try:
                     from datetime import datetime, timezone
 
                     opened_local = fmt_ar(datetime.fromtimestamp(float(opened_at), tz=timezone.utc))
-                    opened_line = f" (apertura: {opened_local})"
+                    opened_line = f"• apertura: {opened_local}\n\n"
                 except Exception:
                     opened_line = ""
-            fallback = (
-                f"*[BOT]* *{sym}* | {side} | qty={_num(q, 4)} | "
-                f"entry=${_num(entry)} | mark=${_num(mark)} | uPnL=${_num(upnl)} "
-                f"({mode_txt}){opened_line}"
+            block = (
+                "📍 *Posición del BOT*\n"
+                f"{opened_line}"
+                f"• Símbolo: *{sym}* ({mode_txt.title()})\n"
+                f"• Lado: *{side}*\n"
+                f"• Cantidad (bot qty): *{_num(q, 4)}*\n"
+                f"• Entrada: {_num(entry)}  |  Mark: {_num(mark)}\n"
+                f"• PnL: *{_num(upnl)}*"
             )
-            await message.reply_text(fallback, parse_mode="Markdown")
+            await message.reply_text(block, parse_mode="Markdown")
             return
         await message.reply_text("No hay posiciones abiertas.")
         return
 
-    bot_status = None
+    st = None
     bot_qty = 0.0
+    opened_bot = None
     try:
-        bot_status = trading.POSITION_SERVICE.get_status() if trading.POSITION_SERVICE else None
-        bot_qty = float(bot_status.get("qty") or 0.0) if bot_status else 0.0
+        st = trading.POSITION_SERVICE.get_status() if trading.POSITION_SERVICE else None
     except Exception:
-        bot_status = None
-        bot_qty = 0.0
+        st = None
+    if st:
+        bot_qty = _first_float(st.get("qty"), st.get("size"), default=0.0)
+        opened_bot = st.get("opened_at")
 
     lines = ["📋 *Posiciones abiertas (BOT + usuario):*"]
     for pos in positions:
@@ -904,20 +916,30 @@ async def posiciones_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         upnl = _first_float(pos.get("unrealizedPnl"), pos.get("unrealized_pnl"), default=0.0)
 
         opened_at = pos.get("opened_at")
-        mode_txt = (pos.get("mode") or ("real" if not S.PAPER else "simulado")).title()
+        mode_txt = ("real" if not S.PAPER else "simulado").title()
         opened_line = ""
-        if opened_at:
+        is_bot_symbol = str(symbol).upper() == str(symbol_bot).upper()
+        if is_bot_symbol and opened_bot:
+            try:
+                opened_local = fmt_ar(datetime.fromtimestamp(float(opened_bot), tz=timezone.utc))
+                opened_line = f"• apertura: {opened_local}\n\n"
+            except Exception:
+                opened_line = ""
+        elif opened_at:
             try:
                 opened_local = fmt_ar(datetime.fromtimestamp(float(opened_at), tz=timezone.utc))
-                opened_line = f"• Apertura: {opened_local}\n"
+                opened_line = f"• apertura: {opened_local}\n\n"
             except Exception:
                 opened_line = ""
 
-        is_bot_symbol = str(symbol).upper() == str(symbol_bot).upper()
         header = "📍 *Posición del BOT*\n" if is_bot_symbol and abs(bot_qty) > 0 else "📍 *Posición*\n"
-        qty_line = f"• Cantidad: *{_num(qty, 4)}*"
+
         if is_bot_symbol and abs(bot_qty) > 0:
-            qty_line += f"  (bot qty={_num(bot_qty, 4)})"
+            # Mostrar exactamente como /posicion: etiqueta y cantidad del BOT
+            qty_line = f"• Cantidad (bot qty): *{_num(bot_qty, 4)}*"
+        else:
+            # Posición del usuario (exchange)
+            qty_line = f"• Cantidad: *{_num(qty, 4)}*"
 
         text = (
             f"{header}"
