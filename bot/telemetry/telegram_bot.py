@@ -1028,6 +1028,60 @@ async def cerrar_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _reply_chunks(update, f"No pude cerrar la **posición del BOT**: {exc}")
 
 
+async def sl_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Ver o setear el Stop Loss como % del equity al abrir (global para todos los leverages).
+      • sl           → muestra el valor actual
+      • sl 10        → setea 10% (también acepta decimales: 'sl 0.1' = 10%)
+    """
+
+    engine = _get_engine_from_context(context)
+    message = update.effective_message
+    if engine is None or message is None:
+        return
+
+    txt = (message.text or "").strip().lower()
+
+    def _cfg() -> Dict:
+        return _engine_config(engine) or {}
+
+    if re.match(r"^/?sl\s*$", txt):
+        cfg = _cfg()
+        v = cfg.get("sl_eq_pct", cfg.get("stop_eq_pnl_pct", 0.05))
+        try:
+            v = float(v)
+        except (TypeError, ValueError):
+            v = 0.05
+        if v < 1.0:
+            pct = v * 100.0
+        else:
+            pct = v
+            v = v / 100.0
+        await message.reply_text(
+            f"SL actual: {pct:.2f}% del equity",
+            parse_mode="Markdown",
+        )
+        return
+
+    m = re.match(r"^/?sl\s+([0-9]+(?:\.[0-9]+)?)%?\s*$", txt)
+    if not m:
+        await message.reply_text("Uso: `sl` | `sl 10` (10%) | `sl 0.1`", parse_mode="Markdown")
+        return
+
+    raw = float(m.group(1))
+    value = raw / 100.0 if raw >= 1.0 else raw
+    cfg = _cfg()
+    cfg["sl_eq_pct"] = value
+
+    if hasattr(engine, "config") and isinstance(engine.config, dict):
+        engine.config.update(cfg)
+
+    await message.reply_text(
+        f"✅ SL fijado en {value * 100:.2f}% del equity",
+        parse_mode="Markdown",
+    )
+
+
 async def tp_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Fija o muestra el TP por apalancamiento (como % del equity al abrir).
@@ -1472,6 +1526,12 @@ def _populate_registry() -> None:
         equity_command,
         aliases=["equity%", "equitypct", "porcentaje", "size"],
         help_text="Muestra o fija el % de equity (1–100). Ej: equity 37%",
+    )
+    REGISTRY.register(
+        "sl",
+        sl_command,
+        aliases=["stop", "stoploss"],
+        help_text="Ver o setear SL global como % del equity. Ej: `sl 10` (10%)",
     )
     REGISTRY.register(
         "pausa",

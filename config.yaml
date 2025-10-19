@@ -47,6 +47,11 @@ daily_stop_R: 2.5
 emerg_trade_stop_R: 1.8
 trail_to_be: false
 
+# SL global como % del equity al abrir (decimal). 0.05 = 5%
+sl_eq_pct: 0.05
+# Compatibilidad (clave anterior):
+# stop_eq_pnl_pct: 0.05
+
 # TP único 10% del equity al abrir
 target_eq_pnl_pct: 0.10
 

@@ -811,7 +811,7 @@ class TradingApp:
                 )
                 return
 
-            sl_price = self.strategy.calculate_sl(entry_price, last_candle, signal)
+            sl_price = self.strategy.calculate_sl(entry_price, last_candle, signal, eq_on_open)
             side = signal
             tp_price = self.strategy.calculate_tp(entry_price, qty, eq_on_open, side, leverage)
 

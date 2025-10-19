@@ -63,7 +63,44 @@ class Strategy:
         return None
 
     # SL ATR x 1.3 y TP único al 10% del equity al abrir (idéntico al sim)
-    def calculate_sl(self, entry_price: float, last_candle: pd.Series, side: str) -> float:
+    def calculate_sl(
+        self,
+        entry_price: float,
+        last_candle: pd.Series,
+        side: str,
+        equity_on_open: float | None = None,
+    ) -> float:
+        """
+        Calcula el precio de Stop Loss.
+
+        Si se provee ``equity_on_open`` se utiliza el % configurado sobre el equity
+        global al abrir (independiente del apalancamiento). Caso contrario conserva
+        el comportamiento anterior (ATR * multiplicador).
+        """
+
+        if equity_on_open is not None:
+            sl_pct = self.config.get("sl_eq_pct")
+            if sl_pct is None:
+                sl_pct = self.config.get("stop_eq_pnl_pct", 0.05)
+            try:
+                sl_pct = float(sl_pct)
+            except (TypeError, ValueError):
+                sl_pct = 0.05
+
+            risk_value = equity_on_open * sl_pct
+            qty_for_sl_val = None
+            if hasattr(last_candle, "get"):
+                qty_for_sl_val = last_candle.get("qty_for_sl")
+            try:
+                qty_for_sl = float(qty_for_sl_val)
+            except (TypeError, ValueError):
+                qty_for_sl = 1.0
+            if not qty_for_sl or qty_for_sl <= 0:
+                qty_for_sl = 1.0
+
+            move = risk_value / max(qty_for_sl, 1e-12)
+            return (entry_price - move) if side == "LONG" else (entry_price + move)
+
         atr = float(last_candle["atr"])
         sl_mult = float(self.config.get("sl_atr_mult", 1.3))
         return entry_price - (atr * sl_mult) if side == "LONG" else entry_price + (atr * sl_mult)
