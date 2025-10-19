@@ -191,7 +191,6 @@ class RealExchange:
     async def get_open_position(self, symbol: Optional[str] = None) -> Optional[Dict[str, Any]]:
         sym = symbol or self.symbol or "BTC/USDT"
         target = sym.replace("/", "")
-        target_upper = target.upper()
 
         ccxt_client = getattr(self, "ccxt", None) or self.client
         if ccxt_client is not None and hasattr(ccxt_client, "fetch_positions"):
@@ -200,8 +199,9 @@ class RealExchange:
                 for entry in pos_list or []:
                     info = entry.get("info") or {}
                     exch_sym = str(info.get("symbol") or entry.get("symbol") or "").upper()
+                    # normalizar para comparar: quitar "/"
                     exch_id = exch_sym.replace("/", "")
-                    if exch_id != target_upper:
+                    if exch_id != target.upper():
                         continue
                     raw_amt = info.get("positionAmt") or info.get("positionamt")
                     if raw_amt is None:
@@ -238,8 +238,9 @@ class RealExchange:
                 return None
             for pos in account.get("positions", []):
                 exch_sym = str(pos.get("symbol") or "").upper()
+                # normalizar para comparar: quitar "/"
                 exch_id = exch_sym.replace("/", "")
-                if exch_id != target_upper:
+                if exch_id != target.upper():
                     continue
                 raw_amt = pos.get("positionAmt") or pos.get("positionamt")
                 amt_f = float(raw_amt or "0")
@@ -253,7 +254,7 @@ class RealExchange:
                     try:
                         mp = await self._call_native(
                             native_client.futures_mark_price,
-                            symbol=target_upper,
+                            symbol=target.upper(),
                         )
                     except Exception:
                         mp = None
