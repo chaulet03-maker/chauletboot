@@ -253,7 +253,7 @@ class RealExchange:
                     try:
                         mp = await self._call_native(
                             native_client.futures_mark_price,
-                            symbol=target,
+                            symbol=target_upper,
                         )
                     except Exception:
                         mp = None
