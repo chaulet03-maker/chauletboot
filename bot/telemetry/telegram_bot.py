@@ -777,7 +777,7 @@ async def posicion_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "📍 *Posición del BOT*\n"
             f"• Símbolo: *{sym}*\n"
             f"• Lado: *{side}*\n"
-            f"• Cantidad (bot_qty): *_{_num(q, 4)}_*\n"
+            f"• Cantidad (bot qty): *{_num(q, 4)}*\n"
             f"• Entrada: {_num(entry)}  |  Mark: {_num(mark)}\n"
             f"• PnL: *{_num(pnl)}*"
         )
@@ -857,7 +857,7 @@ async def posiciones_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         # Resaltar SOLO si el BOT tiene porción abierta en este símbolo
         is_bot_symbol = str(symbol).upper() == str(symbol_bot).upper()
         if is_bot_symbol and bot_qty and abs(bot_qty) > 0:
-            lines.append(f"*[BOT]* *{formatted}*  (bot_qty={_num(bot_qty, 4)})")
+            lines.append(f"*[BOT]* *{formatted}*  (bot qty={_num(bot_qty, 4)})")
         else:
             lines.append(formatted)
 
