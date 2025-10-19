@@ -31,6 +31,40 @@ logger = logging.getLogger("telegram")
 REGISTRY = CommandRegistry()
 
 
+def _format_position_block(
+    *,
+    symbol: str,
+    side: str,
+    qty: float,
+    entry: float,
+    mark: float,
+    pnl: float,
+    mode_txt: str,
+    opened_at: float | None = None,
+    is_bot: bool = False,
+) -> str:
+    """Bloque idéntico al de /posicion."""
+    title = "📍 *Posición del BOT*" if is_bot else "📍 *Posición*"
+    opened_line = ""
+    if opened_at:
+        try:
+            from datetime import datetime, timezone
+
+            opened_local = fmt_ar(datetime.fromtimestamp(float(opened_at), tz=timezone.utc))
+            opened_line = f"• apertura: {opened_local}\n\n"
+        except Exception:
+            opened_line = ""
+    return (
+        f"{title}\n"
+        f"{opened_line}"
+        f"• Símbolo: *{symbol}* ({mode_txt.title()})\n"
+        f"• Lado: *{(side or '').upper()}*\n"
+        f"• Cantidad (bot qty): *{_num(qty, 4)}*\n"
+        f"• Entrada: {_num(entry)}  |  Mark: {_num(mark)}\n"
+        f"• PnL: *{_num(pnl)}*"
+    )
+
+
 async def _on_error(update: Optional[Update], context: ContextTypes.DEFAULT_TYPE):
     error = getattr(context, "error", None)
     if error:
@@ -163,45 +197,19 @@ def _num(val, decimals=2):
 
 
 def _get_equity_fraction(engine) -> float:
-    """Devuelve el equity% configurado como fracción.
-
-    Prioriza, en orden:
-    1) Variable de entorno EQUITY_PCT
-    2) engine.config.order_sizing.default_pct
-    3) getattr(engine, "order_sizes", {}).get("default_pct")
-    Fallback: 1.0
-    """
-
-    try:
-        env_value = os.environ.get("EQUITY_PCT")
-        if env_value is not None:
-            fraction = float(env_value)
-            if 0.0 < fraction <= 1.0:
-                return fraction
-    except Exception:
-        pass
-
-    try:
-        cfg = getattr(engine, "config", {}) or {}
-        osz = cfg.get("order_sizing") or {}
-        value = osz.get("default_pct", None)
-        if value is not None:
-            fraction = float(value)
-            if 0.0 < fraction <= 1.0:
-                return fraction
-    except Exception:
-        pass
-
-    try:
-        osz = getattr(engine, "order_sizes", {}) or {}
-        value = osz.get("default_pct", None)
-        if value is not None:
-            fraction = float(value)
-            if 0.0 < fraction <= 1.0:
-                return fraction
-    except Exception:
-        pass
-
+    # PRIORIDAD: ENV -> engine.config -> default
+    env = os.getenv("EQUITY_PCT")
+    if env:
+        try:
+            f = float(env)
+            if 0 < f <= 1:
+                return f
+        except Exception:
+            pass
+    cfg = getattr(engine, "config", {}) or {}
+    frac = cfg.get("order_sizing", {}).get("default_pct")
+    if isinstance(frac, (int, float)) and 0 < frac <= 1:
+        return float(frac)
     return 1.0
 
 def _pct_rel(entry: float, level: float) -> float:
@@ -829,13 +837,14 @@ async def posiciones_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         logger.debug("upgrade_to_real_if_needed desde /posiciones falló: %s", exc)
     # 2) Traer TODAS las posiciones del exchange (usuario + bot)
     try:
-        positions = await exchange.fetch_positions(None)
+        live_positions = await exchange.list_open_positions()
     except Exception as exc:  # pragma: no cover - robustez
         await message.reply_text(f"No pude leer posiciones: {exc}")
         return
 
-    if not positions:
-        # Respaldo: si el exchange no reporta, pero el BOT sí tiene abierta en PositionService, mostrarla
+    blocks: list[str] = []
+    # Si el exchange no reporta, usar respaldo del BOT
+    if not live_positions:
         try:
             st = trading.POSITION_SERVICE.get_status() if trading.POSITION_SERVICE else None
         except Exception:
@@ -848,111 +857,55 @@ async def posiciones_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
             sym = st.get("symbol") or symbol_bot
             upnl = float(st.get("pnl") or 0.0)
             opened_at = st.get("opened_at")
-            mode_txt = (st.get("mode") or "").strip().lower()
-            if not mode_txt:
-                try:
-                    mr = get_mode()
-                    mode_txt = getattr(mr, "mode", "") or ("real" if not S.PAPER else "simulado")
-                except Exception:
-                    mode_txt = "real" if not S.PAPER else "simulado"
-            opened_line = ""
-            if opened_at:
-                try:
-                    from datetime import datetime, timezone
-
-                    opened_local = fmt_ar(datetime.fromtimestamp(float(opened_at), tz=timezone.utc))
-                    opened_line = f"• apertura: {opened_local}\n\n"
-                except Exception:
-                    opened_line = ""
-            block = (
-                "📍 *Posición del BOT*\n"
-                f"{opened_line}"
-                f"• Símbolo: *{sym}* ({mode_txt.title()})\n"
-                f"• Lado: *{side}*\n"
-                f"• Cantidad (bot qty): *{_num(q, 4)}*\n"
-                f"• Entrada: {_num(entry)}  |  Mark: {_num(mark)}\n"
-                f"• PnL: *{_num(upnl)}*"
+            mode_txt = (st.get("mode") or ("real" if not S.PAPER else "simulado"))
+            blocks.append(
+                _format_position_block(
+                    symbol=sym,
+                    side=side,
+                    qty=q,
+                    entry=entry,
+                    mark=mark,
+                    pnl=upnl,
+                    mode_txt=mode_txt,
+                    opened_at=opened_at,
+                    is_bot=True,
+                )
             )
-            await message.reply_text(block, parse_mode="Markdown")
+            await message.reply_text("\n".join(blocks), parse_mode="Markdown")
             return
         await message.reply_text("No hay posiciones abiertas.")
         return
 
-    st = None
-    bot_qty = 0.0
-    opened_bot = None
+    # Hay posiciones en el exchange → mostrarlas con el mismo formato
     try:
-        st = trading.POSITION_SERVICE.get_status() if trading.POSITION_SERVICE else None
+        st_bot = trading.POSITION_SERVICE.get_status() if trading.POSITION_SERVICE else None
     except Exception:
-        st = None
-    if st:
-        bot_qty = _first_float(st.get("qty"), st.get("size"), default=0.0)
-        opened_bot = st.get("opened_at")
+        st_bot = None
+    opened_bot = st_bot.get("opened_at") if st_bot else None
 
-    lines = ["📋 *Posiciones abiertas (BOT + usuario):*"]
-    for pos in positions:
-        symbol = pos.get("symbol") or pos.get("info", {}).get("symbol") or "?"
-        qty = _first_float(
-            pos.get("contracts"),
-            pos.get("size"),
-            pos.get("contractsSize"),
-            pos.get("amount"),
-            default=0.0,
-        )
-        side = (pos.get("side") or ("LONG" if qty > 0 else ("SHORT" if qty < 0 else "FLAT"))).upper()
-        entry = _first_float(
-            pos.get("entryPrice"),
-            pos.get("entry_price"),
-            pos.get("avgPrice"),
-            pos.get("average"),
-            default=0.0,
-        )
-        mark = _first_float(
-            pos.get("markPrice"),
-            pos.get("mark"),
-            pos.get("marketPrice"),
-            default=0.0,
-        )
-        upnl = _first_float(pos.get("unrealizedPnl"), pos.get("unrealized_pnl"), default=0.0)
-
-        opened_at = pos.get("opened_at")
-        mode_txt = ("real" if not S.PAPER else "simulado").title()
-        opened_line = ""
+    for pos in live_positions:
+        symbol = pos.get("symbol") or pos.get("symbolName") or symbol_bot
+        side = (pos.get("side") or "").upper()
+        size = float(pos.get("contracts") or pos.get("positionAmt") or pos.get("size") or 0.0)
+        entry = float(pos.get("entryPrice") or pos.get("avgEntryPrice") or pos.get("entry") or 0.0)
+        mark = float(pos.get("markPrice") or pos.get("mark") or 0.0)
+        upnl = float(pos.get("unrealizedPnl") or pos.get("unrealized_pnl") or 0.0)
         is_bot_symbol = str(symbol).upper() == str(symbol_bot).upper()
-        if is_bot_symbol and opened_bot:
-            try:
-                opened_local = fmt_ar(datetime.fromtimestamp(float(opened_bot), tz=timezone.utc))
-                opened_line = f"• apertura: {opened_local}\n\n"
-            except Exception:
-                opened_line = ""
-        elif opened_at:
-            try:
-                opened_local = fmt_ar(datetime.fromtimestamp(float(opened_at), tz=timezone.utc))
-                opened_line = f"• apertura: {opened_local}\n\n"
-            except Exception:
-                opened_line = ""
-
-        header = "📍 *Posición del BOT*\n" if is_bot_symbol and abs(bot_qty) > 0 else "📍 *Posición*\n"
-
-        if is_bot_symbol and abs(bot_qty) > 0:
-            # Mostrar exactamente como /posicion: etiqueta y cantidad del BOT
-            qty_line = f"• Cantidad (bot qty): *{_num(bot_qty, 4)}*"
-        else:
-            # Posición del usuario (exchange)
-            qty_line = f"• Cantidad: *{_num(qty, 4)}*"
-
-        text = (
-            f"{header}"
-            f"{opened_line}"
-            f"• Símbolo: *{symbol}* ({mode_txt})\n"
-            f"• Lado: *{side}*\n"
-            f"{qty_line}\n"
-            f"• Entrada: {_num(entry)}  |  Mark: {_num(mark)}\n"
-            f"• PnL: *{_num(upnl)}*"
+        mode_txt = "real" if not S.PAPER else "simulado"
+        blocks.append(
+            _format_position_block(
+                symbol=symbol,
+                side=side,
+                qty=size,
+                entry=entry,
+                mark=mark,
+                pnl=upnl,
+                mode_txt=mode_txt,
+                opened_at=(opened_bot if is_bot_symbol else None),
+                is_bot=is_bot_symbol,
+            )
         )
-        lines.append(text.strip())
-
-    await message.reply_text("\n\n".join(lines), parse_mode="Markdown")
+    await message.reply_text("\n\n".join(blocks), parse_mode="Markdown")
 
 
 async def estado_command(update: Update, context: ContextTypes.DEFAULT_TYPE):

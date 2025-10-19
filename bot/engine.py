@@ -337,7 +337,7 @@ class TradingApp:
                         }
                         await self.trader.set_position(position)
                 else:
-                    # SIM: sólo si qty_local > 0 y side != FLAT
+                    # SIM: sólo si qty_local > 0 (|qty| > 1e-12) y side != FLAT
                     if bot_has_open:
                         position = {
                             "symbol": st.get("symbol", self.config.get("symbol")),
@@ -347,6 +347,13 @@ class TradingApp:
                             "markPrice": float(st.get("mark") or 0.0),
                         }
                         await self.trader.set_position(position)
+                    else:
+                        # sin qty local -> asegurar limpieza de cache
+                        try:
+                            if hasattr(self.trader, "_open_position"):
+                                self.trader._open_position = None
+                        except Exception:
+                            pass
             except Exception as exc:
                 logging.debug("PositionService mapping fail: %s", exc)
 
