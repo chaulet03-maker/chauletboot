@@ -1028,6 +1028,77 @@ async def cerrar_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _reply_chunks(update, f"No pude cerrar la **posición del BOT**: {exc}")
 
 
+async def tp_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Fija o muestra el TP por apalancamiento (como % del equity al abrir).
+    Ejemplos:
+      • tp x5 10        → setea x5 en 10%
+      • tp x10 8        → setea x10 en 8%
+      • tp              → muestra mapeo actual
+      • tp x5           → muestra valor actual para x5
+    """
+    engine = _get_engine_from_context(context)
+    message = update.effective_message
+    if engine is None or message is None:
+        return
+
+    def _cfg() -> Dict:
+        return _engine_config(engine) or {}
+
+    txt = (message.text or "").strip().lower()
+
+    # 1) "tp" o "tp x5" → mostrar
+    m_show_one = re.match(r"^/?tp\s+x?(\d{1,3})\s*$", txt)
+    m_show_all = re.match(r"^/?tp\s*$", txt)
+    if m_show_all:
+        cfg = _cfg()
+        m = cfg.get("tp_eq_pct_by_leverage", {}) or {}
+        default_pct = float(cfg.get("target_eq_pnl_pct", 0.10))
+        lines = ["*TP por apalancamiento*"]
+        if isinstance(m, dict) and m:
+            for k in sorted([str(x) for x in m.keys()], key=lambda s: int(s)):
+                v = float(m[k])
+                v = v / 100.0 if v >= 1.0 else v
+                lines.append(f"• x{int(k)}: {v*100:.2f}% del equity")
+        else:
+            lines.append("_(sin overrides; usando default)_")
+        lines.append(f"• Default: {default_pct*100:.2f}% del equity (`target_eq_pnl_pct`)")
+        await message.reply_text("\n".join(lines), parse_mode="Markdown")
+        return
+    if m_show_one:
+        lev = int(m_show_one.group(1))
+        cfg = _cfg()
+        m = cfg.get("tp_eq_pct_by_leverage", {}) or {}
+        v = m.get(str(lev), None)
+        if v is None:
+            await message.reply_text(f"x{lev}: _sin override_ (usa default)", parse_mode="Markdown")
+        else:
+            v = float(v)
+            v = v / 100.0 if v >= 1.0 else v
+            await message.reply_text(f"x{lev}: {v*100:.2f}% del equity", parse_mode="Markdown")
+        return
+
+    # 2) "tp x5 10" → setear
+    m_set = re.match(r"^/?tp\s+x?(\d{1,3})\s+([0-9]+(?:\.[0-9]+)?)%?\s*$", txt)
+    if not m_set:
+        await message.reply_text("Uso: `tp x5 10` | `tp x10 8` | `tp`", parse_mode="Markdown")
+        return
+    lev = int(m_set.group(1))
+    pct_in = float(m_set.group(2))
+    pct = (pct_in / 100.0) if pct_in >= 1.0 else pct_in
+    cfg = _cfg()
+    mapping = dict(cfg.get("tp_eq_pct_by_leverage", {}) or {})
+    mapping[str(lev)] = pct
+    cfg["tp_eq_pct_by_leverage"] = mapping
+    # guardamos en el objeto de runtime
+    if hasattr(engine, "config") and isinstance(engine.config, dict):
+        engine.config.update(cfg)
+    await message.reply_text(
+        f"✅ TP para x{lev} fijado en {pct*100:.2f}% del equity",
+        parse_mode="Markdown",
+    )
+
+
 async def precio_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     engine = _get_engine_from_context(context)
     if engine is None:
@@ -1426,8 +1497,14 @@ def _populate_registry() -> None:
         "cerrar",
         cerrar_command,
         aliases=["close", "cerrar posicion", "cerrar posición"],
-        help_text="Cierra la posición actual",
-        show_in_help=False,
+        help_text="Cierra la posición abierta por el bot (paper/real)",
+        show_in_help=True,
+    )
+    REGISTRY.register(
+        "tp",
+        tp_command,
+        aliases=["takeprofit", "tp%"],
+        help_text="Fijá o mostrá el TP por apalancamiento. Ej: `tp x5 10` (10%)",
     )
     REGISTRY.register(
         "killswitch",
