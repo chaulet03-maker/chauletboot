@@ -18,6 +18,7 @@ from bot.storage import Storage
 from bot.telemetry.notifier import Notifier
 from bot.telemetry.telegram_bot import setup_telegram_bot
 from brokers import ACTIVE_LIVE_CLIENT
+from state_store import create_position, load_state, persist_open, save_state
 from bot.motives import MOTIVES, MotiveItem, compute_codes
 from core.strategy import Strategy
 from core.indicators import add_indicators
@@ -902,6 +903,178 @@ class TradingApp:
                     self.price_cache[sym] = float(px)
         except Exception as e:
             logging.warning(f"No pude actualizar la cache de precios: {e}")
+
+    def has_open_position(self) -> bool:
+        """Indica si el estado local del bot registra una posición abierta."""
+
+        try:
+            trading.ensure_initialized()
+        except Exception:
+            return False
+
+        service = getattr(trading, "POSITION_SERVICE", None)
+        if service is None:
+            return False
+
+        try:
+            status = service.get_status() or {}
+        except Exception as exc:
+            self.logger.debug("has_open_position: no se pudo obtener status: %s", exc)
+            return False
+
+        side = str(status.get("side", "FLAT")).upper()
+        try:
+            qty = float(status.get("qty") or status.get("pos_qty") or 0.0)
+        except Exception:
+            qty = 0.0
+        return side != "FLAT" and abs(qty) > 0.0
+
+    def sync_live_position(self) -> bool:
+        """
+        Trae la posición LIVE del exchange y la sincroniza al estado local del bot.
+        Devuelve True si encontró y tomó control de una posición; False si no hay.
+        """
+
+        symbol = getattr(self, "symbol", None) or self.config.get("symbol", "BTC/USDT")
+        trading.ensure_initialized()
+
+        broker = getattr(trading, "BROKER", None)
+        client = getattr(broker, "client", None) if broker is not None else None
+        if client is None:
+            client = getattr(trading, "ACTIVE_LIVE_CLIENT", None)
+        if client is None:
+            client = ACTIVE_LIVE_CLIENT
+        if client is None:
+            raise RuntimeError("No hay cliente LIVE disponible para sincronizar la posición.")
+
+        symbol_no_slash = str(symbol).replace("/", "").upper()
+
+        def _call_positions():
+            if hasattr(client, "futures_position_information"):
+                return client.futures_position_information(symbol=symbol_no_slash)
+            if hasattr(client, "fapiPrivate_get_positionrisk"):
+                return client.fapiPrivate_get_positionrisk({"symbol": symbol_no_slash})
+            if hasattr(client, "fapiPrivateGetPositionRisk"):
+                return client.fapiPrivateGetPositionRisk({"symbol": symbol_no_slash})
+            raise RuntimeError("El cliente live no permite consultar posiciones abiertas.")
+
+        try:
+            raw_positions = _call_positions()
+        except Exception as exc:
+            self.logger.exception("sync_live_position: error consultando broker: %s", exc)
+            raise
+
+        if raw_positions is None:
+            entries: list[dict[str, Any]] = []
+        elif isinstance(raw_positions, list):
+            entries = [entry for entry in raw_positions if isinstance(entry, dict)]
+        elif isinstance(raw_positions, dict):
+            entries = [raw_positions]
+        else:
+            entries = []
+
+        def _as_float(entry: Dict[str, Any], *keys: str, default: float = 0.0) -> float:
+            for key in keys:
+                if entry.get(key) is None:
+                    continue
+                try:
+                    return float(entry[key])
+                except Exception:
+                    continue
+            return float(default)
+
+        amount = 0.0
+        entry_price = 0.0
+        leverage = 1.0
+        mark_price = 0.0
+        for entry in entries:
+            entry_symbol = str(entry.get("symbol") or entry.get("symbolName") or "").upper()
+            if entry_symbol != symbol_no_slash:
+                continue
+            amt = _as_float(entry, "positionAmt", "position_amt", "amount", "qty")
+            if abs(amt) <= 0.0:
+                continue
+            amount = amt
+            entry_price = _as_float(entry, "entryPrice", "entry_price", "avgPrice", "avgEntryPrice")
+            leverage = max(1.0, _as_float(entry, "leverage"))
+            mark_price = _as_float(entry, "markPrice", "mark_price", default=entry_price)
+            position_side = str(entry.get("positionSide", "")).upper()
+            if position_side in {"LONG", "SHORT", "BOTH"}:
+                break
+
+        service = getattr(trading, "POSITION_SERVICE", None)
+        store = getattr(service, "store", None)
+
+        if abs(amount) <= 0.0:
+            self.logger.info(
+                "sync_live_position: sin posición LIVE para %s. Limpiando estado local.",
+                symbol,
+            )
+            if store is not None:
+                try:
+                    store.save(pos_qty=0.0, avg_price=0.0)
+                except Exception:
+                    self.logger.debug("No se pudo limpiar store al sincronizar.", exc_info=True)
+            try:
+                state = load_state()
+                open_positions = state.get("open_positions", {})
+                if open_positions.pop(symbol, None) is not None:
+                    save_state(state)
+            except Exception:
+                self.logger.debug("No se pudo limpiar state_store al sincronizar.", exc_info=True)
+            try:
+                if hasattr(self.trader, "_open_position"):
+                    self.trader._open_position = None
+            except Exception:
+                self.logger.debug("No se pudo limpiar cache de trader al sincronizar.", exc_info=True)
+            self.position_open = False
+            return False
+
+        side = "LONG" if amount > 0 else "SHORT"
+        qty = abs(float(amount))
+        entry_price_f = float(entry_price)
+        leverage_i = int(leverage) if leverage >= 1 else 1
+
+        if store is not None:
+            try:
+                store.save(pos_qty=float(amount), avg_price=entry_price_f, mark=mark_price)
+            except Exception:
+                self.logger.debug("No se pudo actualizar el store con la posición live.", exc_info=True)
+
+        try:
+            pos = create_position(
+                symbol=symbol,
+                side=side,
+                qty=qty,
+                entry_price=entry_price_f,
+                leverage=float(leverage_i),
+                mode="live",
+            )
+            persist_open(pos)
+        except Exception:
+            self.logger.debug("No se pudo persistir la posición live en state_store.", exc_info=True)
+
+        try:
+            if hasattr(self.trader, "_open_position"):
+                self.trader._open_position = {
+                    "symbol": symbol,
+                    "side": side,
+                    "contracts": qty,
+                    "entryPrice": entry_price_f,
+                    "markPrice": mark_price,
+                }
+        except Exception:
+            self.logger.debug("No se pudo actualizar la cache del trader con la posición live.", exc_info=True)
+
+        self.position_open = True
+        self.logger.info(
+            "sync_live_position: posición adoptada %s %.6f @ %.2f x%s",
+            side,
+            qty,
+            entry_price_f,
+            leverage_i,
+        )
+        return True
 
     async def _preload_position_from_store(self) -> None:
         if trading.POSITION_SERVICE is None:
