@@ -1028,6 +1028,57 @@ async def cerrar_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _reply_chunks(update, f"No pude cerrar la **posición del BOT**: {exc}")
 
 
+async def control_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Toma control de la posición REAL actual: fuerza modo REAL y sincroniza desde el exchange."""
+
+    engine = _get_engine_from_context(context)
+    message = update.effective_message
+    if engine is None or message is None:
+        return
+
+    result = trading.switch_mode("real")
+    if not result.ok:
+        await message.reply_text(f"❌ No pude activar modo REAL: {result.msg}", parse_mode="Markdown")
+        return
+
+    extra = result.msg or ""
+    warn_lines = [
+        line.strip()
+        for line in extra.splitlines()
+        if line.strip() and "Modo cambiado" not in line
+    ]
+    if warn_lines:
+        await message.reply_text("\n".join(warn_lines), parse_mode="Markdown")
+
+    try:
+        if hasattr(engine, "exchange") and engine.exchange:
+            await engine.exchange.upgrade_to_real_if_needed()
+    except Exception:
+        logger.debug("control_command: no se pudo reautenticar exchange tras activar REAL.", exc_info=True)
+
+    try:
+        if getattr(engine, "trader", None):
+            engine.trader.reset_caches()
+    except Exception:
+        logger.debug("control_command: no se pudo resetear caches del trader.", exc_info=True)
+
+    await message.reply_text("Modo REAL activado. Buscando posición LIVE en el exchange…")
+    if not hasattr(engine, "sync_live_position"):
+        await message.reply_text("❌ Engine no soporta sincronización automática.")
+        return
+
+    try:
+        synced = await asyncio.to_thread(engine.sync_live_position)
+    except Exception as exc:
+        await message.reply_text(f"❌ Error al sincronizar con el exchange: {exc}")
+        return
+
+    if synced:
+        await message.reply_text("✅ Posición LIVE sincronizada. Ya la estoy controlando.")
+    else:
+        await message.reply_text("ℹ️ No encontré posición LIVE en el exchange.")
+
+
 async def sl_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Ver o setear el Stop Loss como % del equity al abrir (global para todos los leverages).
@@ -1227,11 +1278,21 @@ async def bot_off_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def _modo_command(update: Update, context: ContextTypes.DEFAULT_TYPE, new_mode: str):
+    engine = _get_engine_from_context(context)
+    message = update.effective_message
+    rescue_needed = False
+    if new_mode == "real" and engine is not None:
+        has_open_fn = getattr(engine, "has_open_position", None)
+        if callable(has_open_fn):
+            try:
+                rescue_needed = bool(has_open_fn())
+            except Exception:
+                rescue_needed = False
+
     result = trading.switch_mode("real" if new_mode == "real" else "simulado")
     if result.ok:
         base_msg = f"✅ Modo cambiado a *{new_mode.upper()}*. El bot ya opera en {new_mode}."
         msg = f"{base_msg}\n{result.msg}" if result.msg else base_msg
-        engine = _get_engine_from_context(context)
         if new_mode == "real":
             try:
                 if engine and hasattr(engine, "exchange") and engine.exchange:
@@ -1250,9 +1311,31 @@ async def _modo_command(update: Update, context: ContextTypes.DEFAULT_TYPE, new_
                 engine.trader.reset_caches()
         except Exception:
             logger.debug("No se pudo resetear caches del trader tras cambio de modo.", exc_info=True)
+        if message is not None:
+            await message.reply_text(msg, parse_mode="Markdown")
+        if new_mode == "real" and engine is not None and message is not None:
+            if rescue_needed and hasattr(engine, "sync_live_position"):
+                await message.reply_text(
+                    "⚠️ Rescate: activé modo REAL y sincronizo la posición del exchange…"
+                )
+                try:
+                    synced = await asyncio.to_thread(engine.sync_live_position)
+                except Exception as exc:
+                    await message.reply_text(
+                        f"⚠️ Activé REAL pero falló la sincronización automática: {exc}"
+                    )
+                else:
+                    if synced:
+                        await message.reply_text(
+                            "✅ Posición LIVE sincronizada. El bot ya la controla."
+                        )
+                    else:
+                        await message.reply_text(
+                            "ℹ️ No hay posición LIVE en el exchange. Estado local limpiado."
+                        )
+        return
     else:
         msg = f"❌ No pude cambiar el modo: {result.msg}"
-    message = update.effective_message
     if message is None:
         return
     await message.reply_text(msg, parse_mode="Markdown")
@@ -1558,6 +1641,13 @@ def _populate_registry() -> None:
         cerrar_command,
         aliases=["close", "cerrar posicion", "cerrar posición"],
         help_text="Cierra la posición abierta por el bot (paper/real)",
+        show_in_help=True,
+    )
+    REGISTRY.register(
+        "control",
+        control_command,
+        aliases=["sync", "tomarcontrol", "rescate"],
+        help_text="Toma control de la posición LIVE del exchange (fuerza REAL y sincroniza).",
         show_in_help=True,
     )
     REGISTRY.register(

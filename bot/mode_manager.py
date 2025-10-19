@@ -94,12 +94,27 @@ def safe_switch(new_mode: Mode, services) -> ModeResult:
         log.debug("No se pudo obtener position_status antes de cambiar modo: %s", exc)
         status = None
 
-    if status and str(status.get("side", "FLAT")).upper() != "FLAT":
-        return ModeResult(
-            False,
-            "No se puede cambiar de modo con una posición abierta. Cerrá la posición primero.",
-            None,
-        )
+    warn_msg = ""
+    if status:
+        side = str(status.get("side", "FLAT")).upper()
+        try:
+            qty_val = float(status.get("qty") or status.get("pos_qty") or 0.0)
+        except Exception:
+            qty_val = 0.0
+        has_open = side != "FLAT" and abs(qty_val) > 0.0
+        if has_open:
+            if new_mode == "real":
+                warn_msg = (
+                    "⚠️ Se detectó una posición abierta en el estado local."
+                    " Se forzó el cambio a REAL; sincronizá contra el exchange para evitar"
+                    " inconsistencias."
+                )
+            else:
+                return ModeResult(
+                    False,
+                    "No se puede cambiar de modo con una posición abierta. Cerrá la posición primero.",
+                    None,
+                )
 
     if new_mode == "real":
         ok, msg = check_keys_present(env=os.environ)
@@ -115,7 +130,10 @@ def safe_switch(new_mode: Mode, services) -> ModeResult:
             trading.force_refresh_clients()
         except Exception:
             pass
-        return ModeResult(True, f"Modo cambiado a {new_mode.upper()} correctamente.", new_mode)
+        message = f"Modo cambiado a {new_mode.upper()} correctamente."
+        if warn_msg:
+            message = f"{message}\n{warn_msg}"
+        return ModeResult(True, message, new_mode)
     except Exception as exc:  # pragma: no cover - defensivo
         log.exception("Error al cambiar de modo: %s", exc)
         return ModeResult(False, f"Error al cambiar de modo: {exc}", None)
