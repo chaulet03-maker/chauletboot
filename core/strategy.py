@@ -68,12 +68,34 @@ class Strategy:
         sl_mult = float(self.config.get("sl_atr_mult", 1.3))
         return entry_price - (atr * sl_mult) if side == "LONG" else entry_price + (atr * sl_mult)
 
-    def calculate_tp(self, entry_price: float, quantity: float, equity_on_open: float, side: str) -> float:
-        # Idéntico al simulador:
-        # move = (target_eq_pnl_pct * equity_on_open) / qty
+    def calculate_tp(
+        self,
+        entry_price: float,
+        quantity: float,
+        equity_on_open: float,
+        side: str,
+        leverage: int | None = None,
+    ) -> float:
+        """
+        TP único expresado como % del equity al abrir.
+        Si existe `tp_eq_pct_by_leverage` en config y se pasa `leverage`,
+        usa ese valor; si no, cae en `target_eq_pnl_pct`.
+        """
+        # default (global)
         tp_pct = float(self.config.get("target_eq_pnl_pct", 0.10))
+
+        # override por apalancamiento (si está configurado)
+        if leverage is not None:
+            mapping = self.config.get("tp_eq_pct_by_leverage", {})
+            if isinstance(mapping, dict):
+                key = str(int(leverage))
+                v = mapping.get(key, mapping.get(int(leverage)))  # soporta str o int
+                if v is not None:
+                    v = float(v)
+                    tp_pct = v / 100.0 if v >= 1.0 else v  # admite "10" o 0.10
+
         pnl_target = equity_on_open * tp_pct
-        move = pnl_target / max(quantity, 1e-12)
+        move = pnl_target / max(float(quantity), 1e-12)
         return (entry_price + move) if side == "LONG" else (entry_price - move)
 
     # Apalancamiento dinámico por ADX (x5 base / x10 fuerte)

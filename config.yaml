@@ -50,6 +50,12 @@ trail_to_be: false
 # TP único 10% del equity al abrir
 target_eq_pnl_pct: 0.10
 
+# Overrides de TP por apalancamiento (si está, tiene prioridad)
+# valores como decimales (0.10 = 10%). Podés cambiarlos en runtime con 'tp xN %'
+tp_eq_pct_by_leverage:
+  "5": 0.10
+  "10": 0.10
+
 # leverage dinámico
 leverage_base: 5.0
 leverage_strong: 10.0
