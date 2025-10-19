@@ -1145,15 +1145,42 @@ class TradingApp:
 
         symbol = status.get("symbol", self.config.get("symbol", "BTC/USDT"))
         qty = float(status.get("qty") or status.get("size") or 0.0)
-        position = {
-            "symbol": symbol,
-            "side": side,
-            "contracts": qty,
-            "entryPrice": float(status.get("entry_price") or 0.0),
-            "markPrice": float(status.get("mark") or 0.0),
-        }
-        await self.trader.set_position(position)
-        logging.info("Posición precargada desde store: %s %.6f %s", side, qty, symbol)
+        # Precarga de posición: SOLO en SIM. En REAL validar con exchange primero.
+        if S.PAPER:
+            position = {
+                "symbol": symbol,
+                "side": side,
+                "contracts": qty,
+                "entryPrice": float(status.get("entry_price") or 0.0),
+                "markPrice": float(status.get("mark") or 0.0),
+            }
+            await self.trader.set_position(position)
+            logging.info("Posición precargada desde store (SIM): %s %.6f %s", side, qty, symbol)
+        else:
+            try:
+                ex_pos = await self.exchange.get_open_position(self.config.get("symbol"))
+                ex_qty = float(
+                    (ex_pos or {}).get("contracts")
+                    or (ex_pos or {}).get("positionAmt")
+                    or (ex_pos or {}).get("size")
+                    or 0.0
+                )
+                live_has_open = abs(ex_qty) > 0.0
+            except Exception as e:
+                logging.debug("Validación de posición en exchange falló: %s", e)
+                live_has_open = False
+
+            if live_has_open:
+                await self.trader.set_position(ex_pos)
+                logging.info("Posición precargada desde EXCHANGE (REAL): %s", ex_pos)
+            else:
+                # No hay posición live → NO precargar, y limpiar cualquier rastro local
+                try:
+                    if hasattr(self.trader, "_open_position"):
+                        self.trader._open_position = None
+                except Exception:
+                    pass
+                logging.info("Sin posición live en exchange (REAL): no se precarga nada")
 
     def run(self):
         job_queue = self.telegram_app.job_queue
