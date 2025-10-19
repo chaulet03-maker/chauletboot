@@ -1688,7 +1688,7 @@ def _populate_registry() -> None:
         "modo real",
         modo_real_command,
         aliases=["real", "live", "activar real", "poner modo real", "usar real"],
-        help_text="Cambia el bot a modo REAL (requiere API keys y sin posición abierta)",
+        help_text="Cambia el bot a modo REAL (requiere API keys). Si hay una posición del otro modo, sigue en segundo plano sin abrir nuevas en ese modo.",
     )
 
 
