@@ -291,17 +291,62 @@ class TradingApp:
                 st = None
                 logging.debug("PositionService status error: %s", exc)
             try:
-                side = (st.get("side") or "FLAT").upper() if st else "FLAT"
-                bot_has_open = side != "FLAT"
-                if bot_has_open:
-                    position = {
-                        "symbol": st.get("symbol", self.config.get("symbol")),
-                        "side": side,
-                        "contracts": float(st.get("qty") or st.get("size") or 0.0),
-                        "entryPrice": float(st.get("entry_price") or 0.0),
-                        "markPrice": float(st.get("mark") or 0.0),
-                    }
-                    await self.trader.set_position(position)
+                # --- Evaluar posición local del BOT con tolerancia ---
+                qty_local = 0.0
+                side = "FLAT"
+                if st:
+                    side = (st.get("side") or "FLAT").upper()
+                    # tolerancia para evitar falsos positivos
+                    qty_local = float(st.get("qty") or st.get("size") or 0.0) or 0.0
+                bot_has_open = side != "FLAT" and abs(qty_local) > 1e-12
+
+                # --- En REAL nunca confiar en local si el exchange no reporta abierta ---
+                if not S.PAPER:
+                    try:
+                        ex_pos = await self.exchange.get_open_position(self.config.get("symbol"))
+                        ex_qty = float(
+                            (ex_pos or {}).get("contracts")
+                            or (ex_pos or {}).get("positionAmt")
+                            or (ex_pos or {}).get("size")
+                            or 0.0
+                        )
+                        live_has_open = abs(ex_qty) > 0.0
+                    except Exception:
+                        ex_pos = None
+                        live_has_open = False
+
+                    if not live_has_open:
+                        # limpiar cualquier rastro local para no “revivir” posiciones
+                        bot_has_open = False
+                        position = None
+                        try:
+                            if hasattr(self.trader, "_open_position"):
+                                self.trader._open_position = None
+                        except Exception:
+                            pass
+                    else:
+                        # si hay en el exchange, mapear a la cache local coherente
+                        bot_has_open = True
+                        side = ((ex_pos or {}).get("side") or side or "FLAT").upper()
+                        position = {
+                            "symbol": (ex_pos or {}).get("symbol", self.config.get("symbol")),
+                            "side": side,
+                            "contracts": ex_qty,
+                            "entryPrice": float((ex_pos or {}).get("entryPrice") or 0.0),
+                            "markPrice": float((ex_pos or {}).get("markPrice") or 0.0),
+                        }
+                        await self.trader.set_position(position)
+                else:
+                    # SIM: sólo si qty_local > 0 y side != FLAT
+                    if bot_has_open:
+                        position = {
+                            "symbol": st.get("symbol", self.config.get("symbol")),
+                            "side": side,
+                            "contracts": qty_local,
+                            "entryPrice": float(st.get("entry_price") or 0.0),
+                            "markPrice": float(st.get("mark") or 0.0),
+                        }
+                        await self.trader.set_position(position)
             except Exception as exc:
                 logging.debug("PositionService mapping fail: %s", exc)
 
