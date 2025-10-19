@@ -103,17 +103,18 @@ def safe_switch(new_mode: Mode, services) -> ModeResult:
             qty_val = 0.0
         has_open = side != "FLAT" and abs(qty_val) > 0.0
         if has_open:
+            # En ambos sentidos permitimos el cambio de modo y notificamos la situación.
             if new_mode == "real":
                 warn_msg = (
-                    "⚠️ Se detectó una posición abierta en el estado local."
-                    " Se forzó el cambio a REAL; sincronizá contra el exchange para evitar"
-                    " inconsistencias."
+                    "⚠️ Se detectó una posición ABIERTA del modo anterior. "
+                    "Activé REAL; la posición previa seguirá siendo gestionada en segundo plano "
+                    "y no se abrirán nuevas en ese modo."
                 )
             else:
-                return ModeResult(
-                    False,
-                    "No se puede cambiar de modo con una posición abierta. Cerrá la posición primero.",
-                    None,
+                warn_msg = (
+                    "⚠️ Se detectó una posición ABIERTA del modo anterior. "
+                    "Activé SIMULADO; la posición previa seguirá siendo gestionada en segundo plano "
+                    "y no se abrirán nuevas en ese modo."
                 )
 
     if new_mode == "real":
