@@ -6,6 +6,7 @@ import time
 from typing import Any, Dict, List, Mapping, Optional
 
 import ccxt
+from ccxt.base.errors import OperationRejected
 
 from config import S
 from trading import place_order_safe
@@ -241,6 +242,15 @@ class Exchange:
             if rest_method is None:
                 raise AttributeError("Método PositionSideDual no disponible en el cliente CCXT")
             await asyncio.to_thread(rest_method, request)
+        except OperationRejected as exc:
+            message = str(exc)
+            if "-4059" in message or "No need to change position side" in message:
+                logger.info(
+                    "set_position_mode(one_way=%s) omitido: ya estaba configurado.",
+                    one_way,
+                )
+                return
+            raise
         except Exception:
             logger.warning(
                 "set_position_mode(one_way=%s) falló", one_way, exc_info=True
