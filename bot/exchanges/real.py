@@ -238,7 +238,8 @@ class RealExchange:
                 exch_sym = str(pos.get("symbol") or "").upper()
                 if exch_sym != target.upper():
                     continue
-                amt_f = float(pos.get("positionAmt") or "0")
+                raw_amt = pos.get("positionAmt") or pos.get("positionamt")
+                amt_f = float(raw_amt or "0")
                 if abs(amt_f) == 0.0:
                     return None
                 side = "LONG" if amt_f > 0 else "SHORT"
@@ -310,7 +311,8 @@ class RealExchange:
             if not account:
                 return []
             for pos in account.get("positions", []):
-                amt_f = float(pos.get("positionAmt") or "0")
+                raw_amt = pos.get("positionAmt") or pos.get("positionamt")
+                amt_f = float(raw_amt or "0")
                 if abs(amt_f) == 0.0:
                     continue
                 side = "LONG" if amt_f > 0 else "SHORT"
