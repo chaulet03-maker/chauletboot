@@ -108,6 +108,14 @@ class SimBroker:
 
         oid = f"sim-{int(time.time() * 1000)}"
         new_state = self._apply_fill(side, qty, float(fill_price))
+        try:
+            # Persistimos el estado actualizado antes de responder al caller.
+            if isinstance(new_state, dict):
+                self.store.save(**new_state)
+            else:
+                self.store.save()
+        except Exception:
+            logger.warning("PAPER: no se pudo persistir el fill en store", exc_info=True)
         avg_price = float(new_state.get("avg_price", fill_price)) if isinstance(new_state, dict) else float(fill_price)
         logger.info("PAPER ORDER %s %.6f @ %.2f → FILLED [%s]", side, qty, float(fill_price), oid)
         payload: dict[str, Any] = {

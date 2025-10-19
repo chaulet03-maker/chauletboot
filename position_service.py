@@ -27,6 +27,15 @@ class PositionService:
         self.public_client = ccxt_client or live_client
         self.symbol = symbol
 
+    def refresh(self) -> None:
+        """Recarga el estado desde el store compartido."""
+        if not self.store:
+            return
+        try:
+            _ = self.store.load()
+        except Exception:
+            raise
+
     # ------------------------------------------------------------------
     def mark_to_market(self, mark: float) -> None:
         if not (S.PAPER and self.store):
