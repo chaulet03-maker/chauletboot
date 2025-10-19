@@ -166,11 +166,20 @@ def _get_equity_fraction(engine) -> float:
     """Devuelve el equity% configurado como fracción.
 
     Prioriza, en orden:
-    1) engine.config.order_sizing.default_pct
-    2) getattr(engine, "order_sizes", {}).get("default_pct")
-    3) Variable de entorno EQUITY_PCT
+    1) Variable de entorno EQUITY_PCT
+    2) engine.config.order_sizing.default_pct
+    3) getattr(engine, "order_sizes", {}).get("default_pct")
     Fallback: 1.0
     """
+
+    try:
+        env_value = os.environ.get("EQUITY_PCT")
+        if env_value is not None:
+            fraction = float(env_value)
+            if 0.0 < fraction <= 1.0:
+                return fraction
+    except Exception:
+        pass
 
     try:
         cfg = getattr(engine, "config", {}) or {}
@@ -178,7 +187,7 @@ def _get_equity_fraction(engine) -> float:
         value = osz.get("default_pct", None)
         if value is not None:
             fraction = float(value)
-            if 0.01 <= fraction <= 1.0:
+            if 0.0 < fraction <= 1.0:
                 return fraction
     except Exception:
         pass
@@ -188,16 +197,7 @@ def _get_equity_fraction(engine) -> float:
         value = osz.get("default_pct", None)
         if value is not None:
             fraction = float(value)
-            if 0.01 <= fraction <= 1.0:
-                return fraction
-    except Exception:
-        pass
-
-    try:
-        env_value = os.environ.get("EQUITY_PCT")
-        if env_value is not None:
-            fraction = float(env_value)
-            if 0.01 <= fraction <= 1.0:
+            if 0.0 < fraction <= 1.0:
                 return fraction
     except Exception:
         pass

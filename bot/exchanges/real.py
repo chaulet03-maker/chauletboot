@@ -1,6 +1,7 @@
 import asyncio, logging, hashlib
 from dataclasses import dataclass
 from time import time as _t
+from typing import Any, Dict, List, Optional
 
 from .order_store import OrderStore
 from .side_map import normalize_side
@@ -13,11 +14,23 @@ class Fill:
     ts: float
 
 class RealExchange:
-    def __init__(self, ccxt_client, fees: dict, store_path: str = "./runtime/orders.json"):
+    def __init__(
+        self,
+        ccxt_client,
+        fees: dict,
+        store_path: str = "./runtime/orders.json",
+        symbol: str = "BTC/USDT",
+        native_client: Any | None = None,
+    ):
+        default_symbol = symbol or "BTC/USDT"
         self.client = ccxt_client
+        self.ccxt = ccxt_client
         self.fees = fees or {"taker": 0.0002, "maker": 0.0002}
         self.log = logging.getLogger("RealExchange")
         self.store = OrderStore(store_path)
+        self.symbol = default_symbol
+        self._sym_noslash = default_symbol.replace("/", "")
+        self._native_client = native_client
 
     def _idemp_key(self, prefix: str, **fields) -> str:
         raw = prefix + "|" + "|".join(f"{k}={fields[k]}" for k in sorted(fields.keys()))
@@ -147,6 +160,184 @@ class RealExchange:
         )
 
         return order
+
+    def _format_symbol(self, symbol: str) -> str:
+        if not symbol:
+            return symbol
+        if "/" in symbol:
+            return symbol
+        if symbol.endswith("USDT"):
+            return f"{symbol[:-4]}/USDT"
+        return symbol
+
+    def _get_native_client(self):
+        if self._native_client is not None:
+            return self._native_client
+        try:
+            from brokers import ACTIVE_LIVE_CLIENT  # type: ignore
+
+            self._native_client = ACTIVE_LIVE_CLIENT
+        except Exception:
+            self._native_client = None
+        return self._native_client
+
+    async def _call_native(self, func, *args, **kwargs):
+        if func is None:
+            return None
+        if asyncio.iscoroutinefunction(func):
+            return await func(*args, **kwargs)
+        return await asyncio.to_thread(func, *args, **kwargs)
+
+    async def get_open_position(self, symbol: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        sym = symbol or self.symbol or "BTC/USDT"
+        target = sym.replace("/", "")
+
+        ccxt_client = getattr(self, "ccxt", None) or self.client
+        if ccxt_client is not None and hasattr(ccxt_client, "fetch_positions"):
+            try:
+                pos_list = await self._place(ccxt_client.fetch_positions, [sym])
+                for entry in pos_list or []:
+                    info = entry.get("info") or {}
+                    exch_sym = str(info.get("symbol") or entry.get("symbol") or "").upper()
+                    if exch_sym != target.upper():
+                        continue
+                    amt = info.get("positionAmt") or info.get("positionamt")
+                    if amt is None:
+                        amt = entry.get("contracts") or entry.get("size") or 0
+                    amt_f = float(amt or 0)
+                    if abs(amt_f) == 0.0:
+                        return None
+                    side = "LONG" if amt_f > 0 else "SHORT"
+                    entry_price = float(info.get("entryPrice") or entry.get("entryPrice") or 0.0)
+                    mark_price = float(
+                        info.get("markPrice")
+                        or info.get("markprice")
+                        or entry.get("markPrice")
+                        or entry.get("markprice")
+                        or 0.0
+                    )
+                    return {
+                        "symbol": sym,
+                        "side": side,
+                        "contracts": abs(amt_f),
+                        "entryPrice": entry_price,
+                        "markPrice": mark_price,
+                    }
+            except Exception:
+                pass
+
+        native_client = self._get_native_client()
+        if native_client is None:
+            return None
+
+        try:
+            account = await self._call_native(getattr(native_client, "futures_account", None))
+            if not account:
+                return None
+            for pos in account.get("positions", []):
+                exch_sym = str(pos.get("symbol") or "").upper()
+                if exch_sym != target.upper():
+                    continue
+                amt_f = float(pos.get("positionAmt") or 0)
+                if abs(amt_f) == 0.0:
+                    return None
+                side = "LONG" if amt_f > 0 else "SHORT"
+                entry_price = float(pos.get("entryPrice") or 0.0)
+                mark_raw = pos.get("markPrice")
+                mark_price = float(mark_raw or 0.0)
+                if mark_price == 0.0 and hasattr(native_client, "futures_mark_price"):
+                    try:
+                        mp = await self._call_native(native_client.futures_mark_price, symbol=target)
+                    except Exception:
+                        mp = None
+                    if mp:
+                        try:
+                            mark_price = float(mp.get("markPrice") or 0.0)
+                        except Exception:
+                            mark_price = 0.0
+                return {
+                    "symbol": sym,
+                    "side": side,
+                    "contracts": abs(amt_f),
+                    "entryPrice": entry_price,
+                    "markPrice": mark_price,
+                }
+        except Exception:
+            return None
+        return None
+
+    async def list_open_positions(self) -> List[Dict[str, Any]]:
+        out: List[Dict[str, Any]] = []
+        ccxt_client = getattr(self, "ccxt", None) or self.client
+        if ccxt_client is not None and hasattr(ccxt_client, "fetch_positions"):
+            try:
+                pos_list = await self._place(ccxt_client.fetch_positions)
+                for entry in pos_list or []:
+                    info = entry.get("info") or {}
+                    amt = info.get("positionAmt") or info.get("positionamt")
+                    if amt is None:
+                        amt = entry.get("contracts") or entry.get("size") or 0
+                    amt_f = float(amt or 0)
+                    if abs(amt_f) == 0.0:
+                        continue
+                    side = "LONG" if amt_f > 0 else "SHORT"
+                    sym_raw = str(info.get("symbol") or entry.get("symbol") or "")
+                    out.append(
+                        {
+                            "symbol": self._format_symbol(sym_raw),
+                            "side": side,
+                            "contracts": abs(amt_f),
+                            "entryPrice": float(info.get("entryPrice") or entry.get("entryPrice") or 0.0),
+                            "markPrice": float(
+                                info.get("markPrice")
+                                or info.get("markprice")
+                                or entry.get("markPrice")
+                                or entry.get("markprice")
+                                or 0.0
+                            ),
+                        }
+                    )
+                return out
+            except Exception:
+                pass
+
+        native_client = self._get_native_client()
+        if native_client is None:
+            return []
+
+        try:
+            account = await self._call_native(getattr(native_client, "futures_account", None))
+            if not account:
+                return []
+            for pos in account.get("positions", []):
+                amt_f = float(pos.get("positionAmt") or 0)
+                if abs(amt_f) == 0.0:
+                    continue
+                side = "LONG" if amt_f > 0 else "SHORT"
+                sym_raw = str(pos.get("symbol") or "")
+                mark_price = float(pos.get("markPrice") or 0.0)
+                if mark_price == 0.0 and hasattr(native_client, "futures_mark_price"):
+                    try:
+                        mp = await self._call_native(native_client.futures_mark_price, symbol=sym_raw)
+                    except Exception:
+                        mp = None
+                    if mp:
+                        try:
+                            mark_price = float(mp.get("markPrice") or 0.0)
+                        except Exception:
+                            mark_price = 0.0
+                out.append(
+                    {
+                        "symbol": self._format_symbol(sym_raw),
+                        "side": side,
+                        "contracts": abs(amt_f),
+                        "entryPrice": float(pos.get("entryPrice") or 0.0),
+                        "markPrice": mark_price,
+                    }
+                )
+        except Exception:
+            return []
+        return out
 
     # =============================================================
     # === PARCHE APLICADO AQUÍ ===
