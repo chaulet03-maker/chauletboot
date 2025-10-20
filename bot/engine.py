@@ -3,6 +3,7 @@ import math
 import asyncio
 import os
 import threading
+import inspect
 from collections import deque
 from typing import Any, Dict, Optional, cast
 from time import time as _now
@@ -1218,9 +1219,56 @@ class TradingApp:
     async def close_all(self) -> bool:
         """Cierra SOLO la posición del BOT (reduceOnly). No toca posiciones manuales del usuario."""
         try:
-            # trading.close_now usa POSITION_SERVICE (store del bot) y reduceOnly=True
             symbol = (self.config or {}).get("symbol", "BTC/USDT")
+
+            ex = getattr(self, "exchange", None)
+
+            async def _safe_fetch_balance() -> Optional[float]:
+                if ex is None:
+                    return None
+                fetcher = getattr(ex, "fetch_balance_usdt", None)
+                if not callable(fetcher):
+                    return None
+                try:
+                    result = fetcher()
+                    if inspect.isawaitable(result):
+                        result = await result
+                    return float(result)
+                except Exception:
+                    return None
+
+            # --- snapshot antes del cierre (para PnL por delta de balance) ---
+            bal_before = await _safe_fetch_balance()
+
+            # --- cerrar ahora (reduceOnly + positionSide correcto) ---
             await asyncio.to_thread(trading.close_now, symbol)
+
+            # --- snapshot después del cierre ---
+            bal_after = await _safe_fetch_balance()
+
+            # --- persistir trade si podemos calcular PnL ---
+            pnl_real = None
+            if bal_before is not None and bal_after is not None:
+                pnl_real = float(bal_after) - float(bal_before)
+
+            storage = getattr(self, "storage", None)
+            if storage and pnl_real is not None:
+                side = "LONG"
+                try:
+                    from position_service import POSITION_SERVICE
+
+                    status = POSITION_SERVICE.get_status() if POSITION_SERVICE else {}
+                    side = (status.get("side") or side).upper()
+                except Exception:
+                    pass
+                storage.persist_trade(
+                    {
+                        "symbol": symbol,
+                        "side": side,
+                        "pnl": pnl_real,
+                        "note": "close_all/manual",
+                    }
+                )
             return True
         except Exception as exc:
             self.logger.exception("close_all failed: %s", exc)
