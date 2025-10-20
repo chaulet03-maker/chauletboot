@@ -338,7 +338,33 @@ class BinanceBroker:
             **params,
         )
 
-        response = self._call_with_backoff(self.client.futures_create_order, **order_payload)
+        try:
+            response = self._call_with_backoff(self.client.futures_create_order, **order_payload)
+        except Exception as exc:
+            classification = self._classify_error(exc)
+            if classification == "insufficient_margin" and order_payload.get("reduceOnly"):
+                try:
+                    live = self.client.futures_position_information(symbol=filters.symbol)
+                    live_amt = 0.0
+                    for p in live or []:
+                        if str(p.get("symbol") or "").upper() == filters.symbol.upper():
+                            live_amt = float(p.get("positionAmt") or 0.0)
+                            break
+                    live_qty = abs(live_amt)
+                    if live_qty <= 0.0:
+                        return {"status": "noop", "reason": "no live position"}
+                    capped = min(float(order_payload.get("quantity", live_qty)), live_qty)
+                    new_qty = quantize_qty(filters, capped)
+                    if new_qty <= 0:
+                        return {"status": "noop", "reason": "no live position"}
+                    order_payload["quantity"] = new_qty
+                    response = self._call_with_backoff(
+                        self.client.futures_create_order, **order_payload
+                    )
+                except Exception:
+                    raise
+            else:
+                raise
 
         sl_price = kwargs.get("sl")
         tp_price = kwargs.get("tp")

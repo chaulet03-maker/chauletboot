@@ -299,11 +299,29 @@ def close_now(symbol: str | None = None):
     close_side = "SELL" if side == "LONG" else "BUY"
     target_symbol = symbol or status.get("symbol")
     hedged = _config_uses_hedge(RAW_CONFIG)
-    kwargs = dict(order_type="market", symbol=target_symbol)
-    if hedged:
-        kwargs["positionSide"] = "SHORT" if close_side == "SELL" else "LONG"
-    else:
-        kwargs["reduce_only"] = True
+    # Siempre cerrar con reduceOnly; en hedge además explicitar el lado actual
+    kwargs = dict(order_type="market", symbol=target_symbol, reduce_only=True)
+    if hedged and side in {"LONG", "SHORT"}:
+        kwargs["positionSide"] = side
+
+    # Sincronizar con posición viva si hay cliente activo (importante en REAL)
+    if ACTIVE_LIVE_CLIENT is not None:
+        try:
+            sym_id = (target_symbol or "BTC/USDT").replace("/", "")
+            live = ACTIVE_LIVE_CLIENT.futures_position_information(symbol=sym_id)
+            live_amt = 0.0
+            for p in live or []:
+                if str(p.get("symbol") or "").upper() == sym_id.upper():
+                    live_amt = float(p.get("positionAmt") or 0.0)
+                    break
+            live_qty = abs(live_amt)
+            if live_qty <= 0.0:
+                return {"status": "noop", "msg": "No live position"}
+            if qty > live_qty + 1e-12:
+                qty = live_qty
+        except Exception:
+            # si falla el fetch, seguimos con qty local (mejor que no cerrar nada)
+            pass
 
     result = BROKER.place_order(close_side, qty, None, **kwargs)
     close_price = _infer_fill_price(result, status.get("mark"))
