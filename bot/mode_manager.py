@@ -7,6 +7,8 @@ from typing import Literal, Tuple
 
 import yaml
 
+from bot.runtime_state import get_mode as runtime_get_mode, set_mode as runtime_set_mode
+
 log = logging.getLogger(__name__)
 
 Mode = Literal["real", "simulado"]
@@ -46,6 +48,13 @@ def _write_cfg(cfg: dict, path: str = CONFIG_PATH) -> None:
 
 
 def get_mode() -> Mode:
+    # Runtime state tiene prioridad para comandos/manuales.
+    runtime_mode = runtime_get_mode()
+    if runtime_mode == "live":
+        return "real"
+    if runtime_mode == "paper":
+        return "simulado"
+
     cfg = _read_cfg()
     mode = str(cfg.get("trading_mode", "simulado")).lower()
     return "real" if mode == "real" else "simulado"
@@ -56,6 +65,7 @@ def set_mode_in_yaml(mode: Mode) -> None:
     cfg["trading_mode"] = "real" if mode == "real" else "simulado"
     _write_cfg(cfg)
     log.info("Config actualizada: trading_mode=%s", cfg["trading_mode"])
+    runtime_set_mode("live" if mode == "real" else "paper")
 
 
 def _env_key_candidates() -> Tuple[Tuple[str, str], ...]:
@@ -86,6 +96,7 @@ def safe_switch(new_mode: Mode, services) -> ModeResult:
     """
     current = get_mode()
     if new_mode == current:
+        runtime_set_mode("live" if new_mode == "real" else "paper")
         return ModeResult(True, f"Ya estabas en modo {new_mode}.", new_mode)
 
     try:
