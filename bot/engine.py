@@ -39,7 +39,14 @@ class _EngineBrokerAdapter:
     def __init__(self, app: "TradingApp"):
         self.app = app
 
-    async def place_market_order(self, symbol: str, side: str, quantity: float, leverage: int = 1):
+    async def place_market_order(
+        self,
+        symbol: str,
+        side: str,
+        quantity: float,
+        leverage: int = 1,
+        **extra: Any,
+    ):
         trading.ensure_initialized()
         ledger_init()
 
@@ -57,15 +64,18 @@ class _EngineBrokerAdapter:
         bot_id = get_bot_id()
         client_oid = make_client_oid(bot_id, sym_clean, mode)
 
+        order_kwargs = dict(extra or {})
+        order_kwargs.setdefault("symbol", sym)
+        order_kwargs.setdefault("leverage", int(leverage))
+        order_kwargs.setdefault("newClientOrderId", client_oid)
+        order_kwargs.setdefault("order_type", "MARKET")
+
         result = await asyncio.to_thread(
             trading.place_order_safe,
             side_u,
             float(quantity),
             None,
-            symbol=sym,
-            leverage=int(leverage),
-            newClientOrderId=client_oid,
-            order_type="MARKET",
+            **order_kwargs,
         )
 
         if isinstance(result, dict):

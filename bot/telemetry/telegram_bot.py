@@ -22,6 +22,15 @@ from time_fmt import fmt_ar
 from config import S
 from bot.motives import MOTIVES
 from bot.mode_manager import get_mode
+from bot.identity import get_bot_id
+from bot.ledger import bot_position
+from bot.pnl import pnl_summary_bot
+from bot.runtime_state import (
+    get_mode as runtime_get_mode,
+    set_mode as runtime_set_mode,
+    get_equity_sim,
+    set_equity_sim,
+)
 from bot.settings_utils import get_val, read_config_raw
 from bot.telemetry.command_registry import CommandRegistry
 import trading
@@ -727,6 +736,10 @@ def _default_symbol(engine) -> str:
     return "BTC/USDT"
 
 
+def _normalized_symbol(symbol: str) -> str:
+    return symbol.replace("/", "").upper()
+
+
 def _position_status_message(engine) -> str:
     symbol_default = _default_symbol(engine)
     try:
@@ -908,6 +921,132 @@ async def posiciones_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await message.reply_text("\n\n".join(blocks), parse_mode="Markdown")
 
 
+async def open_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.effective_message
+    if message is None:
+        return
+
+    engine = _get_engine_from_context(context)
+    if engine is None:
+        await message.reply_text("No pude acceder al engine para abrir la operación.")
+        return
+
+    raw_text = (message.text or "").strip().lower()
+    match = re.search(r"\bopen\s+(long|short)\s+x\s*(\d+)\b", raw_text)
+    if not match:
+        await message.reply_text("Formato: open long x5  |  open short x10")
+        return
+
+    side_txt = match.group(1).upper()
+    leverage = max(int(match.group(2)), 1)
+
+    cfg = getattr(engine, "config", {}) or {}
+    symbol_cfg = str(cfg.get("symbol") or "BTC/USDT")
+    symbol_norm = _normalized_symbol(symbol_cfg)
+
+    exchange = getattr(engine, "exchange", None)
+    if exchange is None:
+        await message.reply_text("Exchange no disponible para abrir la operación.")
+        return
+
+    try:
+        price_now = await exchange.get_current_price(symbol_cfg)
+    except Exception as exc:
+        logger.debug("open_command: fallo get_current_price: %s", exc)
+        price_now = None
+
+    if price_now is None:
+        await message.reply_text("No pude obtener precio actual.")
+        return
+
+    equity_base = float(get_equity_sim() or 0.0)
+    if equity_base <= 0.0:
+        try:
+            equity_base = float(cfg.get("start_equity") or getattr(S, "start_equity", 0.0) or 0.0)
+        except Exception:
+            equity_base = 0.0
+    if equity_base <= 0.0:
+        await message.reply_text("Equity = 0. Setealo con: equity 1200 (ejemplo).")
+        return
+
+    qty_raw = (equity_base * leverage) / float(price_now)
+    qty_final = qty_raw
+    try:
+        from bot.qty_utils import round_and_validate_qty
+
+        qty_final = await round_and_validate_qty(exchange, symbol_cfg, qty_raw)
+    except Exception:
+        pass
+
+    if qty_final <= 0:
+        await message.reply_text(
+            "Cantidad final <= 0 (minQty/minNotional). Subí equity o bajá el leverage."
+        )
+        return
+
+    entry_price = float(price_now)
+    tp_price = None
+    sl_price = None
+    try:
+        tp_price = engine.strategy.calculate_tp(entry_price, qty_final, equity_base, side_txt, leverage)
+    except Exception:
+        tp_price = None
+    try:
+        qty_series = pd.Series({"qty_for_sl": abs(float(qty_final))})
+        sl_price = engine.strategy.calculate_sl(entry_price, qty_series, side_txt, equity_base)
+    except Exception:
+        sl_price = None
+
+    order_kwargs: Dict[str, float] = {}
+    if tp_price is not None and pd.notna(tp_price):
+        order_kwargs["tp"] = float(tp_price)
+    if sl_price is not None and pd.notna(sl_price):
+        order_kwargs["sl"] = float(sl_price)
+
+    side_exchange = "BUY" if side_txt == "LONG" else "SELL"
+    try:
+        result = await engine.broker.place_market_order(
+            symbol=symbol_cfg,
+            side=side_exchange,
+            quantity=qty_final,
+            leverage=leverage,
+            **order_kwargs,
+        )
+    except Exception as exc:
+        await message.reply_text(f"Fallo al abrir: {exc}")
+        return
+
+    fill_price = entry_price
+    if isinstance(result, dict):
+        for key in ("avgPrice", "avg_price", "price"):
+            val = result.get(key)
+            if val:
+                try:
+                    fill_price = float(val)
+                    break
+                except Exception:
+                    continue
+
+    protections = []
+    if sl_price is not None and pd.notna(sl_price):
+        protections.append(f"SL={float(sl_price):.2f}")
+    if tp_price is not None and pd.notna(tp_price):
+        protections.append(f"TP={float(tp_price):.2f}")
+    prot_line = " | ".join(protections) if protections else "TP/SL no configurados"
+
+    mode_txt = runtime_get_mode()
+    await message.reply_text(
+        (
+            f"🟢 OPEN {side_txt} x{leverage} | {symbol_norm}\n"
+            f"qty: {qty_final:.6f} @~{fill_price:.2f}\n"
+            f"{prot_line}\n"
+            f"Modo: {'REAL' if mode_txt == 'live' else 'SIMULADO'}\n"
+            "Gestionada por la estrategia (TP/SL activos)."
+        ),
+        parse_mode="Markdown",
+    )
+
+
 async def estado_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.effective_message
     if message is None:
@@ -918,91 +1057,93 @@ async def estado_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await message.reply_text("No pude acceder al engine para consultar el estado.")
         return
 
-    storage = getattr(engine, "storage", None)
-    db_path = None
-    if storage is not None:
-        db_path = getattr(storage, "db_path", None)
-    if not db_path:
-        db_path = getattr(engine, "db_path", None)
-    if not db_path:
-        db_path = _engine_sqlite_path(engine)
+    cfg = getattr(engine, "config", {}) or {}
+    symbol_cfg = str(cfg.get("symbol") or "BTC/USDT")
+    symbol_norm = symbol_cfg.replace("/", "").upper()
+    mode_runtime = runtime_get_mode()
+    mode = "live" if mode_runtime == "live" else "paper"
+
+    equity_base = float(get_equity_sim() or 0.0)
+    if equity_base <= 0.0:
+        try:
+            equity_base = float(cfg.get("start_equity") or getattr(S, "start_equity", 0.0) or 0.0)
+        except Exception:
+            equity_base = 0.0
+
+    exchange = getattr(engine, "exchange", None)
+
+    async def _mark(sym: str) -> Optional[float]:
+        if exchange is None:
+            return None
+        candidates = [sym]
+        if "/" in sym:
+            candidates.append(sym.replace("/", ""))
+        elif sym.endswith("USDT"):
+            candidates.append(f"{sym[:-4]}/USDT")
+        for candidate in candidates:
+            try:
+                price = await exchange.get_current_price(candidate)
+            except Exception:
+                price = None
+            if price is not None:
+                try:
+                    return float(price)
+                except Exception:
+                    continue
+        return None
 
     try:
-        now = datetime.now()
-        now_local_str = fmt_ar(datetime.now(timezone.utc))
-        start_of_day = now - timedelta(hours=24)
-        start_of_week = now - timedelta(days=7)
-        from config import S as _S_
-
-        pnl_day = 0.0
-        pnl_week = 0.0
-        if db_path and os.path.exists(db_path):
-            with sqlite3.connect(db_path) as conn:
-                cursor = conn.cursor()
-                cursor.execute(
-                    "SELECT SUM(pnl) FROM trades WHERE close_timestamp >= ?",
-                    (start_of_day.isoformat(),),
-                )
-                row = cursor.fetchone()
-                pnl_day = float(row[0]) if row and row[0] is not None else 0.0
-
-                cursor.execute(
-                    "SELECT SUM(pnl) FROM trades WHERE close_timestamp >= ?",
-                    (start_of_week.isoformat(),),
-                )
-                row = cursor.fetchone()
-                pnl_week = float(row[0]) if row and row[0] is not None else 0.0
-
-        ex = getattr(engine, "exchange", None)
-
-        balance_actual: Optional[float] = None
-        if ex and hasattr(ex, "fetch_balance_usdt"):
-            try:
-                balance_actual = float(await ex.fetch_balance_usdt())
-            except Exception:
-                balance_actual = None
-
-        if balance_actual is None:
-            try:
-                cfg = _engine_config(engine)
-                equity_csv, _ = _cfg_csv_paths(cfg)
-                df = pd.read_csv(equity_csv)
-                if not df.empty:
-                    balance_actual = float(df["equity"].iloc[-1])
-            except Exception:
-                balance_actual = None
-
-        if balance_actual is None:
-            balance_actual = float(getattr(_S_, "start_equity", 0.0))
-
-        # --- Fallback: si no hay trades, mostrar delta de equity/balance ---
-        try:
-            start_eq = float(getattr(_S_, "start_equity", 0.0) or 0.0)
-        except Exception:
-            start_eq = 0.0
-        if (pnl_day == 0.0 or pnl_week == 0.0) and balance_actual is not None and start_eq > 0:
-            # Sin granularidad temporal, pero evitamos mostrar $0 cuando hay ganancia real
-            pnl_total = float(balance_actual) - start_eq
-            if pnl_day == 0.0:
-                pnl_day = pnl_total
-            if pnl_week == 0.0:
-                pnl_week = pnl_total
-
-        estado_lineas = [
-            _position_status_message(engine),
-            "",
-            "Estado de Cuenta Rápido",
-            "---------------------------",
-            f"Hora local: {now_local_str}",
-            f"PNL Hoy (24h): ${pnl_day:+.2f}",
-            f"PNL Semana (7d): ${pnl_week:+.2f}",
-            f"Balance Actual: ${balance_actual:,.2f}",
-        ]
-        reply_text = "\n".join(estado_lineas)
+        pnl = await pnl_summary_bot(mode, mark_provider=_mark)
     except Exception as exc:
-        reply_text = f"Error al generar el estado: {exc}"
+        logger.debug("pnl_summary_bot falló: %s", exc)
+        pnl = {
+            "daily": {"realized": 0.0, "unrealized": 0.0, "total": 0.0},
+            "weekly": {"realized": 0.0, "unrealized": 0.0, "total": 0.0},
+        }
 
-    await message.reply_text(reply_text)
+    bot_id = get_bot_id()
+    try:
+        qty_bot, avg_bot = bot_position(mode, bot_id, symbol_norm)
+        if abs(qty_bot) <= 0.0 and symbol_cfg != symbol_norm:
+            qty_bot, avg_bot = bot_position(mode, bot_id, symbol_cfg)
+    except Exception:
+        qty_bot, avg_bot = 0.0, 0.0
+
+    mark_price = None
+    if abs(qty_bot) > 0:
+        try:
+            mark_price = await _mark(symbol_norm)
+        except Exception:
+            mark_price = None
+    if mark_price is None and abs(qty_bot) > 0 and exchange is not None:
+        try:
+            mark_price = await exchange.get_current_price(symbol_cfg)
+        except Exception:
+            mark_price = None
+
+    unreal_now = 0.0
+    if mark_price is not None and abs(qty_bot) > 0:
+        mark_val = float(mark_price)
+        if qty_bot > 0:
+            unreal_now = qty_bot * (mark_val - avg_bot)
+        else:
+            unreal_now = (-qty_bot) * (avg_bot - mark_val)
+
+    balance_est = equity_base + unreal_now
+
+    daily = pnl.get("daily", {"realized": 0.0, "unrealized": 0.0, "total": 0.0})
+    weekly = pnl.get("weekly", {"realized": 0.0, "unrealized": 0.0, "total": 0.0})
+
+    lines = [
+        f"Modo: *{'REAL' if mode == 'live' else 'SIMULADO'}*",
+        f"Símbolo: {symbol_norm}",
+        f"Equity base: {_num(equity_base)}",
+        f"Balance estimado: {_num(balance_est)}",
+        f"PnL Diario: {daily['total']:+.2f} (R={daily['realized']:+.2f} | U={daily['unrealized']:+.2f})",
+        f"PnL Semanal: {weekly['total']:+.2f} (R={weekly['realized']:+.2f} | U={weekly['unrealized']:+.2f})",
+    ]
+
+    await message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
 async def rendimiento_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1327,6 +1468,23 @@ async def _modo_command(update: Update, context: ContextTypes.DEFAULT_TYPE, new_
     engine = _get_engine_from_context(context)
     message = update.effective_message
     rescue_needed = False
+    target_mode = "real" if new_mode == "real" else "simulado"
+
+    try:
+        current_mode = get_mode()
+    except Exception:
+        current_mode = "real" if not S.PAPER else "simulado"
+
+    if current_mode == target_mode:
+        runtime_set_mode("live" if target_mode == "real" else "paper")
+        already_txt = "REAL" if target_mode == "real" else "SIMULADO"
+        if message is not None:
+            await message.reply_text(
+                f"✅ El bot ya se encontraba en *MODO {already_txt}*.",
+                parse_mode="Markdown",
+            )
+        return
+
     if new_mode == "real" and engine is not None:
         has_open_fn = getattr(engine, "has_open_position", None)
         if callable(has_open_fn):
@@ -1335,7 +1493,7 @@ async def _modo_command(update: Update, context: ContextTypes.DEFAULT_TYPE, new_
             except Exception:
                 rescue_needed = False
 
-    result = trading.switch_mode("real" if new_mode == "real" else "simulado")
+    result = trading.switch_mode(target_mode)
     if result.ok:
         base_msg = f"✅ Modo cambiado a *{new_mode.upper()}*. El bot ya opera en {new_mode}."
         # Si querés mantener el warning en la misma burbuja: descomentar la línea de abajo
@@ -1450,7 +1608,7 @@ async def logs_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def equity_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Fija o muestra el porcentaje de equity (1–100%). Ej: 'equity 50%'."""
+    """Muestra o fija equity base (USDT) y porcentaje de sizing."""
     engine = _get_engine_from_context(context)
     message = update.effective_message
     if message is None:
@@ -1460,51 +1618,65 @@ async def equity_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     txt = (message.text or "").strip().lower()
-    match = re.search(r"equity\s+(\d+(?:[.,]\d+)?)\s*%?", txt)
+    match = re.search(r"equity\s+(\d+(?:[.,]\d+)?)(\s*%?)", txt)
     if not match:
         fraction = float(_get_equity_fraction(engine))
         pct = round(fraction * 100.0, 2)
+        base_equity = get_equity_sim()
         await message.reply_text(
-            f"Equity actual seteado: {pct:.2f}% (frac={fraction})\n"            
+            "Equity base actual: {:.2f}\nEquity % actual: {:.2f}% (frac={:.4f})".format(
+                float(base_equity or 0.0), pct, fraction
+            )
         )
         return
 
     try:
-        pct_str = match.group(1).replace(",", ".")
-        pct = float(pct_str)
+        value = float(match.group(1).replace(",", "."))
     except Exception:
-        await message.reply_text("No pude leer el porcentaje. Ej: equity 25%")
+        await message.reply_text("Formato: equity 1200  |  equity 25%")
         return
 
-    if not (1.0 <= pct <= 100.0):
-        await message.reply_text("El porcentaje debe estar entre 1 y 100.")
-        return
+    suffix = match.group(2) or ""
+    if "%" in suffix:
+        if not (1.0 <= value <= 100.0):
+            await message.reply_text("El porcentaje debe estar entre 1 y 100.")
+            return
 
-    frac = round(pct / 100.0, 4)
-    _find_and_set_config(engine, "order_sizing.default_pct", frac)
-    os.environ["EQUITY_PCT"] = str(frac)
+        frac = round(value / 100.0, 4)
+        _find_and_set_config(engine, "order_sizing.default_pct", frac)
+        os.environ["EQUITY_PCT"] = str(frac)
 
-    # --- Persistencia en YAML si estamos en REAL ---
-    try:
-        mode_result = get_mode()
-        is_real = getattr(mode_result, "mode", None) == "real"
-    except Exception:
-        is_real = False
-
-    if is_real:
         try:
-            # Leemos YAML actual, actualizamos order_sizing.default_pct y guardamos
-            cfg_path = os.getenv("CONFIG_PATH", "config.yaml")
-            raw = read_config_raw(cfg_path) or {}
-            raw.setdefault("order_sizing", {})
-            raw["order_sizing"]["default_pct"] = float(frac)
-            with open(cfg_path, "w", encoding="utf-8") as fh:
-                yaml.safe_dump(raw, fh, sort_keys=False, allow_unicode=True)
+            current_mode = get_mode()
+            is_real = current_mode == "real"
         except Exception:
-            # No rompemos la UX si falló el guardado; queda al menos en memoria/env
-            pass
+            is_real = False
 
-    await message.reply_text(f"✅ Porcentaje de equity seteado: {pct:.2f}% (frac={frac})")
+        if is_real:
+            try:
+                cfg_path = os.getenv("CONFIG_PATH", "config.yaml")
+                raw = read_config_raw(cfg_path) or {}
+                raw.setdefault("order_sizing", {})
+                raw["order_sizing"]["default_pct"] = float(frac)
+                with open(cfg_path, "w", encoding="utf-8") as fh:
+                    yaml.safe_dump(raw, fh, sort_keys=False, allow_unicode=True)
+            except Exception:
+                pass
+
+        await message.reply_text(
+            f"✅ Porcentaje de equity seteado: {value:.2f}% (frac={frac})"
+        )
+        return
+
+    set_equity_sim(value)
+    try:
+        trader = getattr(engine, "trader", None)
+        if trader is not None:
+            trader.set_paper_equity(value)
+    except Exception:
+        logger.debug("No se pudo actualizar trader.set_paper_equity", exc_info=True)
+
+    await message.reply_text(f"Equity seteado: {value:.2f}")
 
 
 async def diag_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1634,6 +1806,12 @@ def _populate_registry() -> None:
         help_text="Lista todas las posiciones abiertas (la del bot en negrita).",
     )
     REGISTRY.register(
+        "open",
+        open_command,
+        aliases=["open", "abrir"],
+        help_text="Abre una operación manual. Ej: open long x5",
+    )
+    REGISTRY.register(
         "diag",
         diag_command,
         aliases=["diagnostico", "status", "health"],
@@ -1673,7 +1851,7 @@ def _populate_registry() -> None:
         "equity",
         equity_command,
         aliases=["equity%", "equitypct", "porcentaje", "size"],
-        help_text="Muestra o fija el % de equity (1–100). Ej: equity 37%",
+        help_text="Muestra o fija equity base (USDT) o %. Ej: equity 1200 | equity 25%",
     )
     REGISTRY.register(
         "sl",
