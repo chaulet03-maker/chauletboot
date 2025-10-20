@@ -932,6 +932,7 @@ async def estado_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         now_local_str = fmt_ar(datetime.now(timezone.utc))
         start_of_day = now - timedelta(hours=24)
         start_of_week = now - timedelta(days=7)
+        from config import S as _S_
 
         pnl_day = 0.0
         pnl_week = 0.0
@@ -952,24 +953,12 @@ async def estado_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 row = cursor.fetchone()
                 pnl_week = float(row[0]) if row and row[0] is not None else 0.0
 
-        trader = getattr(engine, "trader", None)
-        from config import S as _S_
+        ex = getattr(engine, "exchange", None)
 
         balance_actual: Optional[float] = None
-        if _S_.PAPER:
+        if ex and hasattr(ex, "fetch_balance_usdt"):
             try:
-                if trader and hasattr(trader, "equity"):
-                    balance_actual = float(trader.equity())
-            except Exception:
-                balance_actual = None
-
-        if balance_actual is None:
-            try:
-                ex = getattr(engine, "exchange", None)
-                if ex and hasattr(ex, "client") and not _S_.PAPER:
-                    bal = await asyncio.to_thread(ex.client.fetch_balance)
-                    usdt = bal.get("USDT") or {}
-                    balance_actual = float(usdt.get("total") or usdt.get("free") or 0.0)
+                balance_actual = float(await ex.fetch_balance_usdt())
             except Exception:
                 balance_actual = None
 

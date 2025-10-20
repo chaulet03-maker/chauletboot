@@ -21,6 +21,17 @@ class Exchange:
         self._hedge_mode = self._determine_hedge_mode()
         self.public_client = None
         self.client = self._setup_client()
+        # Asegurar que CCXT apunte a Futuros USD-M
+        try:
+            opts = getattr(self.client, "options", {}) or {}
+            if opts.get("defaultType") not in {"future", "swap"}:
+                opts["defaultType"] = "future"
+            # Hedge mode si lo usás
+            if "hedgeMode" not in opts:
+                opts["hedgeMode"] = True
+            self.client.options = opts
+        except Exception:
+            pass
         if self.public_client is None:
             self.public_client = self.client
         self.is_authenticated = getattr(self, "is_authenticated", False)
@@ -75,40 +86,117 @@ class Exchange:
         """
         out: List[Dict[str, Any]] = []
         ccxt_client = getattr(self, "client", None)
-        if ccxt_client is None or not hasattr(ccxt_client, "fetch_positions"):
-            return out
+        # 1) CCXT en futures
+        if ccxt_client is not None and hasattr(ccxt_client, "fetch_positions"):
+            try:
+                pos_list = await asyncio.to_thread(
+                    ccxt_client.fetch_positions, None, {"type": "future"}
+                )
+                for entry in pos_list or []:
+                    info = entry.get("info") or {}
+                    raw_amt = (
+                        info.get("positionAmt")
+                        or entry.get("contracts")
+                        or entry.get("size")
+                        or 0
+                    )
+                    amt_f = float(raw_amt or 0)
+                    if abs(amt_f) == 0.0:
+                        continue
+                    side = "LONG" if amt_f > 0 else "SHORT"
+                    sym_raw = str(info.get("symbol") or entry.get("symbol") or "")
+
+                    def fmt(s: str) -> str:
+                        return s if "/" in s else (s[:-4] + "/USDT" if s.endswith("USDT") else s)
+
+                    out.append(
+                        {
+                            "symbol": fmt(sym_raw),
+                            "side": side,
+                            "contracts": abs(amt_f),
+                            "entryPrice": float(
+                                info.get("entryPrice")
+                                or entry.get("entryPrice")
+                                or 0.0
+                            ),
+                            "markPrice": float(
+                                info.get("markPrice")
+                                or entry.get("markPrice")
+                                or 0.0
+                            ),
+                        }
+                    )
+                if out:
+                    return out
+            except Exception:
+                pass
+
+        # 2) Fallback nativo (python-binance)
         try:
-            pos_list = await asyncio.to_thread(ccxt_client.fetch_positions)
+            from brokers import ACTIVE_LIVE_CLIENT
+
+            nat = ACTIVE_LIVE_CLIENT
+            if nat:
+                acct = await asyncio.to_thread(nat.futures_account)
+                for pos in acct.get("positions", []):
+                    sym = str(pos.get("symbol") or "")
+                    amt = float(pos.get("positionAmt") or 0.0)
+                    if abs(amt) == 0.0:
+                        continue
+                    side = "LONG" if amt > 0 else "SHORT"
+                    entry = float(pos.get("entryPrice") or 0.0)
+                    mark = float(pos.get("markPrice") or 0.0)
+                    symbol_fmt = (
+                        sym
+                        if "/" in sym
+                        else (sym[:-4] + "/USDT" if sym.endswith("USDT") else sym)
+                    )
+                    out.append(
+                        {
+                            "symbol": symbol_fmt,
+                            "side": side,
+                            "contracts": abs(amt),
+                            "entryPrice": entry,
+                            "markPrice": mark,
+                        }
+                    )
         except Exception:
             return out
-        for entry in pos_list or []:
-            info = entry.get("info") or {}
-            raw_amt = info.get("positionAmt") or info.get("positionamt")
-            if raw_amt is None:
-                raw_amt = entry.get("contracts") or entry.get("size") or 0
-            amt_f = float(raw_amt or "0")
-            if abs(amt_f) == 0.0:
-                continue
-            side = "LONG" if amt_f > 0 else "SHORT"
-            sym_raw = str(info.get("symbol") or entry.get("symbol") or "")
-
-            def _fmt_symbol(s: str) -> str:
-                return s if "/" in s else (s[:-4] + "/USDT" if s.endswith("USDT") else s)
-
-            out.append({
-                "symbol": _fmt_symbol(sym_raw),
-                "side": side,
-                "contracts": abs(amt_f),
-                "entryPrice": float(info.get("entryPrice") or entry.get("entryPrice") or 0.0),
-                "markPrice": float(
-                    info.get("markPrice") or info.get("markprice")
-                    or entry.get("markPrice") or entry.get("markprice") or 0.0
-                ),
-            })
         return out
 
     def _normalize_symbol(self, symbol: str) -> str:
         return symbol.replace("/", "").lower()
+
+    async def fetch_balance_usdt(self) -> float:
+        # 1) CCXT en Futuros USD-M
+        try:
+            bal = await asyncio.to_thread(self.client.fetch_balance, {"type": "future"})
+            usdt = bal.get("USDT") or (bal.get("total", {}) or {}).get("USDT")
+            if isinstance(usdt, dict):
+                # En CCXT para futures, 'total' refleja wallet; si no, suma free+used
+                total = usdt.get("total")
+                if total is not None:
+                    return float(total)
+                return float((usdt.get("free", 0.0) or 0.0) + (usdt.get("used", 0.0) or 0.0))
+            return float(usdt or 0.0)
+        except Exception:
+            pass
+
+        # 2) Fallback nativo (python-binance): wallet de USD-M
+        try:
+            from brokers import ACTIVE_LIVE_CLIENT  # client python-binance si estás en REAL
+
+            nat = ACTIVE_LIVE_CLIENT
+            if nat:
+                # futures_account_balance devuelve lista de assets de la wallet USDM
+                data = await asyncio.to_thread(nat.futures_account_balance)
+                for a in data or []:
+                    if str(a.get("asset")) == "USDT":
+                        # usar 'balance' / 'walletBalance'
+                        return float(a.get("balance") or a.get("walletBalance") or 0.0)
+        except Exception:
+            pass
+        return 0.0
 
     def _start_price_stream(self):
         symbol = self.config.get("symbol", "BTC/USDT")
