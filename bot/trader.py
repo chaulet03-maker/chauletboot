@@ -5,6 +5,7 @@ from typing import Any, Dict, Optional
 
 from config import S
 import trading
+from bot.paper_store import get_equity as paper_get_equity, set_equity as paper_set_equity
 
 
 class Trader:
@@ -14,18 +15,40 @@ class Trader:
         default_balance = float(self.config.get('balance', S.start_equity))
         if S.PAPER:
             try:
-                default_balance = float(getattr(trading.BROKER, "equity", default_balance))
+                default_balance = float(paper_get_equity())
             except Exception:
-                pass
+                try:
+                    default_balance = float(getattr(trading.BROKER, "equity", default_balance))
+                except Exception:
+                    pass
         self._balance = default_balance
         self._open_position: Optional[Dict[str, Any]] = None
         self._last_mode = "paper" if S.PAPER else "real"
 
     def reset_caches(self):
         """Limpiar caches de balance/posición al cambiar de modo."""
-        self._balance = float(self.config.get('balance', S.start_equity))
+        base = float(self.config.get('balance', S.start_equity))
+        if S.PAPER:
+            try:
+                base = float(paper_get_equity())
+            except Exception:
+                pass
+        self._balance = base
         self._open_position = None
         self._last_mode = "paper" if S.PAPER else "real"
+
+    def set_paper_equity(self, value: float) -> None:
+        try:
+            val = float(value)
+        except Exception:
+            raise ValueError("Equity inválido") from None
+
+        if S.PAPER:
+            try:
+                paper_set_equity(val)
+            except Exception:
+                logging.debug("No se pudo persistir equity en bot.paper_store.", exc_info=True)
+        self._balance = val
 
     def _ensure_mode_consistency(self):
         curr = "paper" if S.PAPER else "real"
@@ -67,7 +90,7 @@ class Trader:
         equity: Optional[float] = None
 
         service = getattr(trading, "POSITION_SERVICE", None)
-        if service is not None:
+        if service is not None and equity is None:
             try:
                 status = service.get_status() or {}
                 raw_equity = status.get("equity")
@@ -76,31 +99,11 @@ class Trader:
             except Exception:
                 logging.debug("No se pudo obtener equity desde PositionService.", exc_info=True)
 
-        if equity is None and S.PAPER:
-            store = None
-            broker = getattr(trading, "BROKER", None)
-            if broker is not None:
-                store = getattr(broker, "store", None)
-            if store is None:
-                store = getattr(trading, "ACTIVE_PAPER_STORE", None)
-            if store is not None:
-                try:
-                    state = store.load()
-                    base_equity = float(state.get("equity") or 0.0)
-                    realized = float(state.get("realized_pnl") or 0.0)
-                    fees = float(state.get("fees") or 0.0)
-                    mark = float(state.get("mark") or 0.0)
-                    pos_qty = float(state.get("pos_qty") or 0.0)
-                    avg_price = float(state.get("avg_price") or 0.0)
-                    unreal = 0.0
-                    if pos_qty != 0.0 and avg_price > 0.0 and mark > 0.0:
-                        delta = mark - avg_price
-                        if pos_qty < 0:
-                            delta = -delta
-                        unreal = abs(pos_qty) * delta
-                    equity = base_equity + realized + unreal - fees
-                except Exception:
-                    logging.debug("No se pudo calcular equity desde el PaperStore.", exc_info=True)
+        if S.PAPER and equity is None:
+            try:
+                equity = float(paper_get_equity())
+            except Exception:
+                logging.debug("No se pudo leer equity desde bot.paper_store.", exc_info=True)
 
         if equity is None:
             equity = cached

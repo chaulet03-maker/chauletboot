@@ -104,6 +104,7 @@ class SimBroker:
     def place_order(self, side: str, qty: float, price: float | None, **kwargs: Any) -> dict[str, Any]:
         mode = "paper"
         symbol_val = kwargs.get("symbol") or "BTC/USDT"
+        symbol_ledger = str(symbol_val).replace("/", "").upper()
         bot_id = get_bot_id()
         side_u = str(side).upper()
         reduce_only = bool(kwargs.get("reduce_only", False))
@@ -164,7 +165,7 @@ class SimBroker:
             ledger_order(
                 mode,
                 bot_id,
-                str(symbol_val),
+                symbol_ledger,
                 side_u,
                 client_oid,
                 order_id,
@@ -186,7 +187,7 @@ class SimBroker:
             ledger_fill(
                 mode,
                 bot_id,
-                str(symbol_val),
+                symbol_ledger,
                 side_u,
                 client_oid,
                 order_id,
@@ -465,10 +466,11 @@ class BinanceBroker:
                 price_src = float(price)
             else:
                 price_src = 0.0
+            symbol_ledger = (filters.symbol or str(symbol).replace("/", "")).upper()
             ledger_order(
                 mode,
                 bot_id,
-                str(symbol),
+                symbol_ledger,
                 side_u,
                 client_oid,
                 order_id,
@@ -493,10 +495,11 @@ class BinanceBroker:
                 f_qty = float(f.get("qty") or f.get("executedQty") or f.get("amount"))
                 f_price = float(f.get("price") or f.get("fillPrice") or f.get("avgPrice"))
                 f_fee = float(f.get("commission") or f.get("fee") or 0.0)
+                symbol_ledger = (filters.symbol or str(symbol).replace("/", "")).upper()
                 ledger_fill(
                     mode,
                     bot_id,
-                    str(symbol),
+                    symbol_ledger,
                     side_u,
                     client_oid,
                     order_id,
