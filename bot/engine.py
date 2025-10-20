@@ -19,6 +19,8 @@ from bot.storage import Storage
 from bot.telemetry.notifier import Notifier
 from bot.telemetry.telegram_bot import setup_telegram_bot
 from brokers import ACTIVE_LIVE_CLIENT
+from bot.identity import get_bot_id
+from bot.ledger import bot_position, prune_open_older_than
 from state_store import create_position, load_state, persist_open, save_state
 from bot.motives import MOTIVES, MotiveItem, compute_codes
 from core.strategy import Strategy
@@ -81,6 +83,7 @@ class TradingApp:
 
         schedule.every().day.at("07:00", "America/Argentina/Buenos_Aires").do(self._generate_daily_report)
         schedule.every().sunday.at("07:01", "America/Argentina/Buenos_Aires").do(self._generate_weekly_report)
+        schedule.every(30).minutes.do(self._prune_old_orders)
         logging.info("Componentes y tareas de reporte inicializados.")
 
         if str(self.config.get("trading_mode", "simulado")).lower() == "simulado":
@@ -112,6 +115,17 @@ class TradingApp:
         except Exception as e:
             import logging
             logging.debug(f"record_rejection failed: {e}")
+
+    def _prune_old_orders(self):
+        try:
+            if getattr(S, "PAPER", False):
+                mode = "paper"
+            else:
+                trading_mode = str(getattr(S, "trading_mode", "real")).lower()
+                mode = "live" if trading_mode in {"real", "live"} else "paper"
+            prune_open_older_than(mode, get_bot_id(), hours=16)
+        except Exception:
+            self.logger.debug("No se pudo ejecutar prune_open_older_than", exc_info=True)
 
     def _record_motive(self, ctx_overrides: Optional[Dict[str, Any]] = None):
         try:
@@ -1085,23 +1099,53 @@ class TradingApp:
             self.position_open = False
             return False
 
-        side = "LONG" if amount > 0 else "SHORT"
-        qty = abs(float(amount))
-        entry_price_f = float(entry_price)
+        mode = "live" if str(getattr(S, "trading_mode", "real")).lower() == "real" and not getattr(S, "PAPER", False) else "paper"
+        bot_id = get_bot_id()
+        sym = symbol
+        qty_bot, avg_bot = bot_position(mode, bot_id, sym)
+
+        if abs(qty_bot) <= 0.0:
+            try:
+                if store is not None:
+                    store.save(pos_qty=0.0, avg_price=0.0)
+            except Exception:
+                self.logger.debug("No se pudo limpiar store al sincronizar.", exc_info=True)
+            try:
+                state = load_state()
+                open_positions = state.get("open_positions", {})
+                if open_positions.pop(sym, None) is not None:
+                    save_state(state)
+            except Exception:
+                self.logger.debug("No se pudo limpiar state_store al sincronizar.", exc_info=True)
+            try:
+                if hasattr(self.trader, "_open_position"):
+                    self.trader._open_position = None
+            except Exception:
+                self.logger.debug("No se pudo limpiar cache de trader al sincronizar.", exc_info=True)
+            self.position_open = False
+            self.logger.info(
+                "sync_live_position: el bot está FLAT (puede haber posiciones manuales en la cuenta)."
+            )
+            return False
+
         leverage_i = int(leverage) if leverage >= 1 else 1
+        mark_val = float(mark_price or avg_bot or entry_price or 0.0)
+        side_bot = "LONG" if qty_bot > 0 else "SHORT"
+        qty_abs = abs(float(qty_bot))
+        avg_bot_f = float(avg_bot)
 
         if store is not None:
             try:
-                store.save(pos_qty=float(amount), avg_price=entry_price_f, mark=mark_price)
+                store.save(pos_qty=float(qty_bot), avg_price=avg_bot_f, mark=mark_val)
             except Exception:
                 self.logger.debug("No se pudo actualizar el store con la posición live.", exc_info=True)
 
         try:
             pos = create_position(
-                symbol=symbol,
-                side=side,
-                qty=qty,
-                entry_price=entry_price_f,
+                symbol=sym,
+                side=side_bot,
+                qty=qty_abs,
+                entry_price=avg_bot_f,
                 leverage=float(leverage_i),
                 mode="live",
             )
@@ -1112,22 +1156,21 @@ class TradingApp:
         try:
             if hasattr(self.trader, "_open_position"):
                 self.trader._open_position = {
-                    "symbol": symbol,
-                    "side": side,
-                    "contracts": qty,
-                    "entryPrice": entry_price_f,
-                    "markPrice": mark_price,
+                    "symbol": sym,
+                    "side": side_bot,
+                    "contracts": qty_abs,
+                    "entryPrice": avg_bot_f,
+                    "markPrice": mark_val,
                 }
         except Exception:
             self.logger.debug("No se pudo actualizar la cache del trader con la posición live.", exc_info=True)
 
         self.position_open = True
         self.logger.info(
-            "sync_live_position: posición adoptada %s %.6f @ %.2f x%s",
-            side,
-            qty,
-            entry_price_f,
-            leverage_i,
+            "sync_live_position: posición del BOT adoptada %s %.6f @ %.2f",
+            side_bot,
+            qty_abs,
+            avg_bot_f,
         )
         return True
 

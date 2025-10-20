@@ -14,6 +14,9 @@ try:
 except Exception:  # pragma: no cover - python-binance opcional en tests
     BinanceAPIException = BinanceOrderException = BinanceRequestException = tuple()  # type: ignore
 
+from bot.identity import get_bot_id, make_client_oid
+from bot.ledger import init as ledger_init, record_fill as ledger_fill, record_order as ledger_order
+
 from bot.exchanges.binance_filters import (
     SymbolFilters,
     build_filters,
@@ -47,6 +50,7 @@ class SimBroker:
     """Simula fills y persiste el estado en disco."""
 
     def __init__(self, store: PaperStore, fee_rate: float = 0.0):
+        ledger_init()
         self.store = store
         self.fee_rate = max(0.0, float(fee_rate))
 
@@ -98,6 +102,16 @@ class SimBroker:
         return self.store.save(**updates)
 
     def place_order(self, side: str, qty: float, price: float | None, **kwargs: Any) -> dict[str, Any]:
+        mode = "paper"
+        symbol_val = kwargs.get("symbol") or "BTC/USDT"
+        bot_id = get_bot_id()
+        side_u = str(side).upper()
+        reduce_only = bool(kwargs.get("reduce_only", False))
+        client_oid = kwargs.get("newClientOrderId") or make_client_oid(
+            bot_id, str(symbol_val).replace("/", ""), mode
+        )
+        kwargs["newClientOrderId"] = client_oid
+
         fill_price: float | None = None if price is None else float(price)
         if fill_price is None:
             state = self.store.load()
@@ -129,13 +143,60 @@ class SimBroker:
             "sim": True,
             "state": new_state,
         }
-        symbol = kwargs.get("symbol")
-        if symbol:
-            payload["symbol"] = symbol
+        payload["clientOrderId"] = client_oid
+        payload["newClientOrderId"] = client_oid
+        if reduce_only:
+            payload["reduceOnly"] = True
+        symbol_arg = kwargs.get("symbol")
+        if symbol_arg:
+            payload["symbol"] = symbol_arg
         if "sl" in kwargs:
             payload["sl"] = kwargs["sl"]
         if "tp" in kwargs:
             payload["tp"] = kwargs["tp"]
+
+        order_id = ""
+        try:
+            order_id = str(payload.get("orderId") or payload.get("order_id") or "")
+            leverage = int(kwargs.get("leverage") or kwargs.get("lev") or 1)
+            qty_f = float(qty or 0.0)
+            price_f = float(fill_price or 0.0)
+            ledger_order(
+                mode,
+                bot_id,
+                str(symbol_val),
+                side_u,
+                client_oid,
+                order_id,
+                leverage,
+                qty_f,
+                price_f,
+                reduce_only,
+                int(time.time()),
+            )
+        except Exception:
+            pass
+
+        fee_paid = 0.0
+        try:
+            fee_paid = abs(float(fill_price) * float(qty)) * self.fee_rate if fill_price is not None else 0.0
+        except Exception:
+            fee_paid = 0.0
+        try:
+            ledger_fill(
+                mode,
+                bot_id,
+                str(symbol_val),
+                side_u,
+                client_oid,
+                order_id,
+                float(qty or 0.0),
+                float(fill_price or 0.0),
+                float(fee_paid or 0.0),
+                int(time.time()),
+            )
+        except Exception:
+            pass
         return payload
 
 
@@ -143,6 +204,7 @@ class BinanceBroker:
     """Envuelve al cliente real SOLO en live."""
 
     def __init__(self, client: Any):
+        ledger_init()
         self.client = client
         self._symbol_filters: dict[str, SymbolFilters] = {}
         self._filters_lock = Lock()
@@ -279,9 +341,24 @@ class BinanceBroker:
         symbol = kwargs.get("symbol")
         if not symbol:
             raise ValueError("BinanceBroker requiere 'symbol' para enviar la orden.")
-        params = {k: v for k, v in kwargs.items() if k not in {"symbol", "sl", "tp", "client_order_id"}}
+
+        mode = "live"
+        bot_id = get_bot_id()
+        side_u = str(side).upper()
+        reduce_only_flag = bool(kwargs.get("reduce_only", False))
+        client_oid = (
+            kwargs.get("newClientOrderId")
+            or kwargs.get("client_order_id")
+            or make_client_oid(bot_id, str(symbol).replace("/", ""), mode)
+        )
+        kwargs["newClientOrderId"] = client_oid
+
+        params = {
+            k: v
+            for k, v in kwargs.items()
+            if k not in {"symbol", "sl", "tp", "client_order_id", "reduce_only"}
+        }
         explicit_type = params.pop("order_type", None)
-        reduce_only = params.pop("reduce_only", False)
         if explicit_type is None:
             order_type = "MARKET" if price in (None, 0, "0") else "LIMIT"
         else:
@@ -302,21 +379,14 @@ class BinanceBroker:
             params.pop("price", None)
             params.pop("timeInForce", None)
 
-        if reduce_only:
+        if reduce_only_flag:
             params["reduceOnly"] = True
 
         validate_order(filters, qty_f, px_f)
 
-        client_order_id = params.pop("newClientOrderId", None)
-        if client_order_id is None:
-            provided = kwargs.get("client_order_id")
-            if provided:
-                client_order_id = str(provided)
-            else:
-                client_order_id = f"bot-{int(time.time() * 1000)}-{os.getpid()}"
-        params["newClientOrderId"] = client_order_id
+        params["newClientOrderId"] = client_oid
 
-        side_clean = str(side).strip().upper()
+        side_clean = side_u.strip()
         side_map = {
             "BUY": "BUY",
             "SELL": "SELL",
@@ -376,6 +446,67 @@ class BinanceBroker:
             protections["TP"] = tp_price
         if protections:
             self._place_protections(filters, side_clean, qty_f, protections, position_side)
+
+        result: dict[str, Any] = response if isinstance(response, dict) else {}
+        order_id = ""
+        try:
+            order_id = str(result.get("orderId") or result.get("order_id") or "")
+            leverage = int(
+                kwargs.get("leverage")
+                or kwargs.get("lev")
+                or params.get("leverage")
+                or 1
+            )
+            qty_logged = float(qty_f or 0.0)
+            price_src: Optional[float]
+            if px_f is not None:
+                price_src = float(px_f)
+            elif price is not None:
+                price_src = float(price)
+            else:
+                price_src = 0.0
+            ledger_order(
+                mode,
+                bot_id,
+                str(symbol),
+                side_u,
+                client_oid,
+                order_id,
+                leverage,
+                qty_logged,
+                float(price_src or 0.0),
+                reduce_only_flag,
+                int(time.time()),
+            )
+        except Exception:
+            pass
+
+        fills = []
+        if isinstance(result, dict):
+            for key in ("fills", "trade_list", "trades", "executedFills"):
+                val = result.get(key)
+                if isinstance(val, list):
+                    fills = val
+                    break
+        for f in fills:
+            try:
+                f_qty = float(f.get("qty") or f.get("executedQty") or f.get("amount"))
+                f_price = float(f.get("price") or f.get("fillPrice") or f.get("avgPrice"))
+                f_fee = float(f.get("commission") or f.get("fee") or 0.0)
+                ledger_fill(
+                    mode,
+                    bot_id,
+                    str(symbol),
+                    side_u,
+                    client_oid,
+                    order_id,
+                    f_qty,
+                    f_price,
+                    f_fee,
+                    int(time.time()),
+                )
+            except Exception:
+                continue
 
         return response
 
