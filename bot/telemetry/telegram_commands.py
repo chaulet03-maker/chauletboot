@@ -6,9 +6,6 @@ import unicodedata
 import trading
 from config import S
 from bot.motives import MOTIVES
-from state_store import load_state as load_bot_state
-from state_store import position_status as store_position_status
-
 from .telegram_bot import (
     _build_config_text,
     _build_estado_text,
@@ -45,12 +42,12 @@ ALIASES = {
     "posicion": [
         "posicion",
         "posición",
-        "posiciones",
         "position",
         "pos",
         "posicion actual",
         "posición actual",
     ],
+    "posiciones": ["posiciones", "positions", "open positions"],
     "motivos": [
         "motivos",
         "razones",
@@ -81,6 +78,8 @@ ALIASES = {
         "test",
     ],
 }
+
+ALIASES["open"] = ["open", "abrir"]
 
 
 def resolve_command(txt: str) -> Optional[str]:
@@ -213,34 +212,83 @@ async def _cmd_precio(engine, reply, symbol: Optional[str] = None):
 
 
 async def _cmd_posicion(engine, reply):
-    try:
-        st = trading.POSITION_SERVICE.get_status() if trading.POSITION_SERVICE else None
-    except Exception as e:
-        st = None
-        log.debug("posicion/status error: %s", e)
-    cfg = getattr(engine, "config", None)
-    symbol_default = "BTC/USDT"
-    if isinstance(cfg, dict):
-        symbol_default = cfg.get("symbol", symbol_default)
+    from bot.identity import get_bot_id
+    from bot.ledger import bot_position
+
+    sym = engine.config.get("symbol", "BTC/USDT")
     mode = "live" if str(trading.ACTIVE_MODE).lower() == "real" else "paper"
-    state = load_bot_state()
-    symbol_candidates = []
-    if st and st.get("symbol"):
-        symbol_candidates.append(str(st.get("symbol")))
-    symbol_candidates.extend(state.get("open_positions", {}).keys())
-    if symbol_default not in symbol_candidates:
-        symbol_candidates.append(symbol_default)
-    for symbol in symbol_candidates:
-        try:
-            msg = store_position_status(symbol, mode)
-        except Exception:
-            log.debug("state_store position_status falló", exc_info=True)
-            continue
-        if msg != "SIN POSICIÓN":
-            return await reply(msg)
+    bid = get_bot_id()
+
+    qty, avg = bot_position(mode, bid, sym)
+    if abs(qty) <= 0.0:
+        return await reply(f"Estado Actual: Sin posición\n----------------\nSímbolo: {sym}")
+
+    try:
+        mark = await engine.exchange.get_current_price(sym)
+    except Exception:
+        mark = avg
+
+    mark_val = float(mark if mark is not None else avg)
+    side = "LONG" if qty > 0 else "SHORT"
+    pnl = (mark_val - avg) * abs(qty) if qty > 0 else (avg - mark_val) * abs(qty)
     return await reply(
-        f"Estado Actual: Sin posición\n----------------\nSímbolo: {st.get('symbol', symbol_default) if st else symbol_default}"
+        f"Estado Actual: {side}\n----------------\n"
+        f"Símbolo: {sym}\n"
+        f"Cantidad (bot): {abs(qty):.6f}\n"
+        f"Entrada: {avg:.2f} | Mark: {mark_val:.2f}\n"
+        f"PnL no realizado: {pnl:+.2f}"
     )
+
+
+async def _cmd_posiciones(engine, reply):
+    from bot.identity import get_bot_id
+    from bot.ledger import bot_position
+
+    mode = "live" if str(trading.ACTIVE_MODE).lower() == "real" else "paper"
+    bid = get_bot_id()
+    sym = engine.config.get("symbol", "BTC/USDT")
+    try:
+        pos_list = await engine.exchange.get_open_position(sym)
+    except Exception:
+        pos_list = None
+
+    entries = [pos_list] if isinstance(pos_list, dict) else (pos_list or [])
+    if not entries:
+        return await reply("No hay posiciones abiertas en la cuenta.")
+
+    lines = []
+    for entry in entries:
+        try:
+            symbol = entry.get("symbol", sym)
+            amt = float(
+                entry.get("contracts")
+                or entry.get("positionAmt")
+                or entry.get("amount")
+                or 0.0
+            )
+            side = "LONG" if amt > 0 else ("SHORT" if amt < 0 else "FLAT")
+            entryP = float(entry.get("entryPrice") or entry.get("avgPrice") or 0.0)
+            mark = float(entry.get("markPrice") or entry.get("mark") or entryP)
+        except Exception:
+            continue
+
+        qty_bot, avg_bot = bot_position(mode, bid, symbol)
+        is_bot = abs(qty_bot) > 0.0
+        if is_bot:
+            lines.append(
+                f"**{symbol} {side}**\n"
+                f"**qty total exchange:** {abs(amt):.6f} | **BOT qty:** {abs(qty_bot):.6f}\n"
+                f"**entrada BOT:** {avg_bot:.2f} | mark: {mark:.2f}"
+            )
+        else:
+            lines.append(
+                f"{symbol} {side}\n"
+                f"qty total exchange: {abs(amt):.6f}\n"
+                f"entrada: {entryP:.2f} | mark: {mark:.2f}"
+            )
+        lines.append("")
+
+    return await reply("\n".join(lines).strip())
 
 
 async def _cmd_motivos(engine, reply, n: int = 10):
@@ -425,69 +473,77 @@ def _build_report(days: int, csv_dir: str) -> str:
 # ========= Texto de estado =========
 
 def _status_text(engine):
-    # Saldo actual
+    from bot.identity import get_bot_id
+    from bot.ledger import pnl_summary
+
+    mode = "live" if str(trading.ACTIVE_MODE).lower() == "real" else "paper"
+    bid = get_bot_id()
     try:
         eq = float(engine.trader.equity())
     except Exception:
         eq = 0.0
 
-    # posiciones abiertas en memoria
-    per_symbol = {s: len(v) for s, v in getattr(engine.trader.state, "positions", {}).items()} if getattr(engine, "trader", None) else {}
-    open_cnt = sum(per_symbol.values()) if per_symbol else 0
+    def _mark(sym):
+        try:
+            return float(engine.price_cache.get(sym) or 0.0) or None
+        except Exception:
+            return None
 
-    # fallback: contar en CSV si no hay memoria
-    try:
-        if open_cnt == 0:
-            csv_dir = _csv_dir(engine)
-            path = os.path.join(csv_dir, "trades.csv")
-            if os.path.exists(path):
-                abiertos = {}
-                with open(path, newline="", encoding="utf-8") as f:
-                    reader = csv.DictReader(f)
-                    for r in reader:
-                        sym = (r.get("symbol") or "").upper()
-                        note = (r.get("note") or "").upper()
-                        if not sym:
-                            continue
-                        if note.startswith("OPEN"):
-                            abiertos[sym] = abiertos.get(sym, 0) + 1
-                        elif note.startswith("CLOSE") and abiertos.get(sym, 0) > 0:
-                            abiertos[sym] -= 1
-                            if abiertos[sym] <= 0:
-                                abiertos.pop(sym, None)
-                per_symbol = {k: v for k, v in abiertos.items() if v > 0}
-                open_cnt = sum(per_symbol.values())
-    except Exception as e:
-        log.warning("No pude leer trades.csv para estado: %s", e)
+    pnl = pnl_summary(mode, bid, mark_provider=_mark)
+    daily = pnl["daily"]
+    weekly = pnl["weekly"]
+    return (
+        f"Modo: *{'REAL' if mode == 'live' else 'SIMULADO'}*\n"
+        f"Equity: {eq:,.2f}\n"
+        f"PnL Diario: {daily['total']:+.2f} (R={daily['realized']:+.2f} | U={daily['unrealized']:+.2f})\n"
+        f"PnL Semanal: {weekly['total']:+.2f} (R={weekly['realized']:+.2f} | U={weekly['unrealized']:+.2f})"
+    )
 
-    # Últimos saldos (equity.csv)
-    recientes_txt = ""
+
+async def _cmd_open(engine, reply, txt: str):
+    """
+    Sintaxis: "open long x5"  |  "open short x10"
+    Usa equity ya seteado por el comando 'equity'.
+    """
+
+    t = _normalize_text(txt)
+    m = re.match(r"open\s+(long|short)\s+x(\d+)", t)
+    if not m:
+        return await reply("Formato: open long x5  |  open short x10")
+
+    side = m.group(1).upper()
+    lev = int(m.group(2))
+    sym = engine.config.get("symbol", "BTC/USDT")
     try:
-        csv_dir = _csv_dir(engine)
-        eq_path = os.path.join(csv_dir, "equity.csv")
-        if os.path.exists(eq_path):
-            rows = []
-            with open(eq_path, newline="", encoding="utf-8") as f:
-                reader = csv.DictReader(f)
-                for r in reader:
-                    rows.append(r)
-            ult = rows[-3:] if len(rows) >= 3 else rows[-len(rows):]
-            if ult:
-                saldos = " → ".join(_fmt_money(r.get("equity", "0")) for r in ult)
-                recientes_txt = f"\nSaldos recientes: {saldos}"
+        px = await engine.exchange.get_current_price(sym)
+        eq = float(engine.trader.equity())
     except Exception:
-        pass
+        return await reply("No pude obtener precio/equity.")
 
-    partes = [f"📊 Estado",
-              f"Saldo: {_fmt_money(eq)}",
-              f"Operaciones abiertas: {open_cnt}"]
-    if per_symbol:
-        partes.append("Por símbolo: " + ", ".join(f"{k}: {v}" for k, v in per_symbol.items()))
-    partes.append(f"Killswitch: {'ACTIVADO' if getattr(engine.trader.state, 'killswitch', False) else 'desactivado'}")
-    if recientes_txt:
-        partes.append(recientes_txt)
+    qty = (eq * lev) / float(px)
+    qty = max(0.0, float(qty))
+    if qty <= 0.0:
+        return await reply("Equity insuficiente.")
 
-    return "\n".join(partes)
+    order_side = "BUY" if side == "LONG" else "SELL"
+
+    try:
+        trading.place_order_safe(
+            order_side,
+            qty,
+            None,
+            symbol=sym,
+            leverage=lev,
+            newClientOrderId=None,
+        )
+    except Exception as e:
+        return await reply(f"Fallo al abrir: {e}")
+
+    return await reply(
+        f"🟢 OPEN {side} x{lev} | {sym}\n"
+        f"qty aprox: {qty:.6f} @ {float(px):.2f}\n"
+        "(la posición será gestionada por el bot)"
+    )
 
 # ========= Bot de comandos =========
 
@@ -522,16 +578,22 @@ class CommandBot:
                 return await _cmd_precio(self.engine, reply)
 
             if cmd_alias == "estado":
-                return await reply(_build_estado_text(self.engine))
+                return await reply(_status_text(self.engine))
 
             if cmd_alias == "posicion":
                 return await _cmd_posicion(self.engine, reply)
+
+            if cmd_alias == "posiciones":
+                return await _cmd_posiciones(self.engine, reply)
 
             if cmd_alias == "motivos":
                 return await _cmd_motivos(self.engine, reply)
 
             if cmd_alias == "config":
                 return await reply(_build_config_text(self.engine))
+
+            if cmd_alias == "open":
+                return await _cmd_open(self.engine, reply, msg_raw)
 
             if cmd_alias == "pausa":
                 _set_killswitch(self.engine, True)
@@ -563,8 +625,10 @@ class CommandBot:
             return await reply("⛔ Bot OFF: bloqueadas nuevas operaciones (killswitch ACTIVADO).")
 
         # --- POSICION DETALLE ---
-        if norm_all in ('posicion','posiciones','position','positions'):
+        if norm_all in ("posicion", "posición", "position", "pos", "posicion actual", "posición actual"):
             return await _cmd_posicion(self.engine, reply)
+        if norm_all in ("posiciones", "positions", "open positions"):
+            return await _cmd_posiciones(self.engine, reply)
 
         # --- AYUDA ---
         if norm_all in ('ayuda','menu','comandos','help'):
@@ -572,7 +636,7 @@ class CommandBot:
 
         # --- ESTADO ---
         if msg in ("estado", "status"):
-            return await reply(_build_estado_text(self.engine))
+            return await reply(_status_text(self.engine))
 
         if msg == "rendimiento":
             return await reply(_build_rendimiento_text(self.engine))
@@ -614,8 +678,13 @@ class CommandBot:
                 return await reply("Formato no válido. Ej: saldo=1000")
 
         # --- POSICIONES (por símbolo) ---
-        if msg in ("posicion", "posición", "posiciones"):
+        if msg in ("posicion", "posición"):
             return await _cmd_posicion(self.engine, reply)
+        if msg == "posiciones":
+            return await _cmd_posiciones(self.engine, reply)
+
+        if norm_all.startswith("open ") or norm_all.startswith("abrir "):
+            return await _cmd_open(self.engine, reply, msg_raw)
 
         # --- PRECIO ---
         if msg.startswith("precio"):
