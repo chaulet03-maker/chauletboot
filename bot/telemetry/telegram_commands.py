@@ -79,7 +79,26 @@ ALIASES = {
     ],
 }
 
-ALIASES["open"] = ["open", "abrir"]
+ALIASES.update(
+    {
+        "open": ["open", "abrir"],
+        "posicion": ["posicion", "posición", "position", "pos", "posicion actual", "posición actual"],
+        "posiciones": ["posiciones", "positions", "open positions"],
+    }
+)
+ALIASES["debug"] = ["debug"]
+
+
+def _to_binance_symbol(sym: str) -> str:
+    return sym.replace("/", "").upper()
+
+
+def _is_engine_live(engine) -> bool:
+    try:
+        return bool(getattr(engine, "is_live"))
+    except Exception:
+        pass
+    return str(trading.ACTIVE_MODE).lower() == "real"
 
 
 def resolve_command(txt: str) -> Optional[str]:
@@ -215,28 +234,30 @@ async def _cmd_posicion(engine, reply):
     from bot.identity import get_bot_id
     from bot.ledger import bot_position
 
-    sym = engine.config.get("symbol", "BTC/USDT")
-    mode = "live" if str(trading.ACTIVE_MODE).lower() == "real" else "paper"
+    sym_conf = engine.config.get("symbol", "BTCUSDT")
+    symbol = _to_binance_symbol(sym_conf)
+    mode = "live" if _is_engine_live(engine) else "paper"
     bid = get_bot_id()
 
-    qty, avg = bot_position(mode, bid, sym)
+    qty, avg = bot_position(mode, bid, symbol)
     if abs(qty) <= 0.0:
-        return await reply(f"Estado Actual: Sin posición\n----------------\nSímbolo: {sym}")
+        qty, avg = bot_position(mode, bid, sym_conf)
+    if abs(qty) <= 0.0:
+        return await reply(f"Sin posición del bot en {symbol}.")
 
     try:
-        mark = await engine.exchange.get_current_price(sym)
+        mark = await engine.exchange.get_current_price(symbol)
     except Exception:
-        mark = avg
+        mark = None
 
     mark_val = float(mark if mark is not None else avg)
     side = "LONG" if qty > 0 else "SHORT"
-    pnl = (mark_val - avg) * abs(qty) if qty > 0 else (avg - mark_val) * abs(qty)
+    pnl_u = (mark_val - avg) * abs(qty) if qty > 0 else (avg - mark_val) * abs(qty)
+
     return await reply(
-        f"Estado Actual: {side}\n----------------\n"
-        f"Símbolo: {sym}\n"
-        f"Cantidad (bot): {abs(qty):.6f}\n"
-        f"Entrada: {avg:.2f} | Mark: {mark_val:.2f}\n"
-        f"PnL no realizado: {pnl:+.2f}"
+        f"BOT {side} {symbol}\n"
+        f"qty: {abs(qty):.6f} | entrada: {avg:.2f} | mark: {mark_val:.2f}\n"
+        f"PnL no realizado: {pnl_u:+.2f}"
     )
 
 
@@ -244,47 +265,47 @@ async def _cmd_posiciones(engine, reply):
     from bot.identity import get_bot_id
     from bot.ledger import bot_position
 
-    mode = "live" if str(trading.ACTIVE_MODE).lower() == "real" else "paper"
+    mode = "live" if _is_engine_live(engine) else "paper"
     bid = get_bot_id()
-    sym = engine.config.get("symbol", "BTC/USDT")
+    sym_conf = engine.config.get("symbol", "BTCUSDT")
     try:
-        pos_list = await engine.exchange.get_open_position(sym)
+        ex_positions = await engine.exchange.fetch_positions()
     except Exception:
-        pos_list = None
+        ex_positions = []
 
-    entries = [pos_list] if isinstance(pos_list, dict) else (pos_list or [])
-    if not entries:
-        return await reply("No hay posiciones abiertas en la cuenta.")
+    if not ex_positions:
+        return await reply("No hay posiciones abiertas en el exchange.")
 
     lines = []
-    for entry in entries:
+    for entry in ex_positions:
         try:
-            symbol = entry.get("symbol", sym)
+            symbol_raw = entry.get("symbol") or sym_conf
+            symbol_clean = _to_binance_symbol(symbol_raw)
             amt = float(
-                entry.get("contracts")
-                or entry.get("positionAmt")
+                entry.get("positionAmt")
+                or entry.get("contracts")
                 or entry.get("amount")
                 or 0.0
             )
+            entry_price = float(entry.get("entryPrice") or entry.get("avgPrice") or 0.0)
+            mark_price = float(entry.get("markPrice") or entry.get("mark") or entry_price)
             side = "LONG" if amt > 0 else ("SHORT" if amt < 0 else "FLAT")
-            entryP = float(entry.get("entryPrice") or entry.get("avgPrice") or 0.0)
-            mark = float(entry.get("markPrice") or entry.get("mark") or entryP)
         except Exception:
             continue
 
-        qty_bot, avg_bot = bot_position(mode, bid, symbol)
-        is_bot = abs(qty_bot) > 0.0
-        if is_bot:
+        qty_bot, avg_bot = bot_position(mode, bid, symbol_clean)
+        if abs(qty_bot) <= 0.0:
+            qty_bot, avg_bot = bot_position(mode, bid, symbol_raw)
+
+        if abs(qty_bot) > 0.0:
             lines.append(
-                f"**{symbol} {side}**\n"
-                f"**qty total exchange:** {abs(amt):.6f} | **BOT qty:** {abs(qty_bot):.6f}\n"
-                f"**entrada BOT:** {avg_bot:.2f} | mark: {mark:.2f}"
+                f"**{symbol_clean} {side}**  | **BOT qty:** {abs(qty_bot):.6f}\n"
+                f"**entrada BOT:** {avg_bot:.2f} | mark: {mark_price:.2f}"
             )
         else:
             lines.append(
-                f"{symbol} {side}\n"
-                f"qty total exchange: {abs(amt):.6f}\n"
-                f"entrada: {entryP:.2f} | mark: {mark:.2f}"
+                f"{symbol_clean} {side}\n"
+                f"qty exch: {abs(amt):.6f} | entrada: {entry_price:.2f} | mark: {mark_price:.2f}"
             )
         lines.append("")
 
@@ -476,7 +497,7 @@ def _status_text(engine):
     from bot.identity import get_bot_id
     from bot.ledger import pnl_summary
 
-    mode = "live" if str(trading.ACTIVE_MODE).lower() == "real" else "paper"
+    mode = "live" if _is_engine_live(engine) else "paper"
     bid = get_bot_id()
     try:
         eq = float(engine.trader.equity())
@@ -484,10 +505,22 @@ def _status_text(engine):
         eq = 0.0
 
     def _mark(sym):
-        try:
-            return float(engine.price_cache.get(sym) or 0.0) or None
-        except Exception:
-            return None
+        candidates = {sym}
+        if "/" in sym:
+            candidates.add(sym.replace("/", ""))
+        else:
+            candidates.add(sym)
+            if sym.endswith("USDT"):
+                base = sym[:-4]
+                candidates.add(f"{base}/USDT")
+        for key in candidates:
+            try:
+                price = engine.price_cache.get(key)
+                if price is not None:
+                    return float(price)
+            except Exception:
+                continue
+        return None
 
     pnl = pnl_summary(mode, bid, mark_provider=_mark)
     daily = pnl["daily"]
@@ -500,49 +533,98 @@ def _status_text(engine):
     )
 
 
-async def _cmd_open(engine, reply, txt: str):
-    """
-    Sintaxis: "open long x5"  |  "open short x10"
-    Usa equity ya seteado por el comando 'equity'.
-    """
-
-    t = _normalize_text(txt)
-    m = re.match(r"open\s+(long|short)\s+x(\d+)", t)
+async def _cmd_open(engine, reply, raw_txt: str):
+    t = raw_txt.strip().lower()
+    m = re.search(r"\bopen\s+(long|short)\s+x\s*(\d+)\b", t)
     if not m:
         return await reply("Formato: open long x5  |  open short x10")
 
-    side = m.group(1).upper()
+    side_txt = m.group(1).upper()
     lev = int(m.group(2))
-    sym = engine.config.get("symbol", "BTC/USDT")
+    sym_conf = engine.config.get("symbol", "BTCUSDT")
+    symbol = _to_binance_symbol(sym_conf)
+
     try:
-        px = await engine.exchange.get_current_price(sym)
+        px = await engine.exchange.get_current_price(symbol)
+    except Exception as e:
+        return await reply(f"No pude obtener precio para {symbol}: {e}")
+
+    try:
         eq = float(engine.trader.equity())
-    except Exception:
-        return await reply("No pude obtener precio/equity.")
+    except Exception as e:
+        return await reply(f"No pude leer equity: {e}")
+
+    if eq <= 0:
+        return await reply("Equity = 0. Setealo con: equity 1200 (ejemplo).")
 
     qty = (eq * lev) / float(px)
-    qty = max(0.0, float(qty))
-    if qty <= 0.0:
-        return await reply("Equity insuficiente.")
-
-    order_side = "BUY" if side == "LONG" else "SELL"
 
     try:
-        trading.place_order_safe(
-            order_side,
-            qty,
-            None,
-            symbol=sym,
+        from bot.qty_utils import round_and_validate_qty
+
+        qty = await round_and_validate_qty(engine.exchange, symbol, qty)
+    except Exception:
+        pass
+
+    if qty <= 0:
+        return await reply("Cantidad final <= 0 (minQty/minNotional). Subí el equity o bajá el leverage.")
+
+    order_side = "SELL" if side_txt == "SHORT" else "BUY"
+
+    try:
+        await engine.broker.place_market_order(
+            symbol=symbol,
+            side=order_side,
+            quantity=qty,
             leverage=lev,
-            newClientOrderId=None,
         )
     except Exception as e:
         return await reply(f"Fallo al abrir: {e}")
 
     return await reply(
-        f"🟢 OPEN {side} x{lev} | {sym}\n"
-        f"qty aprox: {qty:.6f} @ {float(px):.2f}\n"
-        "(la posición será gestionada por el bot)"
+        f"🟢 OPEN {side_txt} x{lev} | {symbol}\n"
+        f"qty: {qty:.6f}  @ ~{float(px):.2f}\n"
+        f"Modo: {'REAL' if _is_engine_live(engine) else 'SIMULADO'}"
+    )
+
+
+async def _cmd_debug_open(engine, reply, raw_txt: str):
+    t = raw_txt.strip().lower()
+    m = re.search(r"\bdebug\s+open\s+(long|short)\s+x\s*(\d+)\b", t)
+    if not m:
+        return await reply("Formato: debug open long x5  |  debug open short x10")
+
+    side_txt = m.group(1).upper()
+    lev = int(m.group(2))
+    sym_conf = engine.config.get("symbol", "BTCUSDT")
+    symbol = _to_binance_symbol(sym_conf)
+
+    eq = float(engine.trader.equity())
+    px = await engine.exchange.get_current_price(symbol)
+
+    try:
+        info = await engine.exchange.get_symbol_filters(symbol)
+    except Exception:
+        info = {}
+
+    min_qty = info.get("minQty")
+    step = info.get("stepSize")
+    min_notional = info.get("minNotional")
+    qty_raw = (eq * lev) / px if px else 0
+    qty_final = qty_raw
+    try:
+        from bot.qty_utils import round_and_validate_qty
+
+        qty_final = await round_and_validate_qty(engine.exchange, symbol, qty_raw)
+    except Exception:
+        pass
+
+    return await reply(
+        "DEBUG OPEN\n"
+        f"modo: {'REAL' if _is_engine_live(engine) else 'SIM'} | symbol: {symbol}\n"
+        f"eq: {eq} | px: {px} | lev: {lev}\n"
+        f"minQty: {min_qty} | step: {step} | minNotional: {min_notional}\n"
+        f"qty_raw: {qty_raw} | qty_final: {qty_final}"
     )
 
 # ========= Bot de comandos =========
@@ -594,6 +676,9 @@ class CommandBot:
 
             if cmd_alias == "open":
                 return await _cmd_open(self.engine, reply, msg_raw)
+
+            if cmd_alias == "debug":
+                return await _cmd_debug_open(self.engine, reply, msg_raw)
 
             if cmd_alias == "pausa":
                 _set_killswitch(self.engine, True)
@@ -648,6 +733,54 @@ class CommandBot:
             except Exception:
                 eq = 0.0
             return await reply(f"Saldo: {_fmt_money(eq)}")
+
+        m_eq_cmd = re.match(r"(equity|saldo)\s+([\d\.,]+)", norm_all)
+        if m_eq_cmd:
+            val_txt = m_eq_cmd.group(2).replace(".", "").replace(",", ".")
+            try:
+                new_eq = float(val_txt)
+            except Exception:
+                return await reply("Formato no válido. Ej: equity 1200")
+
+            applied = False
+            trader = getattr(self.engine, "trader", None)
+            if trader is not None and hasattr(trader, "set_paper_equity"):
+                try:
+                    trader.set_paper_equity(new_eq)
+                    applied = True
+                except Exception:
+                    applied = False
+
+            if self.engine.is_paper:
+                try:
+                    from bot.paper_store import set_equity as paper_set_equity
+
+                    paper_set_equity(new_eq)
+                except Exception:
+                    pass
+
+            if not applied:
+                for meth in ("set_equity", "set_equity_init"):
+                    fn = getattr(self.engine, meth, None)
+                    if callable(fn):
+                        try:
+                            fn(new_eq)
+                            applied = True
+                            break
+                        except Exception:
+                            continue
+
+            if not applied:
+                try:
+                    os.makedirs(_csv_dir(self.engine), exist_ok=True)
+                    with open(os.path.join(_csv_dir(self.engine), "equity_init.txt"), "w", encoding="utf-8") as f:
+                        f.write(str(new_eq))
+                    applied = True
+                except Exception:
+                    applied = False
+
+            return await reply("Saldo inicial actualizado." if applied else "Guardé el valor, pero el engine no expone setter.")
+
         m = re.match(r"saldo\s*=\s*([\d\.,]+)", norm_all)
         if m:
             val_txt = m.group(1).replace(".", "").replace(",", ".")
@@ -685,6 +818,8 @@ class CommandBot:
 
         if norm_all.startswith("open ") or norm_all.startswith("abrir "):
             return await _cmd_open(self.engine, reply, msg_raw)
+        if norm_all.startswith("debug open"):
+            return await _cmd_debug_open(self.engine, reply, msg_raw)
 
         # --- PRECIO ---
         if msg.startswith("precio"):

@@ -10,6 +10,7 @@ from ccxt.base.errors import OperationRejected
 
 from config import S
 from trading import place_order_safe
+from bot.exchanges.binance_filters import build_filters
 
 
 logger = logging.getLogger(__name__)
@@ -496,6 +497,51 @@ class Exchange:
 
         logger.warning(f"No pude obtener precio para {base_symbol}")
         return None
+
+    async def get_symbol_filters(self, symbol: str) -> Dict[str, Any]:
+        sym = symbol or self.config.get('symbol', 'BTC/USDT')
+        sym_clean = sym.replace('/', '').upper()
+
+        client = getattr(self, 'client', None)
+        if client is None:
+            return {}
+
+        markets: Dict[str, Any] = {}
+        try:
+            markets = await asyncio.to_thread(client.load_markets)
+        except Exception:
+            markets = {}
+
+        candidates = [sym, sym.upper(), sym_clean]
+        if sym_clean.endswith('USDT') and not sym.endswith('/USDT'):
+            candidates.append(f"{sym_clean[:-4]}/USDT")
+        market = None
+        for key in candidates:
+            if not key:
+                continue
+            market = markets.get(key)
+            if market:
+                break
+
+        if market is None:
+            try:
+                market = await asyncio.to_thread(client.market, sym)
+            except Exception:
+                market = None
+
+        if market is None and sym_clean.endswith('USDT'):
+            alt = f"{sym_clean[:-4]}/USDT"
+            market = markets.get(alt)
+
+        if market is None:
+            return {}
+
+        filters = build_filters(sym_clean, market)
+        return {
+            "stepSize": float(filters.step_size),
+            "minQty": float(filters.min_qty),
+            "minNotional": float(filters.min_notional),
+        }
 
     async def set_leverage(self, leverage: float | int, symbol: Optional[str] = None) -> None:
         """Establece el apalancamiento para un par."""

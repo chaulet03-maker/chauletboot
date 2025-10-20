@@ -19,8 +19,8 @@ from bot.storage import Storage
 from bot.telemetry.notifier import Notifier
 from bot.telemetry.telegram_bot import setup_telegram_bot
 from brokers import ACTIVE_LIVE_CLIENT
-from bot.identity import get_bot_id
-from bot.ledger import bot_position, prune_open_older_than
+from bot.identity import get_bot_id, make_client_oid
+from bot.ledger import bot_position, prune_open_older_than, init as ledger_init
 from state_store import create_position, load_state, persist_open, save_state
 from bot.motives import MOTIVES, MotiveItem, compute_codes
 from core.strategy import Strategy
@@ -35,6 +35,44 @@ from risk_guards import (
 )
 from reanudar_listener import listen_reanudar
 
+class _EngineBrokerAdapter:
+    def __init__(self, app: "TradingApp"):
+        self.app = app
+
+    async def place_market_order(self, symbol: str, side: str, quantity: float, leverage: int = 1):
+        trading.ensure_initialized()
+        ledger_init()
+
+        sym = symbol or self.app.config.get("symbol", "BTC/USDT")
+        sym_clean = sym.replace("/", "").upper()
+        mode = "live" if self.app.is_live else "paper"
+        side_u = str(side).upper()
+
+        if self.app.is_live:
+            try:
+                await self.app.exchange.set_leverage(leverage, sym)
+            except Exception:
+                self.app.logger.debug("No se pudo establecer leverage", exc_info=True)
+
+        bot_id = get_bot_id()
+        client_oid = make_client_oid(bot_id, sym_clean, mode)
+
+        result = await asyncio.to_thread(
+            trading.place_order_safe,
+            side_u,
+            float(quantity),
+            None,
+            symbol=sym,
+            leverage=int(leverage),
+            newClientOrderId=client_oid,
+            order_type="MARKET",
+        )
+
+        if isinstance(result, dict):
+            result.setdefault("newClientOrderId", client_oid)
+            result.setdefault("clientOrderId", client_oid)
+        return result
+
 
 class TradingApp:
     def __init__(self, cfg):
@@ -45,6 +83,8 @@ class TradingApp:
         self.logger = logging.getLogger(__name__)
 
         trading.ensure_initialized()
+
+        self.broker = _EngineBrokerAdapter(self)
 
         storage_cfg = cfg.get("storage", {}) if isinstance(cfg, dict) else {}
         self.db_path = (
@@ -95,6 +135,18 @@ class TradingApp:
                     logging.warning("No se pudo cargar la serie de funding desde %s: %s", funding_csv, exc)
 
         self._start_reanudar_listener()
+
+    @property
+    def active_mode(self) -> str:
+        return str(trading.ACTIVE_MODE).lower()
+
+    @property
+    def is_live(self) -> bool:
+        return self.active_mode in {"real", "live"}
+
+    @property
+    def is_paper(self) -> bool:
+        return not self.is_live
 
     # === Rejection recording helpers ===
     def record_rejection(self, symbol: str, side: str, code: str, detail: str = "", ts=None):
@@ -1099,10 +1151,14 @@ class TradingApp:
             self.position_open = False
             return False
 
-        mode = "live" if str(getattr(S, "trading_mode", "real")).lower() == "real" and not getattr(S, "PAPER", False) else "paper"
+        mode = "live" if self.is_live else "paper"
         bot_id = get_bot_id()
+        sym_clean = symbol.replace("/", "").upper()
         sym = symbol
-        qty_bot, avg_bot = bot_position(mode, bot_id, sym)
+        qty_bot, avg_bot = bot_position(mode, bot_id, sym_clean)
+
+        if abs(qty_bot) <= 0.0:
+            qty_bot, avg_bot = bot_position(mode, bot_id, symbol)
 
         if abs(qty_bot) <= 0.0:
             try:
