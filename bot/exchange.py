@@ -29,6 +29,84 @@ class Exchange:
         self._price_stream = None
         self._start_price_stream()
 
+    # --------- NUEVO: posiciones abiertas (CCXT) ---------
+    async def get_open_position(self, symbol: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        """
+        Devuelve una sola posición (la del símbolo configurado), o None si no hay.
+        """
+        sym = symbol or self.config.get("symbol", "BTC/USDT")
+        target = sym.replace("/", "").upper()
+        ccxt_client = getattr(self, "client", None)
+        if ccxt_client is None or not hasattr(ccxt_client, "fetch_positions"):
+            return None
+        try:
+            pos_list = await asyncio.to_thread(ccxt_client.fetch_positions, [sym])
+        except Exception:
+            return None
+        for entry in pos_list or []:
+            info = entry.get("info") or {}
+            exch_sym = str(info.get("symbol") or entry.get("symbol") or "").upper()
+            if exch_sym.replace("/", "") != target:
+                continue
+            raw_amt = info.get("positionAmt") or info.get("positionamt")
+            if raw_amt is None:
+                raw_amt = entry.get("contracts") or entry.get("size") or 0
+            amt_f = float(raw_amt or "0")
+            if abs(amt_f) == 0.0:
+                return None
+            side = "LONG" if amt_f > 0 else "SHORT"
+            entry_price = float(info.get("entryPrice") or entry.get("entryPrice") or 0.0)
+            mark_price = float(
+                info.get("markPrice") or info.get("markprice")
+                or entry.get("markPrice") or entry.get("markprice") or 0.0
+            )
+            return {
+                "symbol": sym,
+                "side": side,
+                "contracts": abs(amt_f),
+                "entryPrice": entry_price,
+                "markPrice": mark_price,
+            }
+        return None
+
+    async def list_open_positions(self) -> List[Dict[str, Any]]:
+        """
+        Devuelve todas las posiciones abiertas del account (formato unificado).
+        """
+        out: List[Dict[str, Any]] = []
+        ccxt_client = getattr(self, "client", None)
+        if ccxt_client is None or not hasattr(ccxt_client, "fetch_positions"):
+            return out
+        try:
+            pos_list = await asyncio.to_thread(ccxt_client.fetch_positions)
+        except Exception:
+            return out
+        for entry in pos_list or []:
+            info = entry.get("info") or {}
+            raw_amt = info.get("positionAmt") or info.get("positionamt")
+            if raw_amt is None:
+                raw_amt = entry.get("contracts") or entry.get("size") or 0
+            amt_f = float(raw_amt or "0")
+            if abs(amt_f) == 0.0:
+                continue
+            side = "LONG" if amt_f > 0 else "SHORT"
+            sym_raw = str(info.get("symbol") or entry.get("symbol") or "")
+
+            def _fmt_symbol(s: str) -> str:
+                return s if "/" in s else (s[:-4] + "/USDT" if s.endswith("USDT") else s)
+
+            out.append({
+                "symbol": _fmt_symbol(sym_raw),
+                "side": side,
+                "contracts": abs(amt_f),
+                "entryPrice": float(info.get("entryPrice") or entry.get("entryPrice") or 0.0),
+                "markPrice": float(
+                    info.get("markPrice") or info.get("markprice")
+                    or entry.get("markPrice") or entry.get("markprice") or 0.0
+                ),
+            })
+        return out
+
     def _normalize_symbol(self, symbol: str) -> str:
         return symbol.replace("/", "").lower()
 
