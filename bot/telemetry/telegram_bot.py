@@ -986,6 +986,19 @@ async def estado_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if balance_actual is None:
             balance_actual = float(getattr(_S_, "start_equity", 0.0))
 
+        # --- Fallback: si no hay trades, mostrar delta de equity/balance ---
+        try:
+            start_eq = float(getattr(_S_, "start_equity", 0.0) or 0.0)
+        except Exception:
+            start_eq = 0.0
+        if (pnl_day == 0.0 or pnl_week == 0.0) and balance_actual is not None and start_eq > 0:
+            # Sin granularidad temporal, pero evitamos mostrar $0 cuando hay ganancia real
+            pnl_total = float(balance_actual) - start_eq
+            if pnl_day == 0.0:
+                pnl_day = pnl_total
+            if pnl_week == 0.0:
+                pnl_week = pnl_total
+
         estado_lineas = [
             _position_status_message(engine),
             "",
