@@ -158,6 +158,58 @@ class TradingApp:
     def is_paper(self) -> bool:
         return not self.is_live
 
+    def set_mode(self, mode: str):
+        """
+        Cambia modo del bot sin tocar propiedades de solo-lectura.
+        Acepta: 'live'|'real'|'paper'|'simulado'|'sim'.
+        Propaga a trader/strategy/exchange si esos objetos exponen 'mode' o setters similares.
+        """
+
+        m = (mode or "").lower()
+        target = "live" if m in ("live", "real") else "paper"
+
+        # bandera propia
+        try:
+            self.mode = target
+        except Exception:
+            pass
+
+        # flags tipicas
+        for flag, val in (("PAPER", target == "paper"), ("paper", target == "paper")):
+            try:
+                if hasattr(self, flag):
+                    setattr(self, flag, val)
+            except Exception:
+                pass
+
+        # propagar a subcomponentes comunes
+        for comp_name in ("trader", "exchange", "strategy"):
+            comp = getattr(self, comp_name, None)
+            if not comp:
+                continue
+            # atributo simple .mode
+            try:
+                if hasattr(comp, "mode"):
+                    setattr(comp, "mode", target)
+            except Exception:
+                pass
+            # setters conocidos (si existen en tu código)
+            for fn in (
+                "set_mode",
+                "set_trading_mode",
+                "switch_mode",
+                "enable_live",
+                "enable_real",
+                "enable_paper",
+                "set_paper",
+            ):
+                try:
+                    fn_ref = getattr(comp, fn, None)
+                    if callable(fn_ref):
+                        fn_ref(target)
+                except Exception:
+                    pass
+
     # === Rejection recording helpers ===
     def record_rejection(self, symbol: str, side: str, code: str, detail: str = "", ts=None):
         try:

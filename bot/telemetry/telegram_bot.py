@@ -38,94 +38,16 @@ REGISTRY = CommandRegistry()
 # ===== Helpers de modo seguros (NO tocar is_live) =====
 
 
-def _get_mode(engine) -> str:
-    """
-    Devuelve 'live' o 'paper' sin tocar nada.
-    1) Si hay un método que lo expone, úsalo.
-    2) Si existe una property .mode, úsala.
-    3) Si existe is_live (solo lectura), úsala para derivar.
-    """
-    # 1) métodos comunes
-    for fn in ("get_mode", "trading_mode", "active_mode"):
-        if hasattr(engine, fn) and callable(getattr(engine, fn)):
-            m = getattr(engine, fn)()
-            if isinstance(m, str):
-                return m.lower()
-    # 2) atributo .mode
-    if hasattr(engine, "mode"):
-        val = getattr(engine, "mode")
-        if isinstance(val, str):
-            return val.lower()
-        # a veces guardan un enum/objeto con .name
-        if hasattr(val, "name"):
-            return str(val.name).lower()
-    # 3) derivar de is_live (solo lectura)
-    if hasattr(engine, "is_live"):
-        try:
-            return "live" if bool(getattr(engine, "is_live")) else "paper"
-        except Exception:
-            pass
-    # fallback
-    return "paper"
-
-
-def _safe_set_attr(obj, name, value):
-    """Setea atributo solo si existe y NO es property sin setter."""
-    if not hasattr(obj, name):
-        return False
-    # evitar properties sin setter
-    prop = getattr(type(obj), name, None)
-    if isinstance(prop, property) and prop.fset is None:
-        return False
+def _get_mode_from_engine(engine) -> str:
+    # lee modo actual sin tocar nada
     try:
-        setattr(obj, name, value)
-        return True
+        if hasattr(engine, "mode") and isinstance(engine.mode, str):
+            return "live" if engine.mode.lower() in ("live", "real") else "paper"
+        if hasattr(engine, "is_live"):
+            return "live" if bool(engine.is_live) else "paper"
     except Exception:
-        return False
-
-
-def _set_mode(engine, target: str) -> bool:
-    """
-    Intenta setear el modo a 'live' o 'paper' SIN tocar is_live.
-    Orden de preferencia:
-      - engine.set_mode / set_trading_mode / switch_mode(target)
-      - engine.trader.set_mode / engine.exchange.set_mode / engine.strategy.set_mode
-      - engine.mode / engine.trader.mode / engine.exchange.mode
-    Devuelve True si logró setear.
-    """
-    t = target.lower()
-    assert t in ("live", "paper")
-
-    # 1) métodos directos en engine
-    for fn in ("set_mode", "set_trading_mode", "switch_mode"):
-        if hasattr(engine, fn) and callable(getattr(engine, fn)):
-            try:
-                getattr(engine, fn)(t)
-                return True
-            except Exception:
-                pass
-
-    # 2) métodos en subcomponentes
-    for comp_name in ("trader", "exchange", "strategy"):
-        if hasattr(engine, comp_name):
-            comp = getattr(engine, comp_name)
-            for fn in ("set_mode", "set_trading_mode", "switch_mode"):
-                if hasattr(comp, fn) and callable(getattr(comp, fn)):
-                    try:
-                        getattr(comp, fn)(t)
-                        # seguimos sin error aunque alguno no exista
-                    except Exception:
-                        pass
-
-    # 3) atributos simples .mode en engine y subcomponentes
-    ok = False
-    ok |= _safe_set_attr(engine, "mode", t)
-    for comp_name in ("trader", "exchange", "strategy"):
-        if hasattr(engine, comp_name):
-            comp = getattr(engine, comp_name)
-            ok |= _safe_set_attr(comp, "mode", t)
-
-    return ok
+        pass
+    return "paper"
 
 
 def _format_position_block(
@@ -948,129 +870,74 @@ async def posiciones_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await message.reply_text("\n\n".join(blocks), parse_mode="Markdown")
 
 
-def _engine_mode_is_live(engine) -> bool:
-    mode_attr = str(getattr(engine, "mode", "") or "").lower()
-    return bool(getattr(engine, "is_live", False)) or mode_attr in ("real", "live")
+def _sym(s):
+    return (s or "BTCUSDT").replace("/", "").upper()
 
 
-async def _cmd_open(engine, reply, raw_txt: str):
-    text = (raw_txt or "").strip().lower()
-    match = re.search(r"\bopen\s+(long|short)\s+x\s*(\d+)\b", text)
-    if not match:
+async def _cmd_open(engine, reply, raw_txt):
+    t = (raw_txt or "").strip().lower()
+    m = re.search(r"\bopen\s+(long|short)\s+x\s*(\d+)\b", t)
+    if not m:
         return await reply("Formato: open long x5  |  open short x10")
 
-    side_txt = match.group(1).upper()
-    leverage = int(match.group(2))
-    cfg = getattr(engine, "config", {}) or {}
-    symbol_cfg = str(cfg.get("symbol") or "BTC/USDT")
-    symbol_norm = _normalized_symbol(symbol_cfg)
+    side_txt = m.group(1).upper()   # LONG/SHORT
+    lev      = int(m.group(2))
+    cfg      = getattr(engine, "config", {}) or {}
+    symbol   = _sym(cfg.get("symbol"))
+    side     = "BUY" if side_txt=="LONG" else "SELL"
 
     exchange = getattr(engine, "exchange", None)
-    if exchange is None:
-        return await reply("Exchange no disponible para abrir la operación.")
+    broker = getattr(engine, "broker", None)
+    if exchange is None or broker is None:
+        return await reply("No pude obtener acceso a exchange/broker para abrir.")
 
+    # precio actual
     try:
-        price_now = await exchange.get_current_price(symbol_cfg)
-    except Exception as exc:
-        logger.debug("open_command: fallo get_current_price: %s", exc)
-        price_now = None
-
-    if price_now is None:
+        px = await exchange.get_current_price(symbol)
+    except Exception:
+        px = None
+    if not px:
         return await reply("No pude obtener precio actual del símbolo.")
 
+    # equity para sizing (como pediste: el que seteás con 'equity', en ambos modos)
     try:
-        equity = float(engine.trader.equity())
+        eq = float(engine.trader.equity())
     except Exception:
-        equity = 0.0
-
-    if equity <= 0:
+        eq = 0.0
+    if eq <= 0:
         return await reply("Equity = 0. Setealo con: equity 1200")
 
-    qty = (equity * leverage) / float(price_now)
-
+    qty = (eq * lev) / float(px)
     try:
         round_qty_fn = getattr(exchange, "round_qty", None)
         if callable(round_qty_fn):
-            if inspect.iscoroutinefunction(round_qty_fn):
-                qty = await round_qty_fn(symbol_norm, qty)
-            else:
-                qty = round_qty_fn(symbol_norm, qty)
+            maybe_qty = round_qty_fn(symbol, qty)
+            qty = await maybe_qty if inspect.isawaitable(maybe_qty) else maybe_qty
+    except Exception:
+        pass
+    if qty <= 0:
+        return await reply("Cantidad final <= 0 (minQty/minNotional). Subí equity o bajá leverage.")
+
+    try:
+        res = await broker.place_market_order(symbol=symbol, side=side, quantity=qty, leverage=lev)
+    except Exception as e:
+        return await reply(f"Fallo al abrir: {e}")
+
+    try:
+        # Enganchá TP/SL de tu estrategia (si tenés método)
+        strategy = getattr(engine, "strategy", None)
+        attach = getattr(strategy, "attach_tp_sl", None)
+        if callable(attach):
+            entry_price = float(
+                res.get("price") if isinstance(res, dict) and res.get("price") is not None else px
+            )
+            maybe_coro = attach(symbol=symbol, side_txt=side_txt, entry_price=entry_price)
+            if inspect.isawaitable(maybe_coro):
+                await maybe_coro
     except Exception:
         pass
 
-    if qty <= 0:
-        try:
-            from bot.qty_utils import round_and_validate_qty
-
-            qty = await round_and_validate_qty(exchange, symbol_cfg, qty)
-        except Exception:
-            pass
-
-    if qty is None or qty <= 0:
-        return await reply(
-            "Cantidad final <= 0 (minQty/minNotional). Subí equity o bajá el leverage."
-        )
-
-    side_exchange = "BUY" if side_txt == "LONG" else "SELL"
-    broker = getattr(engine, "broker", None)
-    if broker is None or not hasattr(broker, "place_market_order"):
-        return await reply("Broker no disponible para abrir la operación.")
-
-    try:
-        place_fn = broker.place_market_order
-        if inspect.iscoroutinefunction(place_fn):
-            result = await place_fn(
-                symbol=symbol_cfg,
-                side=side_exchange,
-                quantity=qty,
-                leverage=leverage,
-            )
-        else:
-            result = await asyncio.to_thread(
-                place_fn,
-                symbol=symbol_cfg,
-                side=side_exchange,
-                quantity=qty,
-                leverage=leverage,
-            )
-    except Exception as exc:
-        return await reply(f"Fallo al abrir: {exc}")
-
-    fill_price = float(price_now)
-    if isinstance(result, dict):
-        for key in ("avgPrice", "avg_price", "price"):
-            val = result.get(key)
-            if val is not None:
-                try:
-                    fill_price = float(val)
-                    break
-                except Exception:
-                    continue
-
-    strategy = getattr(engine, "strategy", None)
-    if strategy is not None and hasattr(strategy, "attach_tp_sl"):
-        try:
-            attach_fn = strategy.attach_tp_sl
-            kwargs = {
-                "symbol": symbol_cfg,
-                "side_txt": side_txt,
-                "entry_price": fill_price,
-            }
-            if inspect.iscoroutinefunction(attach_fn):
-                await attach_fn(**kwargs)
-            else:
-                await asyncio.to_thread(attach_fn, **kwargs)
-        except Exception:
-            logger.debug("attach_tp_sl falló tras open", exc_info=True)
-
-    mode_text = "REAL" if _engine_mode_is_live(engine) else "SIMULADO"
-    return await reply(
-        (
-            f"🟢 OPEN {side_txt} x{leverage} | {symbol_norm}\n"
-            f"qty: {qty:.6f} @~{fill_price:.2f}\n"
-            "Gestionada por la estrategia (TP/SL activos)."
-        )
-    )
+    return await reply(f"🟢 OPEN {side_txt} x{lev} | {symbol}\nqty: {qty:.6f} @~{float(px):.2f}\nGestionada por la estrategia (TP/SL activos).")
 
 
 async def open_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1087,31 +954,29 @@ async def open_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _cmd_open(engine, reply_md, message.text or "")
 
 
-async def _cmd_estado(engine, reply_md):
-    mode = _get_mode(engine)  # 'live' | 'paper'
+async def _cmd_estado(engine, reply):
     cfg = getattr(engine, "config", {}) or {}
-    symbol = str((cfg.get("symbol") or "BTCUSDT")).replace("/", "").upper()
+    symbol = (cfg.get("symbol") or "BTCUSDT").replace("/", "").upper()
+    mode = _get_mode_from_engine(engine)      # 'live' | 'paper'
     exchange = getattr(engine, "exchange", None)
     trader = getattr(engine, "trader", None)
 
     # EQUITY correcto según modo
     if mode == "live":
-        # REAL: equity desde Binance (tu wrapper real; si es sync, quita await)
         try:
             equity = float(await exchange.get_account_equity()) if exchange else 0.0
         except Exception:
             equity = 0.0
     else:
-        # SIM: equity seteado por vos (tu mismo método actual de sizing)
         try:
-            equity = float(trader.equity()) if trader else 0.0
+            equity = float(trader.equity()) if trader else 0.0  # el que seteás con 'equity'
         except Exception:
             equity = 0.0
 
-    # mark para PnL no realizado
+    # Mark para PnL no realizado
     async def _mark(sym):
         try:
-            if exchange is None:
+            if not exchange:
                 return None
             px = await exchange.get_current_price(sym)
             return float(px)
@@ -1119,30 +984,16 @@ async def _cmd_estado(engine, reply_md):
             return None
 
     # PnL del BOT (no del exchange)
-    try:
-        pnl = await pnl_summary_bot(
-            mode=("live" if mode == "live" else "paper"),
-            mark_provider=_mark,
-        )
-    except Exception as exc:
-        logger.debug("pnl_summary_bot falló en estado: %s", exc)
-        pnl = {
-            "daily": {"realized": 0.0, "unrealized": 0.0, "total": 0.0},
-            "weekly": {"realized": 0.0, "unrealized": 0.0, "total": 0.0},
-        }
+    pnl = await pnl_summary_bot(mode=("live" if mode=="live" else "paper"), mark_provider=_mark)
+    d, w = pnl["daily"], pnl["weekly"]
 
-    d = pnl.get("daily", {"realized": 0.0, "unrealized": 0.0, "total": 0.0})
-    w = pnl.get("weekly", {"realized": 0.0, "unrealized": 0.0, "total": 0.0})
-
-    modo_txt = "REAL" if mode == "live" else "SIMULADO"
-    txt = (
-        f"Modo: *{modo_txt}*\n"
+    return await reply(
+        f"Modo: *{'REAL' if mode=='live' else 'SIMULADO'}*\n"
         f"Símbolo: {symbol}\n"
         f"Equity: {equity:,.2f}\n"
         f"PnL Diario: {d['total']:+.2f} (R={d['realized']:+.2f} | U={d['unrealized']:+.2f})\n"
         f"PnL Semanal: {w['total']:+.2f} (R={w['realized']:+.2f} | U={w['unrealized']:+.2f})"
     )
-    return await reply_md(txt)
 
 
 async def estado_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1477,28 +1328,24 @@ async def bot_off_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await pausa_command(update, context)
 
 
-async def _cmd_modo_simulado(engine, reply_md):
-    current = _get_mode(engine)
-    if current == "paper":
-        return await reply_md("✅ El bot ya se encontraba en *MODO SIMULADO*.")
-    ok = _set_mode(engine, "paper")
-    if not ok:
-        return await reply_md(
-            "⚠️ No pude cambiar a SIMULADO (revisá logs y configuración de modo)."
-        )
-    return await reply_md("✅ Modo cambiado a *SIMULADO*. El bot ahora opera en simulado.")
+async def _cmd_modo_simulado(engine, reply):
+    if _get_mode_from_engine(engine) == "paper":
+        return await reply("✅ El bot ya se encontraba en *MODO SIMULADO*.")
+    try:
+        engine.set_mode("paper")   # usa el método que agregaste recién
+        return await reply("✅ Modo cambiado a *SIMULADO*. El bot ahora opera en simulado.")
+    except Exception as e:
+        return await reply("⚠️ No pude cambiar a SIMULADO (revisá logs / configuración).")
 
 
-async def _cmd_modo_real(engine, reply_md):
-    current = _get_mode(engine)
-    if current == "live":
-        return await reply_md("✅ El bot ya se encontraba en *MODO REAL*.")
-    ok = _set_mode(engine, "live")
-    if not ok:
-        return await reply_md(
-            "⚠️ No pude cambiar a REAL (revisá logs y configuración de modo)."
-        )
-    return await reply_md("✅ Modo cambiado a *REAL*. El bot ahora opera en real.")
+async def _cmd_modo_real(engine, reply):
+    if _get_mode_from_engine(engine) == "live":
+        return await reply("✅ El bot ya se encontraba en *MODO REAL*.")
+    try:
+        engine.set_mode("live")    # usa el método que agregaste recién
+        return await reply("✅ Modo cambiado a *REAL*. El bot ahora opera en real.")
+    except Exception as e:
+        return await reply("⚠️ No pude cambiar a REAL (revisá logs / configuración de modo).")
 
 
 async def modo_simulado_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
