@@ -378,67 +378,6 @@ async def ayuda_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await message.reply_text(text, parse_mode="Markdown")
 
 
-def _calc_equity_stats(engine) -> Tuple[float, float, float]:
-    equity = 0.0
-    d1 = 0.0
-    w1 = 0.0
-    trader = getattr(engine, "trader", None)
-    if trader and hasattr(trader, "equity"):
-        try:
-            equity = float(trader.equity())
-        except Exception:
-            equity = 0.0
-    cfg = _engine_config(engine)
-    equity_csv, _ = _cfg_csv_paths(cfg)
-    try:
-        df = pd.read_csv(equity_csv, parse_dates=["ts"])
-        df["ts"] = pd.to_datetime(df["ts"], utc=True, errors="coerce")
-        now = pd.Timestamp.utcnow()
-        d1 = float(df[df["ts"] >= (now - pd.Timedelta(days=1))]["pnl"].sum())
-        w1 = float(df[df["ts"] >= (now - pd.Timedelta(days=7))]["pnl"].sum())
-    except Exception:
-        pass
-    return equity, d1, w1
-
-
-def _build_estado_text(engine) -> str:
-    if engine is None:
-        return "Engine no disponible."
-    equity, d1, w1 = _calc_equity_stats(engine)
-    trader = getattr(engine, "trader", None)
-    per_symbol: Dict[str, int] = {}
-    if trader and getattr(trader, "state", None):
-        try:
-            per_symbol = {sym: len(lots) for sym, lots in trader.state.positions.items()}
-        except Exception:
-            per_symbol = {}
-    open_cnt = sum(per_symbol.values()) if per_symbol else 0
-    ks = False
-    if trader and getattr(trader.state, "killswitch", None) is not None:
-        try:
-            ks = bool(trader.state.killswitch)
-        except Exception:
-            ks = False
-    mode_txt = "🧪 SIMULADO" if S.PAPER else "🔴 REAL"
-    lines = [
-        "📊 Estado del Bot",
-        f"Modo: {mode_txt}",
-        f"Saldo actual: ${_fmt_num(equity, 2)}",
-        f"PnL 24h: ${_fmt_num(d1, 2)} | PnL 7d: ${_fmt_num(w1, 2)}",
-        f"Operaciones abiertas: {open_cnt}",
-    ]
-    if S.PAPER:
-        try:
-            eq_sim = float(getattr(trading.BROKER, "equity"))
-            lines.append(f"Equity sim: ${_fmt_num(eq_sim, 2)}")
-        except Exception:
-            pass
-    if per_symbol:
-        lines.append("Por símbolo: " + ", ".join(f"{sym}: {cnt}" for sym, cnt in per_symbol.items()))
-    lines.append("Bot: OFF (killswitch ACTIVADO)" if ks else "Bot: ON (killswitch desactivado)")
-    return "\n".join(lines)
-
-
 def _build_rendimiento_text(engine) -> str:
     path = _engine_sqlite_path(engine)
     if not os.path.exists(path):
@@ -921,6 +860,131 @@ async def posiciones_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await message.reply_text("\n\n".join(blocks), parse_mode="Markdown")
 
 
+def _engine_mode_is_live(engine) -> bool:
+    mode_attr = str(getattr(engine, "mode", "") or "").lower()
+    return bool(getattr(engine, "is_live", False)) or mode_attr in ("real", "live")
+
+
+async def _cmd_open(engine, reply, raw_txt: str):
+    text = (raw_txt or "").strip().lower()
+    match = re.search(r"\bopen\s+(long|short)\s+x\s*(\d+)\b", text)
+    if not match:
+        return await reply("Formato: open long x5  |  open short x10")
+
+    side_txt = match.group(1).upper()
+    leverage = int(match.group(2))
+    cfg = getattr(engine, "config", {}) or {}
+    symbol_cfg = str(cfg.get("symbol") or "BTC/USDT")
+    symbol_norm = _normalized_symbol(symbol_cfg)
+
+    exchange = getattr(engine, "exchange", None)
+    if exchange is None:
+        return await reply("Exchange no disponible para abrir la operación.")
+
+    try:
+        price_now = await exchange.get_current_price(symbol_cfg)
+    except Exception as exc:
+        logger.debug("open_command: fallo get_current_price: %s", exc)
+        price_now = None
+
+    if price_now is None:
+        return await reply("No pude obtener precio actual del símbolo.")
+
+    try:
+        equity = float(engine.trader.equity())
+    except Exception:
+        equity = 0.0
+
+    if equity <= 0:
+        return await reply("Equity = 0. Setealo con: equity 1200")
+
+    qty = (equity * leverage) / float(price_now)
+
+    try:
+        round_qty_fn = getattr(exchange, "round_qty", None)
+        if callable(round_qty_fn):
+            if inspect.iscoroutinefunction(round_qty_fn):
+                qty = await round_qty_fn(symbol_norm, qty)
+            else:
+                qty = round_qty_fn(symbol_norm, qty)
+    except Exception:
+        pass
+
+    if qty <= 0:
+        try:
+            from bot.qty_utils import round_and_validate_qty
+
+            qty = await round_and_validate_qty(exchange, symbol_cfg, qty)
+        except Exception:
+            pass
+
+    if qty is None or qty <= 0:
+        return await reply(
+            "Cantidad final <= 0 (minQty/minNotional). Subí equity o bajá el leverage."
+        )
+
+    side_exchange = "BUY" if side_txt == "LONG" else "SELL"
+    broker = getattr(engine, "broker", None)
+    if broker is None or not hasattr(broker, "place_market_order"):
+        return await reply("Broker no disponible para abrir la operación.")
+
+    try:
+        place_fn = broker.place_market_order
+        if inspect.iscoroutinefunction(place_fn):
+            result = await place_fn(
+                symbol=symbol_cfg,
+                side=side_exchange,
+                quantity=qty,
+                leverage=leverage,
+            )
+        else:
+            result = await asyncio.to_thread(
+                place_fn,
+                symbol=symbol_cfg,
+                side=side_exchange,
+                quantity=qty,
+                leverage=leverage,
+            )
+    except Exception as exc:
+        return await reply(f"Fallo al abrir: {exc}")
+
+    fill_price = float(price_now)
+    if isinstance(result, dict):
+        for key in ("avgPrice", "avg_price", "price"):
+            val = result.get(key)
+            if val is not None:
+                try:
+                    fill_price = float(val)
+                    break
+                except Exception:
+                    continue
+
+    strategy = getattr(engine, "strategy", None)
+    if strategy is not None and hasattr(strategy, "attach_tp_sl"):
+        try:
+            attach_fn = strategy.attach_tp_sl
+            kwargs = {
+                "symbol": symbol_cfg,
+                "side_txt": side_txt,
+                "entry_price": fill_price,
+            }
+            if inspect.iscoroutinefunction(attach_fn):
+                await attach_fn(**kwargs)
+            else:
+                await asyncio.to_thread(attach_fn, **kwargs)
+        except Exception:
+            logger.debug("attach_tp_sl falló tras open", exc_info=True)
+
+    mode_text = "REAL" if _engine_mode_is_live(engine) else "SIMULADO"
+    return await reply(
+        (
+            f"🟢 OPEN {side_txt} x{leverage} | {symbol_norm}\n"
+            f"qty: {qty:.6f} @~{fill_price:.2f}\n"
+            "Gestionada por la estrategia (TP/SL activos)."
+        )
+    )
+
+
 async def open_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.effective_message
     if message is None:
@@ -931,120 +995,77 @@ async def open_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await message.reply_text("No pude acceder al engine para abrir la operación.")
         return
 
-    raw_text = (message.text or "").strip().lower()
-    match = re.search(r"\bopen\s+(long|short)\s+x\s*(\d+)\b", raw_text)
-    if not match:
-        await message.reply_text("Formato: open long x5  |  open short x10")
-        return
+    reply_md = lambda txt: message.reply_text(txt, parse_mode="Markdown")
+    await _cmd_open(engine, reply_md, message.text or "")
 
-    side_txt = match.group(1).upper()
-    leverage = max(int(match.group(2)), 1)
 
+async def _cmd_estado(engine, reply):
+    mode_is_live = _engine_mode_is_live(engine)
     cfg = getattr(engine, "config", {}) or {}
-    symbol_cfg = str(cfg.get("symbol") or "BTC/USDT")
+    symbol_cfg = str(cfg.get("symbol") or "BTCUSDT")
     symbol_norm = _normalized_symbol(symbol_cfg)
 
     exchange = getattr(engine, "exchange", None)
-    if exchange is None:
-        await message.reply_text("Exchange no disponible para abrir la operación.")
-        return
 
-    try:
-        price_now = await exchange.get_current_price(symbol_cfg)
-    except Exception as exc:
-        logger.debug("open_command: fallo get_current_price: %s", exc)
-        price_now = None
-
-    if price_now is None:
-        await message.reply_text("No pude obtener precio actual.")
-        return
-
-    equity_base = float(get_equity_sim() or 0.0)
-    if equity_base <= 0.0:
+    if mode_is_live:
         try:
-            equity_base = float(cfg.get("start_equity") or getattr(S, "start_equity", 0.0) or 0.0)
+            equity = float(await exchange.get_account_equity()) if exchange else 0.0
         except Exception:
-            equity_base = 0.0
-    if equity_base <= 0.0:
-        await message.reply_text("Equity = 0. Setealo con: equity 1200 (ejemplo).")
-        return
+            equity = 0.0
+    else:
+        try:
+            equity = float(engine.trader.equity())
+        except Exception:
+            equity = 0.0
 
-    qty_raw = (equity_base * leverage) / float(price_now)
-    qty_final = qty_raw
-    try:
-        from bot.qty_utils import round_and_validate_qty
-
-        qty_final = await round_and_validate_qty(exchange, symbol_cfg, qty_raw)
-    except Exception:
-        pass
-
-    if qty_final <= 0:
-        await message.reply_text(
-            "Cantidad final <= 0 (minQty/minNotional). Subí equity o bajá el leverage."
-        )
-        return
-
-    entry_price = float(price_now)
-    tp_price = None
-    sl_price = None
-    try:
-        tp_price = engine.strategy.calculate_tp(entry_price, qty_final, equity_base, side_txt, leverage)
-    except Exception:
-        tp_price = None
-    try:
-        qty_series = pd.Series({"qty_for_sl": abs(float(qty_final))})
-        sl_price = engine.strategy.calculate_sl(entry_price, qty_series, side_txt, equity_base)
-    except Exception:
-        sl_price = None
-
-    order_kwargs: Dict[str, float] = {}
-    if tp_price is not None and pd.notna(tp_price):
-        order_kwargs["tp"] = float(tp_price)
-    if sl_price is not None and pd.notna(sl_price):
-        order_kwargs["sl"] = float(sl_price)
-
-    side_exchange = "BUY" if side_txt == "LONG" else "SELL"
-    try:
-        result = await engine.broker.place_market_order(
-            symbol=symbol_cfg,
-            side=side_exchange,
-            quantity=qty_final,
-            leverage=leverage,
-            **order_kwargs,
-        )
-    except Exception as exc:
-        await message.reply_text(f"Fallo al abrir: {exc}")
-        return
-
-    fill_price = entry_price
-    if isinstance(result, dict):
-        for key in ("avgPrice", "avg_price", "price"):
-            val = result.get(key)
-            if val:
+    async def _mark(sym: str):
+        if exchange is None:
+            return None
+        candidates = [sym]
+        if "/" in sym:
+            candidates.append(sym.replace("/", ""))
+        elif sym.endswith("USDT"):
+            base = sym[:-4]
+            candidates.append(f"{base}/USDT")
+        for candidate in candidates:
+            try:
+                px = await exchange.get_current_price(candidate)
+            except Exception:
+                px = None
+            if px is not None:
                 try:
-                    fill_price = float(val)
-                    break
+                    return float(px)
                 except Exception:
                     continue
+        return None
 
-    protections = []
-    if sl_price is not None and pd.notna(sl_price):
-        protections.append(f"SL={float(sl_price):.2f}")
-    if tp_price is not None and pd.notna(tp_price):
-        protections.append(f"TP={float(tp_price):.2f}")
-    prot_line = " | ".join(protections) if protections else "TP/SL no configurados"
+    try:
+        pnl = await pnl_summary_bot(
+            mode="live" if mode_is_live else "paper",
+            mark_provider=_mark,
+        )
+    except Exception as exc:
+        logger.debug("pnl_summary_bot falló: %s", exc)
+        pnl = {
+            "daily": {"realized": 0.0, "unrealized": 0.0, "total": 0.0},
+            "weekly": {"realized": 0.0, "unrealized": 0.0, "total": 0.0},
+        }
 
-    mode_txt = runtime_get_mode()
-    await message.reply_text(
-        (
-            f"🟢 OPEN {side_txt} x{leverage} | {symbol_norm}\n"
-            f"qty: {qty_final:.6f} @~{fill_price:.2f}\n"
-            f"{prot_line}\n"
-            f"Modo: {'REAL' if mode_txt == 'live' else 'SIMULADO'}\n"
-            "Gestionada por la estrategia (TP/SL activos)."
-        ),
-        parse_mode="Markdown",
+    daily = pnl.get("daily", {"realized": 0.0, "unrealized": 0.0, "total": 0.0})
+    weekly = pnl.get("weekly", {"realized": 0.0, "unrealized": 0.0, "total": 0.0})
+
+    balance_estimado = equity
+
+    modo_txt = "REAL" if mode_is_live else "SIMULADO"
+    txt = (
+        f"Modo: *{modo_txt}*\n"
+        f"Símbolo: {symbol_norm}\n"
+        f"Equity base: {equity:,.2f}\n"
+        f"Balance estimado: {balance_estimado:,.2f}\n"
+        f"PnL Diario: {daily['total']:+.2f} (R={daily['realized']:+.2f} | U={daily['unrealized']:+.2f})\n"
+        f"PnL Semanal: {weekly['total']:+.2f} (R={weekly['realized']:+.2f} | U={weekly['unrealized']:+.2f})"
     )
+    return await reply(txt)
 
 
 async def estado_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1057,93 +1078,8 @@ async def estado_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await message.reply_text("No pude acceder al engine para consultar el estado.")
         return
 
-    cfg = getattr(engine, "config", {}) or {}
-    symbol_cfg = str(cfg.get("symbol") or "BTC/USDT")
-    symbol_norm = symbol_cfg.replace("/", "").upper()
-    mode_runtime = runtime_get_mode()
-    mode = "live" if mode_runtime == "live" else "paper"
-
-    equity_base = float(get_equity_sim() or 0.0)
-    if equity_base <= 0.0:
-        try:
-            equity_base = float(cfg.get("start_equity") or getattr(S, "start_equity", 0.0) or 0.0)
-        except Exception:
-            equity_base = 0.0
-
-    exchange = getattr(engine, "exchange", None)
-
-    async def _mark(sym: str) -> Optional[float]:
-        if exchange is None:
-            return None
-        candidates = [sym]
-        if "/" in sym:
-            candidates.append(sym.replace("/", ""))
-        elif sym.endswith("USDT"):
-            candidates.append(f"{sym[:-4]}/USDT")
-        for candidate in candidates:
-            try:
-                price = await exchange.get_current_price(candidate)
-            except Exception:
-                price = None
-            if price is not None:
-                try:
-                    return float(price)
-                except Exception:
-                    continue
-        return None
-
-    try:
-        pnl = await pnl_summary_bot(mode, mark_provider=_mark)
-    except Exception as exc:
-        logger.debug("pnl_summary_bot falló: %s", exc)
-        pnl = {
-            "daily": {"realized": 0.0, "unrealized": 0.0, "total": 0.0},
-            "weekly": {"realized": 0.0, "unrealized": 0.0, "total": 0.0},
-        }
-
-    bot_id = get_bot_id()
-    try:
-        qty_bot, avg_bot = bot_position(mode, bot_id, symbol_norm)
-        if abs(qty_bot) <= 0.0 and symbol_cfg != symbol_norm:
-            qty_bot, avg_bot = bot_position(mode, bot_id, symbol_cfg)
-    except Exception:
-        qty_bot, avg_bot = 0.0, 0.0
-
-    mark_price = None
-    if abs(qty_bot) > 0:
-        try:
-            mark_price = await _mark(symbol_norm)
-        except Exception:
-            mark_price = None
-    if mark_price is None and abs(qty_bot) > 0 and exchange is not None:
-        try:
-            mark_price = await exchange.get_current_price(symbol_cfg)
-        except Exception:
-            mark_price = None
-
-    unreal_now = 0.0
-    if mark_price is not None and abs(qty_bot) > 0:
-        mark_val = float(mark_price)
-        if qty_bot > 0:
-            unreal_now = qty_bot * (mark_val - avg_bot)
-        else:
-            unreal_now = (-qty_bot) * (avg_bot - mark_val)
-
-    balance_est = equity_base + unreal_now
-
-    daily = pnl.get("daily", {"realized": 0.0, "unrealized": 0.0, "total": 0.0})
-    weekly = pnl.get("weekly", {"realized": 0.0, "unrealized": 0.0, "total": 0.0})
-
-    lines = [
-        f"Modo: *{'REAL' if mode == 'live' else 'SIMULADO'}*",
-        f"Símbolo: {symbol_norm}",
-        f"Equity base: {_num(equity_base)}",
-        f"Balance estimado: {_num(balance_est)}",
-        f"PnL Diario: {daily['total']:+.2f} (R={daily['realized']:+.2f} | U={daily['unrealized']:+.2f})",
-        f"PnL Semanal: {weekly['total']:+.2f} (R={weekly['realized']:+.2f} | U={weekly['unrealized']:+.2f})",
-    ]
-
-    await message.reply_text("\n".join(lines), parse_mode="Markdown")
+    reply_md = lambda txt: message.reply_text(txt, parse_mode="Markdown")
+    await _cmd_estado(engine, reply_md)
 
 
 async def rendimiento_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1464,91 +1400,96 @@ async def bot_off_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await pausa_command(update, context)
 
 
-async def _modo_command(update: Update, context: ContextTypes.DEFAULT_TYPE, new_mode: str):
-    engine = _get_engine_from_context(context)
-    message = update.effective_message
-    rescue_needed = False
-    target_mode = "real" if new_mode == "real" else "simulado"
+async def _cmd_modo_simulado(engine, reply):
+    if not _engine_mode_is_live(engine):
+        return await reply("✅ El bot ya se encontraba en *MODO SIMULADO*.")
 
+    set_mode_fn = getattr(engine, "set_mode", None)
     try:
-        current_mode = get_mode()
-    except Exception:
-        current_mode = "real" if not S.PAPER else "simulado"
-
-    if current_mode == target_mode:
-        runtime_set_mode("live" if target_mode == "real" else "paper")
-        already_txt = "REAL" if target_mode == "real" else "SIMULADO"
-        if message is not None:
-            await message.reply_text(
-                f"✅ El bot ya se encontraba en *MODO {already_txt}*.",
-                parse_mode="Markdown",
-            )
-        return
-
-    if new_mode == "real" and engine is not None:
-        has_open_fn = getattr(engine, "has_open_position", None)
-        if callable(has_open_fn):
-            try:
-                rescue_needed = bool(has_open_fn())
-            except Exception:
-                rescue_needed = False
-
-    result = trading.switch_mode(target_mode)
-    if result.ok:
-        base_msg = f"✅ Modo cambiado a *{new_mode.upper()}*. El bot ya opera en {new_mode}."
-        # Si querés mantener el warning en la misma burbuja: descomentar la línea de abajo
-        # msg = f"{base_msg}\n{result.msg}" if result.msg else base_msg
-        msg = base_msg
-        if new_mode == "real":
-            try:
-                if engine and hasattr(engine, "exchange") and engine.exchange:
-                    await engine.exchange.upgrade_to_real_if_needed()
-            except Exception:
-                logger.debug("No se pudo reautenticar exchange tras cambio a REAL.", exc_info=True)
-        else:
-            try:
-                if engine and hasattr(engine, "exchange") and engine.exchange:
-                    await engine.exchange.downgrade_to_paper()
-            except Exception:
-                logger.debug("No se pudo pasar exchange a paper tras cambio a SIM.", exc_info=True)
-        # Resetear caches del trader para evitar balances/posiciones viejas
-        try:
-            if engine and getattr(engine, "trader", None):
-                engine.trader.reset_caches()
-        except Exception:
-            logger.debug("No se pudo resetear caches del trader tras cambio de modo.", exc_info=True)
-        if message is not None:
-            await message.reply_text(msg, parse_mode="Markdown")
-        if new_mode == "real" and engine is not None and rescue_needed:
-            sync_fn = getattr(engine, "sync_live_position", None)
-            if callable(sync_fn):
-                try:
-                    if inspect.iscoroutinefunction(sync_fn):
-                        ok = await sync_fn()
-                    else:
-                        ok = await asyncio.to_thread(sync_fn)
-                    logger.info(
-                        "Rescate modo REAL: sync_live_position -> %s",
-                        "OK" if ok else "SIN_POS",
-                    )
-                except Exception:
-                    logger.debug("Rescate modo REAL falló durante sync.", exc_info=True)
+        if callable(set_mode_fn):
+            if inspect.iscoroutinefunction(set_mode_fn):
+                await set_mode_fn("paper")
             else:
-                logger.warning("Rescate modo REAL: engine no soporta sync_live_position()")
-        return
-    else:
-        msg = f"❌ No pude cambiar el modo: {result.msg}"
-    if message is None:
-        return
-    await message.reply_text(msg, parse_mode="Markdown")
+                await asyncio.to_thread(set_mode_fn, "paper")
+        else:
+            setattr(engine, "mode", "paper")
+    except Exception:
+        setattr(engine, "mode", "paper")
+
+    setattr(engine, "is_live", False)
+    try:
+        runtime_set_mode("paper")
+    except Exception:
+        pass
+
+    exchange = getattr(engine, "exchange", None)
+    if exchange is not None and hasattr(exchange, "downgrade_to_paper"):
+        try:
+            await exchange.downgrade_to_paper()
+        except Exception:
+            logger.debug("downgrade_to_paper falló", exc_info=True)
+
+    return await reply("✅ Modo cambiado a *SIMULADO*. El bot ahora opera en simulado.")
+
+
+async def _cmd_modo_real(engine, reply):
+    if _engine_mode_is_live(engine):
+        return await reply("✅ El bot ya se encontraba en *MODO REAL*.")
+
+    set_mode_fn = getattr(engine, "set_mode", None)
+    try:
+        if callable(set_mode_fn):
+            if inspect.iscoroutinefunction(set_mode_fn):
+                await set_mode_fn("live")
+            else:
+                await asyncio.to_thread(set_mode_fn, "live")
+        else:
+            setattr(engine, "mode", "live")
+    except Exception:
+        setattr(engine, "mode", "live")
+
+    setattr(engine, "is_live", True)
+    try:
+        runtime_set_mode("live")
+    except Exception:
+        pass
+
+    exchange = getattr(engine, "exchange", None)
+    if exchange is not None and hasattr(exchange, "upgrade_to_real_if_needed"):
+        try:
+            await exchange.upgrade_to_real_if_needed()
+        except Exception:
+            logger.debug("upgrade_to_real_if_needed falló", exc_info=True)
+
+    return await reply("✅ Modo cambiado a *REAL*. El bot ahora opera en real.")
 
 
 async def modo_simulado_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await _modo_command(update, context, "simulado")
+    message = update.effective_message
+    if message is None:
+        return
+
+    engine = _get_engine_from_context(context)
+    if engine is None:
+        await _reply_chunks(update, "No pude acceder al engine.")
+        return
+
+    reply_md = lambda txt: message.reply_text(txt, parse_mode="Markdown")
+    await _cmd_modo_simulado(engine, reply_md)
 
 
 async def modo_real_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await _modo_command(update, context, "real")
+    message = update.effective_message
+    if message is None:
+        return
+
+    engine = _get_engine_from_context(context)
+    if engine is None:
+        await _reply_chunks(update, "No pude acceder al engine.")
+        return
+
+    reply_md = lambda txt: message.reply_text(txt, parse_mode="Markdown")
+    await _cmd_modo_real(engine, reply_md)
 
 
 async def killswitch_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
