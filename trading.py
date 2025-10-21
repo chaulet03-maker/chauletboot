@@ -347,7 +347,16 @@ def close_now(symbol: str | None = None):
             logger.warning("PAPER: no se pudo reflejar cierre en store.", exc_info=True)
         else:
             logger.debug("No se pudo reflejar cierre en store.", exc_info=True)
-    return result
+    summary: dict[str, Any] = {
+        "status": "ok",
+        "order": result,
+        "symbol": target_symbol,
+        "side": side,
+        "qty": float(qty),
+    }
+    if close_price is not None:
+        summary["close_price"] = float(close_price)
+    return summary
 
 
 def _infer_fill_price(order_result: Any, fallback: float | None = None) -> float | None:
