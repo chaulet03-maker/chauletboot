@@ -115,12 +115,29 @@ def _side_from_qty(qty: float) -> str:
     return "LONG" if qty > 0 else ("SHORT" if qty < 0 else "FLAT")
 
 
+def _normalize_side_name(side: str) -> str:
+    """Normaliza representaciones de lado a LONG/SHORT/FLAT."""
+    s = (side or "").strip().upper()
+    if s in ("", "FLAT", "NEUTRAL", "NONE"):
+        return "FLAT"
+    if s in ("LONG", "BUY", "BULL", "L", "LARGO"):
+        return "LONG"
+    if s in ("SHORT", "SELL", "BEAR", "S", "CORTO"):
+        return "SHORT"
+    if s.startswith("L"):
+        return "LONG"
+    if s.startswith("S"):
+        return "SHORT"
+    return "LONG"
+
+
 def _target_from_equity_pct(entry: float, qty_abs: float, equity: float, side: str, pct: float) -> float:
     """pct puede ser + (TP) o - (SL). Basado en % del equity."""
     if qty_abs <= 0 or equity <= 0 or entry <= 0:
         return entry
     dollars = equity * abs(pct) / 100.0  # cuánto querés ganar/perder en USD
-    if side == "LONG":
+    side_norm = _normalize_side_name(side)
+    if side_norm == "LONG":
         sign = +1 if pct > 0 else -1
     else:  # SHORT
         sign = -1 if pct > 0 else +1
@@ -135,7 +152,8 @@ def _pcts_for_target(entry: float, target: float, qty_abs: float, equity: float,
     """
     if entry <= 0 or qty_abs <= 0:
         return 0.0, 0.0
-    dir_sign = 1.0 if side == "LONG" else -1.0
+    side_norm = _normalize_side_name(side)
+    dir_sign = 1.0 if side_norm == "LONG" else -1.0
     price_pct = dir_sign * ((target - entry) / entry) * 100.0
     pnl_usd = dir_sign * (target - entry) * qty_abs
     pnl_pct_equity = (pnl_usd / equity) * 100.0 if equity > 0 else 0.0
@@ -218,10 +236,11 @@ def _build_bot_position_message(*, engine, symbol, qty, avg, mark_val) -> str:
             target = float(target_val)
         except (TypeError, ValueError):
             return f"• {name}: —"
-        price_pct, pnl_pct_equity = _pcts_for_target(avg_val, target, qty_abs, equity, side)
+        _, pnl_pct_equity = _pcts_for_target(avg_val, target, qty_abs, equity, side)
+        price_move_pct = _pct_rel(avg_val, target)
         return (
             f"• {name}: {target:,.2f} "
-            f"({price_pct:+.2f}% precio | PnL {pnl_pct_equity:+.2f}%)"
+            f"({price_move_pct:+.2f}% vs entrada | PnL {pnl_pct_equity:+.2f}%)"
         )
 
     tp_line = _line_tp_sl("TP", tp_price)
@@ -855,7 +874,7 @@ def _bot_position_info(engine) -> Optional[dict[str, Any]]:
         status = None
     if not status:
         return None
-    side = str(status.get("side", "FLAT")).upper()
+    side = _normalize_side_name(str(status.get("side", "FLAT")))
     if side == "FLAT":
         return None
     qty_raw = status.get("qty") or status.get("size") or status.get("pos_qty") or 0.0
@@ -1613,12 +1632,12 @@ async def sl_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if position_info is not None:
         symbol_norm = position_info.get("symbol", symbol_norm)
         symbol_conf = position_info.get("symbol_conf", symbol_conf)
-        side_now = str(position_info.get("side") or "LONG").upper()
+        side_now = _normalize_side_name(str(position_info.get("side") or "LONG"))
         entry = float(position_info.get("entry") or position_info.get("entry_price") or 0.0)
         qty_abs = abs(float(position_info.get("qty") or 0.0))
         mark_cached = position_info.get("mark")
     else:
-        side_now = str((open_pos or {}).get("side") or "LONG").upper()
+        side_now = _normalize_side_name(str((open_pos or {}).get("side") or "LONG"))
         entry = _first_float(
             (open_pos or {}).get("entry_price"),
             (open_pos or {}).get("entry"),
@@ -1677,14 +1696,32 @@ async def sl_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     continue
         return None
 
+    def _format_sl_message(prefix: str, target: float, mark_val: Optional[float]) -> str:
+        _, pnl_pct_equity = _pcts_for_target(entry, target, qty_abs, equity, side_now)
+        price_move_pct = _pct_rel(entry, target)
+        lines = [
+            f"{prefix} {_num(target)}",
+            f"• Se ejecuta si {symbol_conf} toca {_num(target)}.",
+            f"• Movimiento desde la entrada ({_num(entry)}): {price_move_pct:+.2f}%.",
+            f"• Impacto estimado en equity al gatillarse: {pnl_pct_equity:+.2f}%.",
+        ]
+        if mark_val not in (None, 0):
+            try:
+                mark = float(mark_val)
+                dist_vs_mark = _pct_rel(mark, target)
+                lines.append(
+                    f"• Distancia vs. mark actual ({_num(mark)}): {dist_vs_mark:+.2f}%."
+                )
+            except Exception:
+                pass
+        return "\n".join(lines)
+
     text_raw = (message.text or "").strip()
     if re.match(r"^/?sl\s*$", text_raw, re.IGNORECASE):
         current = _pick_level(open_pos, "sl", "sl_price", "stop_loss")
         if current is not None:
-            price_pct, pnl_pct_equity = _pcts_for_target(entry, current, qty_abs, equity, side_now)
-            await reply_md(
-                f"SL actual: {_num(current)} ({price_pct:+.2f}% precio | PnL {pnl_pct_equity:+.2f}%)"
-            )
+            mark_val = await _current_mark()
+            await reply_md(_format_sl_message("SL actual:", current, mark_val))
         else:
             await reply_md("SL actual: —")
         await reply_md("Uso: `sl +5`, `sl -2`, `sl 105000`")
@@ -1703,8 +1740,6 @@ async def sl_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         target = _target_from_equity_pct(entry, qty_abs, equity, side_now, pct)
     else:
         target = float(m_abs.group(1))  # type: ignore[union-attr]
-
-    price_pct, pnl_pct_equity = _pcts_for_target(entry, target, qty_abs, equity, side_now)
 
     broker = getattr(trading, "BROKER", None)
     if broker is None:
@@ -1736,10 +1771,7 @@ async def sl_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-    await reply_md(
-        f"✅ SL actualizado a {_num(target)} "
-        f"({price_pct:+.2f}% precio | PnL {pnl_pct_equity:+.2f}%)"
-    )
+    await reply_md(_format_sl_message("✅ SL actualizado a", target, mark_val))
 
 
 async def tp_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
