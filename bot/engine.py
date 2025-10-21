@@ -158,15 +158,17 @@ class TradingApp:
     def is_paper(self) -> bool:
         return not self.is_live
 
-    def set_mode(self, mode: str):
+    def set_mode(self, mode: str) -> str:
         """
         Cambia modo del bot sin tocar propiedades de solo-lectura.
         Acepta: 'live'|'real'|'paper'|'simulado'|'sim'.
         Propaga a trader/strategy/exchange si esos objetos exponen 'mode' o setters similares.
+        Devuelve el modo normalizado ('live'|'paper') activo tras el cambio.
         """
 
         m = (mode or "").lower()
         target = "live" if m in ("live", "real") else "paper"
+        current = "live" if self.is_live else "paper"
 
         # bandera propia
         try:
@@ -174,26 +176,32 @@ class TradingApp:
         except Exception:
             pass
 
-        # flags tipicas
+        # flags tipicas / legacy
         for flag, val in (("PAPER", target == "paper"), ("paper", target == "paper")):
             try:
                 if hasattr(self, flag):
                     setattr(self, flag, val)
             except Exception:
-                pass
+                self.logger.debug("No se pudo actualizar flag %s", flag, exc_info=True)
 
-        # propagar a subcomponentes comunes
+        # Actualizar diccionario de config si aplica
+        try:
+            if isinstance(self.config, dict):
+                self.config["mode"] = "real" if target == "live" else "paper"
+                self.config["trading_mode"] = "real" if target == "live" else "simulado"
+        except Exception:
+            self.logger.debug("No se pudo reflejar modo en config", exc_info=True)
+
+        # Propagar a subcomponentes comunes
         for comp_name in ("trader", "exchange", "strategy"):
             comp = getattr(self, comp_name, None)
             if not comp:
                 continue
-            # atributo simple .mode
             try:
                 if hasattr(comp, "mode"):
                     setattr(comp, "mode", target)
             except Exception:
-                pass
-            # setters conocidos (si existen en tu código)
+                self.logger.debug("No se pudo fijar atributo mode en %s", comp_name, exc_info=True)
             for fn in (
                 "set_mode",
                 "set_trading_mode",
@@ -208,7 +216,22 @@ class TradingApp:
                     if callable(fn_ref):
                         fn_ref(target)
                 except Exception:
-                    pass
+                    self.logger.debug(
+                        "No se pudo propagar %s.%s(%s)", comp_name, fn, target, exc_info=True
+                    )
+
+        # Sincronizar stack de trading principal (usa ModeResult para logs)
+        desired_trading_mode = "real" if target == "live" else "simulado"
+        try:
+            result = trading.switch_mode(desired_trading_mode)
+            if hasattr(result, "ok") and not result.ok:
+                self.logger.warning("switch_mode devolvió error: %s", getattr(result, "msg", ""))
+        except Exception:
+            self.logger.warning(
+                "No se pudo sincronizar trading.switch_mode(%s)", desired_trading_mode, exc_info=True
+            )
+
+        return current if current == target else target
 
     # === Rejection recording helpers ===
     def record_rejection(self, symbol: str, side: str, code: str, detail: str = "", ts=None):
