@@ -1367,12 +1367,41 @@ class TradingApp:
                     pass
                 logging.info("Sin posición live en exchange (REAL): no se precarga nada")
 
-    def run(self):
-        job_queue = self.telegram_app.job_queue
-        job_queue.run_repeating(self._update_price_cache_job, interval=10, first=1)
-        job_queue.run_repeating(self.trading_loop, interval=60, first=5)
+    def _start_internal_scheduler(self, loop: asyncio.AbstractEventLoop) -> None:
+        """Fallback scheduler when Telegram is disabled."""
 
+        async def _run_periodic(coro, interval: float, first: float = 0.0):
+            await asyncio.sleep(max(first, 0.0))
+            context = None
+            while True:
+                try:
+                    await coro(context)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:  # pragma: no cover - defensivo
+                    self.logger.exception("Error en tarea periódica interna: %s", exc)
+                await asyncio.sleep(max(interval, 0.0))
+
+        tasks = [
+            loop.create_task(_run_periodic(self._update_price_cache_job, interval=10, first=1)),
+            loop.create_task(_run_periodic(self.trading_loop, interval=60, first=5)),
+        ]
+        self._internal_jobs = getattr(self, "_internal_jobs", [])
+        self._internal_jobs.extend(tasks)
+
+    def run(self):
         loop = asyncio.get_event_loop()
+
+        if self.telegram_app is not None:
+            job_queue = self.telegram_app.job_queue
+            job_queue.run_repeating(self._update_price_cache_job, interval=10, first=1)
+            job_queue.run_repeating(self.trading_loop, interval=60, first=5)
+        else:
+            logging.info(
+                "Telegram deshabilitado; iniciando planificador interno basado en asyncio."
+            )
+            self._start_internal_scheduler(loop)
+
         bootstrap_tasks = [
             self.exchange.set_position_mode(one_way=not self.exchange.hedge_mode),
             self._preload_position_from_store(),
@@ -1397,8 +1426,17 @@ class TradingApp:
         else:
             loop.run_until_complete(self.notifier.send(boot_message))
 
-        logging.info("Bucle de trading programado. Iniciando polling de Telegram.")
-        self.telegram_app.run_polling()
+        if self.telegram_app is not None:
+            logging.info("Bucle de trading programado. Iniciando polling de Telegram.")
+            self.telegram_app.run_polling()
+        else:
+            logging.info(
+                "Bucle de trading programado. Ejecutando bucle interno sin Telegram."
+            )
+            try:
+                loop.run_forever()
+            except KeyboardInterrupt:  # pragma: no cover - defensivo
+                logging.info("Ejecución interrumpida manualmente.")
 
     async def close_all(self) -> Dict[str, Any] | bool:
         """Cierra SOLO la posición del BOT (reduceOnly) y devuelve un resumen del cierre."""
