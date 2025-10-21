@@ -7,8 +7,8 @@ from typing import Any, Dict, Optional
 
 
 STATE_PATH = "data/runtime/state.json"
-DEFAULT_SL_PCT_EQUITY = -5.0
-DEFAULT_TP_PCT_EQUITY = 10.0
+DEFAULT_SL_PRICE_PCT = -10.0
+DEFAULT_TP_PRICE_PCT = 10.0
 os.makedirs(os.path.dirname(STATE_PATH), exist_ok=True)
 
 
@@ -91,9 +91,9 @@ def get_protection_defaults(symbol: str) -> Dict[str, Any]:
     if not isinstance(protections, dict):
         return {
             "sl_last_kind": "pct",
-            "sl_pct_equity": DEFAULT_SL_PCT_EQUITY,
+            "sl_pct_equity": DEFAULT_SL_PRICE_PCT,
             "tp_last_kind": "pct",
-            "tp_pct_equity": DEFAULT_TP_PCT_EQUITY,
+            "tp_pct_equity": DEFAULT_TP_PRICE_PCT,
         }
     entry_raw = protections.get(_symbol_key(symbol), {})
     entry = dict(entry_raw) if isinstance(entry_raw, dict) else {}
@@ -104,7 +104,7 @@ def get_protection_defaults(symbol: str) -> Dict[str, Any]:
     entry["sl_last_kind"] = "price" if sl_kind == "price" else "pct"
     if entry["sl_last_kind"] == "pct":
         sl_pct = _coerce_float(entry.get("sl_pct_equity"))
-        entry["sl_pct_equity"] = sl_pct if sl_pct is not None else DEFAULT_SL_PCT_EQUITY
+        entry["sl_pct_equity"] = sl_pct if sl_pct is not None else DEFAULT_SL_PRICE_PCT
     else:
         sl_price = _coerce_float(entry.get("sl_price"))
         if sl_price is not None:
@@ -116,7 +116,7 @@ def get_protection_defaults(symbol: str) -> Dict[str, Any]:
     entry["tp_last_kind"] = "price" if tp_kind == "price" else "pct"
     if entry["tp_last_kind"] == "pct":
         tp_pct = _coerce_float(entry.get("tp_pct_equity"))
-        entry["tp_pct_equity"] = tp_pct if tp_pct is not None else DEFAULT_TP_PCT_EQUITY
+        entry["tp_pct_equity"] = tp_pct if tp_pct is not None else DEFAULT_TP_PRICE_PCT
     else:
         tp_price = _coerce_float(entry.get("tp_price"))
         if tp_price is not None:

@@ -43,9 +43,9 @@ logger = logging.getLogger("telegram")
 REGISTRY = CommandRegistry()
 
 
-# Valores por defecto para TP/SL expresados como % del equity.
-DEFAULT_SL_PCT_EQUITY = -5.0
-DEFAULT_TP_PCT_EQUITY = 10.0
+# Valores por defecto para TP/SL expresados como % del precio de entrada.
+DEFAULT_SL_PRICE_PCT = -10.0
+DEFAULT_TP_PRICE_PCT = 10.0
 
 
 # ===== Helpers de modo seguros (NO tocar is_live) =====
@@ -119,7 +119,7 @@ def _signed_qty(qty: float, side: str) -> float:
     return q
 
 
-# ==== Helpers de TP/SL por % del EQUITY y métricas de presentación ====
+# ==== Helpers de TP/SL por % del precio y métricas de presentación ====
 
 
 def _side_from_qty(qty: float) -> str:
@@ -161,17 +161,24 @@ def _normalize_percent_value(value: Any, *, prefer_sign: int | None = None) -> O
     return pct
 
 
-def _target_from_equity_pct(entry: float, qty_abs: float, equity: float, side: str, pct: float) -> float:
-    """pct puede ser + (TP) o - (SL). Basado en % del equity."""
-    if qty_abs <= 0 or equity <= 0 or entry <= 0:
+def _target_from_price_pct(entry: float, side: str, pct: float) -> float:
+    """Devuelve un precio objetivo aplicando un % sobre el precio de entrada."""
+    if entry <= 0:
         return entry
-    dollars = equity * abs(pct) / 100.0  # cuánto querés ganar/perder en USD
+    try:
+        pct_val = float(pct)
+    except (TypeError, ValueError):
+        return entry
+    if not math.isfinite(pct_val):
+        return entry
     side_norm = _normalize_side_name(side)
-    if side_norm == "LONG":
-        sign = +1 if pct > 0 else -1
-    else:  # SHORT
-        sign = -1 if pct > 0 else +1
-    return entry + sign * (dollars / qty_abs)
+    adj_pct = pct_val
+    if side_norm == "SHORT":
+        adj_pct = -adj_pct
+    target = entry * (1 + adj_pct / 100.0)
+    if target <= 0:
+        target = entry * 0.1
+    return target
 
 
 def _pcts_for_target(entry: float, target: float, qty_abs: float, equity: float, side: str):
@@ -1058,7 +1065,7 @@ async def _handle_position_controls(engine, reply_md, text: str) -> bool:
             stored_kind = defaults.get("sl_last_kind")
             if stored_kind == "pct" and defaults.get("sl_pct_equity") not in (None, ""):
                 pct_val = float(defaults["sl_pct_equity"])
-                await reply_md(f"SL predeterminado: {pct_val:+.2f}% del equity")
+                await reply_md(f"SL predeterminado: {pct_val:+.2f}% del precio")
             elif stored_kind == "price" and defaults.get("sl_price") not in (None, ""):
                 await reply_md(f"SL predeterminado: {_num(defaults['sl_price'])}")
             else:
@@ -1086,7 +1093,7 @@ async def _handle_position_controls(engine, reply_md, text: str) -> bool:
                     sl_price=None,
                 )
                 await reply_md(
-                    f"✅ SL predeterminado guardado: {pct_signed:+.2f}% del equity (se aplicará al próximo trade)."
+                    f"✅ SL predeterminado guardado: {pct_signed:+.2f}% del precio (se aplicará al próximo trade)."
                 )
             else:
                 try:
@@ -1110,7 +1117,7 @@ async def _handle_position_controls(engine, reply_md, text: str) -> bool:
             stored_kind = defaults.get("tp_last_kind")
             if stored_kind == "pct" and defaults.get("tp_pct_equity") not in (None, ""):
                 pct_val = float(defaults["tp_pct_equity"])
-                await reply_md(f"TP predeterminado: {pct_val:+.2f}% del equity")
+                await reply_md(f"TP predeterminado: {pct_val:+.2f}% del precio")
             elif stored_kind == "price" and defaults.get("tp_price") not in (None, ""):
                 await reply_md(f"TP predeterminado: {_num(defaults['tp_price'])}")
             else:
@@ -1138,7 +1145,7 @@ async def _handle_position_controls(engine, reply_md, text: str) -> bool:
                     tp_price=None,
                 )
                 await reply_md(
-                    f"✅ TP predeterminado guardado: {pct_signed:+.2f}% del equity (se aplicará al próximo trade)."
+                    f"✅ TP predeterminado guardado: {pct_signed:+.2f}% del precio (se aplicará al próximo trade)."
                 )
             else:
                 try:
@@ -1211,7 +1218,7 @@ async def _handle_position_controls(engine, reply_md, text: str) -> bool:
                     await reply_md("No pude obtener el equity live desde Binance. Intentá nuevamente en unos segundos.")
                 return True
             pct_signed = (+pct if sign == "+" else (-pct if sign == "-" else -pct))
-            target = _target_from_equity_pct(entry, qty_abs, equity, side_now, pct_signed)
+            target = _target_from_price_pct(entry, side_now, pct_signed)
         else:
             try:
                 raw = m_sl_abs.group(1)  # type: ignore[union-attr]
@@ -1321,7 +1328,7 @@ async def _handle_position_controls(engine, reply_md, text: str) -> bool:
                 await reply_md("Equity <= 0. Configuralo con `equity 1000` antes de usar TP %.")
                 return True
             pct_signed = (+pct if sign == "+" else (-pct if sign == "-" else +pct))
-            target = _target_from_equity_pct(entry, qty_abs, equity, side_now, pct_signed)
+            target = _target_from_price_pct(entry, side_now, pct_signed)
         else:
             try:
                 raw = m_tp_abs.group(1)  # type: ignore[union-attr]
@@ -1677,10 +1684,10 @@ async def _cmd_open(engine, reply, raw_txt):
 
     cfg_strategy = cfg.get("strategy") if isinstance(cfg, dict) else None
 
-    sl_pct_equity_cfg: Optional[float]
+    sl_pct_price_cfg: Optional[float]
     if sl_kind == "pct":
-        sl_pct_equity_cfg = _normalize_percent_value(defaults.get("sl_pct_equity"))
-        if sl_pct_equity_cfg is None:
+        sl_pct_price_cfg = _normalize_percent_value(defaults.get("sl_pct_equity"))
+        if sl_pct_price_cfg is None:
             fallback_sl_candidates: list[Any] = []
             if isinstance(cfg, dict):
                 fallback_sl_candidates.extend(
@@ -1714,25 +1721,25 @@ async def _cmd_open(engine, reply, raw_txt):
                             raw_strategy_cfg.get("sl_eq_pct"),
                             raw_strategy_cfg.get("stop_eq_pnl_pct"),
                         ]
-                    )
-            sl_pct_equity_cfg = None
+            )
+            sl_pct_price_cfg = None
             for cand in fallback_sl_candidates:
-                sl_pct_equity_cfg = _normalize_percent_value(cand, prefer_sign=-1)
-                if sl_pct_equity_cfg is not None:
+                sl_pct_price_cfg = _normalize_percent_value(cand, prefer_sign=-1)
+                if sl_pct_price_cfg is not None:
                     break
-            if sl_pct_equity_cfg is None:
-                sl_pct_equity_cfg = DEFAULT_SL_PCT_EQUITY
-            defaults["sl_pct_equity"] = sl_pct_equity_cfg
+            if sl_pct_price_cfg is None:
+                sl_pct_price_cfg = DEFAULT_SL_PRICE_PCT
+            defaults["sl_pct_equity"] = sl_pct_price_cfg
             persist_sl_default = True
         else:
-            defaults["sl_pct_equity"] = sl_pct_equity_cfg
+            defaults["sl_pct_equity"] = sl_pct_price_cfg
     else:
-        sl_pct_equity_cfg = None
+        sl_pct_price_cfg = None
 
-    tp_pct_equity_cfg: Optional[float]
+    tp_pct_price_cfg: Optional[float]
     if tp_kind == "pct":
-        tp_pct_equity_cfg = _normalize_percent_value(defaults.get("tp_pct_equity"))
-        if tp_pct_equity_cfg is None:
+        tp_pct_price_cfg = _normalize_percent_value(defaults.get("tp_pct_equity"))
+        if tp_pct_price_cfg is None:
             fallback_tp_candidates: list[Any] = []
             lev_keys: list[Any] = [str(int(lev))]
             lev_int = int(lev)
@@ -1752,26 +1759,26 @@ async def _cmd_open(engine, reply, raw_txt):
                 strategy_cfg.get("target_eq_pnl_pct") if isinstance(strategy_cfg, dict) else None,
             ):
                 fallback_tp_candidates.append(cand)
-            tp_pct_equity_cfg = None
+            tp_pct_price_cfg = None
             for cand in fallback_tp_candidates:
-                tp_pct_equity_cfg = _normalize_percent_value(cand, prefer_sign=1)
-                if tp_pct_equity_cfg is not None:
+                tp_pct_price_cfg = _normalize_percent_value(cand, prefer_sign=1)
+                if tp_pct_price_cfg is not None:
                     break
-            if tp_pct_equity_cfg is None:
-                tp_pct_equity_cfg = DEFAULT_TP_PCT_EQUITY
-            defaults["tp_pct_equity"] = tp_pct_equity_cfg
+            if tp_pct_price_cfg is None:
+                tp_pct_price_cfg = DEFAULT_TP_PRICE_PCT
+            defaults["tp_pct_equity"] = tp_pct_price_cfg
             persist_tp_default = True
         else:
-            defaults["tp_pct_equity"] = tp_pct_equity_cfg
+            defaults["tp_pct_equity"] = tp_pct_price_cfg
     else:
-        tp_pct_equity_cfg = None
+        tp_pct_price_cfg = None
 
     qty_abs = abs(float(qty))
     if sl is None and qty_abs > 0:
-        if defaults.get("sl_last_kind") == "pct" and defaults.get("sl_pct_equity") not in (None, "") and eq > 0:
+        if defaults.get("sl_last_kind") == "pct" and defaults.get("sl_pct_equity") not in (None, ""):
             try:
                 pct_val = float(defaults.get("sl_pct_equity"))
-                sl = _target_from_equity_pct(entry_price, qty_abs, eq, side_txt, pct_val)
+                sl = _target_from_price_pct(entry_price, side_txt, pct_val)
             except Exception:
                 logger.debug("open_command: no se pudo aplicar SL % por defecto", exc_info=True)
         elif defaults.get("sl_last_kind") == "price" and defaults.get("sl_price") not in (None, ""):
@@ -1779,11 +1786,14 @@ async def _cmd_open(engine, reply, raw_txt):
                 sl = float(defaults.get("sl_price"))
             except Exception:
                 logger.debug("open_command: SL precio por defecto inválido", exc_info=True)
+    if sl is None and entry_price > 0:
+        sl = _target_from_price_pct(entry_price, side_txt, DEFAULT_SL_PRICE_PCT)
+
     if tp is None and qty_abs > 0:
-        if defaults.get("tp_last_kind") == "pct" and defaults.get("tp_pct_equity") not in (None, "") and eq > 0:
+        if defaults.get("tp_last_kind") == "pct" and defaults.get("tp_pct_equity") not in (None, ""):
             try:
                 pct_val = float(defaults.get("tp_pct_equity"))
-                tp = _target_from_equity_pct(entry_price, qty_abs, eq, side_txt, pct_val)
+                tp = _target_from_price_pct(entry_price, side_txt, pct_val)
             except Exception:
                 logger.debug("open_command: no se pudo aplicar TP % por defecto", exc_info=True)
         elif defaults.get("tp_last_kind") == "price" and defaults.get("tp_price") not in (None, ""):
@@ -1791,6 +1801,8 @@ async def _cmd_open(engine, reply, raw_txt):
                 tp = float(defaults.get("tp_price"))
             except Exception:
                 logger.debug("open_command: TP precio por defecto inválido", exc_info=True)
+    if tp is None and entry_price > 0:
+        tp = _target_from_price_pct(entry_price, side_txt, DEFAULT_TP_PRICE_PCT)
 
     tp_price = float(tp) if tp is not None else None
     sl_price = float(sl) if sl is not None else None
@@ -2093,11 +2105,11 @@ async def control_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def sl_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    SL por % del equity (positivo o negativo) o por precio fijo.
+    SL por % del precio de entrada (positivo o negativo) o por precio fijo.
       • sl            → muestra SL actual (si hay)
-      • sl 5          → 5% (equity)  [equivale a +5]
-      • sl +5         → +5% (equity)  → SL en ganancia
-      • sl -5         → -5% (equity)  → SL en pérdida
+      • sl 5          → -5% (precio)  [equivale a -5]
+      • sl +5         → +5% (precio)  → SL sobre la entrada
+      • sl -5         → -5% (precio)  → SL por debajo de la entrada
       • sl 108000     → SL fijo a $108,000
       • sl $108000    → idem
     """
@@ -2229,7 +2241,7 @@ async def sl_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if m_pct:
         pct = float(m_pct.group(1))
-        target = _target_from_equity_pct(entry, qty_abs, equity, side_now, pct)
+        target = _target_from_price_pct(entry, side_now, pct)
     else:
         target = float(m_abs.group(1))  # type: ignore[union-attr]
 
@@ -2370,7 +2382,7 @@ async def tp_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     equity = 0.0
                 if entry > 0 and qty_abs > 0 and equity > 0:
                     pct_for_price = pct * 100.0
-                    tp_price = _target_from_equity_pct(entry, qty_abs, equity, side_now, +pct_for_price)
+                    tp_price = _target_from_price_pct(entry, side_now, +pct_for_price)
                     broker = getattr(trading, "BROKER", None)
                     if broker is not None:
                         try:
@@ -2845,7 +2857,7 @@ def _populate_registry() -> None:
         "sl",
         sl_command,
         aliases=["stop", "stoploss"],
-        help_text="Ver o setear SL global como % del equity. Ej: `sl 10` (10%)",
+        help_text="Ver o setear SL global como % del precio. Ej: `sl 10` (10%)",
     )
     REGISTRY.register(
         "pausa",
