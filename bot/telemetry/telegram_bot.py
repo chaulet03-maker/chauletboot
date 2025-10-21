@@ -169,14 +169,26 @@ def _build_bot_position_message(*, engine, symbol, qty, avg, mark_val) -> str:
         pos_state = open_positions.get(sym_key1) or open_positions.get(sym_key2)
         if isinstance(pos_state, dict):
             lev_raw = pos_state.get("leverage") or 1
+
+            def _pick(d: dict | None, *keys):
+                if not isinstance(d, dict):
+                    return None
+                for k in keys:
+                    if k in d and d[k] not in (None, ""):
+                        try:
+                            return float(d[k])
+                        except Exception:
+                            continue
+                return None
+
             try:
                 lev_val = float(lev_raw)
             except Exception:
                 lev_val = 1.0
             if lev_val > 0:
                 lev = max(int(lev_val), 1)
-            tp_price = pos_state.get("tp")
-            sl_price = pos_state.get("sl")
+            tp_price = _pick(pos_state, "tp", "tp_price", "take_profit")
+            sl_price = _pick(pos_state, "sl", "sl_price", "stop_loss")
     except Exception:
         pass
 
@@ -919,8 +931,8 @@ async def _handle_position_controls(engine, reply_md, text: str) -> bool:
                 mark_val = None
         return mark_val
 
-    m_sl_pct = re.search(r"\bsl\s*([+-])\s*(\d+(?:\.\d+)?)\b", lower)
-    m_sl_abs = re.search(r"\bsl\s*(\d+(?:\.\d+)?)\b", lower) if not m_sl_pct else None
+    m_sl_abs = re.search(r"\bsl\s*\$([0-9][\d.,]*)\b", lower)
+    m_sl_pct = re.search(r"\bsl\s*([+-]?)(\d+(?:\.\d+)?)\b", lower) if not m_sl_abs else None
     if m_sl_pct or m_sl_abs:
         if qty_abs <= 0 or entry <= 0:
             await reply_md("No tengo datos de la posición para calcular SL.")
@@ -935,11 +947,12 @@ async def _handle_position_controls(engine, reply_md, text: str) -> bool:
             if equity <= 0:
                 await reply_md("Equity <= 0. Configuralo con `equity 1000` antes de usar SL %.")
                 return True
-            pct_signed = +pct if sign == "+" else -pct
+            pct_signed = (+pct if sign == "+" else (-pct if sign == "-" else -pct))
             target = _target_from_equity_pct(entry, qty_abs, equity, side_now, pct_signed)
         else:
             try:
-                target = float(m_sl_abs.group(1))  # type: ignore[union-attr]
+                raw = m_sl_abs.group(1)  # type: ignore[union-attr]
+                target = float(str(raw).replace(".", "").replace(",", "."))
             except Exception:
                 await reply_md("Formato SL: `sl +5`, `sl -2` o `sl 105000`")
                 return True
@@ -977,8 +990,8 @@ async def _handle_position_controls(engine, reply_md, text: str) -> bool:
         )
         return True
 
-    m_tp_pct = re.search(r"\btp\s*([+-])\s*(\d+(?:\.\d+)?)\b", lower)
-    m_tp_abs = re.search(r"\btp\s*(\d+(?:\.\d+)?)\b", lower) if not m_tp_pct else None
+    m_tp_abs = re.search(r"\btp\s*\$([0-9][\d.,]*)\b", lower)
+    m_tp_pct = re.search(r"\btp\s*([+-]?)(\d+(?:\.\d+)?)\b", lower) if not m_tp_abs else None
     if m_tp_pct or m_tp_abs:
         if qty_abs <= 0 or entry <= 0:
             await reply_md("No tengo datos de la posición para calcular TP.")
@@ -993,11 +1006,12 @@ async def _handle_position_controls(engine, reply_md, text: str) -> bool:
             if equity <= 0:
                 await reply_md("Equity <= 0. Configuralo con `equity 1000` antes de usar TP %.")
                 return True
-            pct_signed = +pct if sign == "+" else -pct
+            pct_signed = (+pct if sign == "+" else (-pct if sign == "-" else +pct))
             target = _target_from_equity_pct(entry, qty_abs, equity, side_now, pct_signed)
         else:
             try:
-                target = float(m_tp_abs.group(1))  # type: ignore[union-attr]
+                raw = m_tp_abs.group(1)  # type: ignore[union-attr]
+                target = float(str(raw).replace(".", "").replace(",", "."))
             except Exception:
                 await reply_md("Formato TP: `tp +5` o `tp 109000`")
                 return True
@@ -1611,7 +1625,6 @@ async def tp_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if m_show_all:
         cfg = _cfg()
         m = cfg.get("tp_eq_pct_by_leverage", {}) or {}
-        default_pct = float(cfg.get("target_eq_pnl_pct", 0.10))
         lines = ["*TP por apalancamiento*"]
         if isinstance(m, dict) and m:
             for k in sorted([str(x) for x in m.keys()], key=lambda s: int(s)):
@@ -1619,8 +1632,9 @@ async def tp_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 v = v / 100.0 if v >= 1.0 else v
                 lines.append(f"• x{int(k)}: {v*100:.2f}% del equity")
         else:
-            lines.append("_(sin overrides; usando default)_")
-        lines.append(f"• Default: {default_pct*100:.2f}% del equity (`target_eq_pnl_pct`)")
+            default_pct = float((_engine_config(engine) or {}).get("target_eq_pnl_pct", 0.10))
+            for lev in (5, 10):
+                lines.append(f"• x{lev}: {default_pct*100:.2f}% del equity")
         await message.reply_text("\n".join(lines), parse_mode="Markdown")
         return
     if m_show_one:
