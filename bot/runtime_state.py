@@ -3,10 +3,12 @@ from __future__ import annotations
 import json
 import os
 import time
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 
 STATE_PATH = "data/runtime/state.json"
+DEFAULT_SL_PCT_EQUITY = -5.0
+DEFAULT_TP_PCT_EQUITY = 10.0
 os.makedirs(os.path.dirname(STATE_PATH), exist_ok=True)
 
 
@@ -74,15 +76,53 @@ def _symbol_key(symbol: str) -> str:
     return str(symbol or "BTCUSDT").replace("/", "").upper()
 
 
+def _coerce_float(value: Any) -> Optional[float]:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def get_protection_defaults(symbol: str) -> Dict[str, Any]:
     """Return persisted TP/SL defaults for the given symbol (if any)."""
 
     state = _load_state()
     protections = state.get("protections", {})
     if not isinstance(protections, dict):
-        return {}
-    entry = protections.get(_symbol_key(symbol), {})
-    return dict(entry) if isinstance(entry, dict) else {}
+        return {
+            "sl_last_kind": "pct",
+            "sl_pct_equity": DEFAULT_SL_PCT_EQUITY,
+            "tp_last_kind": "pct",
+            "tp_pct_equity": DEFAULT_TP_PCT_EQUITY,
+        }
+    entry_raw = protections.get(_symbol_key(symbol), {})
+    entry = dict(entry_raw) if isinstance(entry_raw, dict) else {}
+
+    sl_kind = str(entry.get("sl_last_kind") or "").lower()
+    if sl_kind not in {"pct", "price"}:
+        sl_kind = "pct"
+    entry["sl_last_kind"] = "price" if sl_kind == "price" else "pct"
+    if entry["sl_last_kind"] == "pct":
+        sl_pct = _coerce_float(entry.get("sl_pct_equity"))
+        entry["sl_pct_equity"] = sl_pct if sl_pct is not None else DEFAULT_SL_PCT_EQUITY
+    else:
+        sl_price = _coerce_float(entry.get("sl_price"))
+        if sl_price is not None:
+            entry["sl_price"] = sl_price
+
+    tp_kind = str(entry.get("tp_last_kind") or "").lower()
+    if tp_kind not in {"pct", "price"}:
+        tp_kind = "pct"
+    entry["tp_last_kind"] = "price" if tp_kind == "price" else "pct"
+    if entry["tp_last_kind"] == "pct":
+        tp_pct = _coerce_float(entry.get("tp_pct_equity"))
+        entry["tp_pct_equity"] = tp_pct if tp_pct is not None else DEFAULT_TP_PCT_EQUITY
+    else:
+        tp_price = _coerce_float(entry.get("tp_price"))
+        if tp_price is not None:
+            entry["tp_price"] = tp_price
+
+    return entry
 
 
 def update_protection_defaults(symbol: str, **changes: Any) -> Dict[str, Any]:
