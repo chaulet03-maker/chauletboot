@@ -28,7 +28,6 @@ Se realizó una compilación en frío de todos los archivos Python del repositor
 - bot/telemetry/notifier.py — ✅ Sin errores de sintaxis
 - bot/telemetry/reporting.py — ✅ Sin errores de sintaxis
 - bot/telemetry/telegram_bot.py — ✅ Sin errores de sintaxis
-- bot/telemetry/telegram_commands.py — ✅ Sin errores de sintaxis
 - bot/telemetry/webhooks.py — ✅ Sin errores de sintaxis
 - bot/trader.py — ✅ Sin errores de sintaxis
 - descargar_datos.py — ✅ Sin errores de sintaxis
