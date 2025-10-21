@@ -200,6 +200,33 @@ class SimBroker:
             pass
         return payload
 
+    def update_protections(
+        self,
+        symbol: str,
+        side: str,
+        qty: float,
+        tp: float | None = None,
+        sl: float | None = None,
+        position_side: str | None = None,
+    ) -> dict[str, Any]:
+        changes: dict[str, float] = {}
+        if tp is not None:
+            try:
+                changes["tp"] = float(tp)
+            except (TypeError, ValueError):
+                pass
+        if sl is not None:
+            try:
+                changes["sl"] = float(sl)
+            except (TypeError, ValueError):
+                pass
+        if changes:
+            try:
+                self.store.save(**changes)
+            except Exception:
+                logger.debug("SimBroker.update_protections: no se pudo guardar cambios", exc_info=True)
+        return {"ok": True}
+
 
 class BinanceBroker:
     """Envuelve al cliente real SOLO en live."""
@@ -242,6 +269,37 @@ class BinanceBroker:
             filters = build_filters(norm, {"info": info, "symbol": norm})
             self._symbol_filters[norm] = filters
             return filters
+
+    def update_protections(
+        self,
+        symbol: str,
+        side: str,
+        qty: float,
+        tp: float | None = None,
+        sl: float | None = None,
+        position_side: Optional[str] = None,
+    ) -> dict[str, Any]:
+        filters = self._load_symbol_filters(symbol)
+        protections: dict[str, float] = {}
+        if sl is not None:
+            try:
+                protections["SL"] = float(sl)
+            except (TypeError, ValueError):
+                pass
+        if tp is not None:
+            try:
+                protections["TP"] = float(tp)
+            except (TypeError, ValueError):
+                pass
+        if protections:
+            self._place_protections(
+                filters,
+                str(side).upper(),
+                float(qty),
+                protections,
+                position_side,
+            )
+        return {"ok": True}
 
     # ------------------------------------------------------------------
     # Error handling / retry
