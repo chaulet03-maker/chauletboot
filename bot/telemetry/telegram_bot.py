@@ -52,6 +52,13 @@ def _get_mode_from_engine(engine) -> str:
     return "paper"
 
 
+def _is_engine_live(engine) -> bool:
+    try:
+        return _get_mode_from_engine(engine) == "live"
+    except Exception:
+        return False
+
+
 def _format_position_block(
     *,
     symbol: str,
@@ -84,6 +91,96 @@ def _format_position_block(
         f"• Entrada: {_num(entry)}  |  Mark: {_num(mark)}\n"
         f"• PnL: *{_num(pnl)}*"
     )
+
+
+def _signed_qty(qty: float, side: str) -> float:
+    try:
+        q = float(qty)
+    except Exception:
+        q = 0.0
+    s = (side or "").upper()
+    if q == 0:
+        return 0.0
+    if s in ("SHORT", "SELL") and q > 0:
+        return -q
+    if s in ("LONG", "BUY") and q < 0:
+        return -q
+    return q
+
+
+def _build_bot_position_message(*, engine, symbol, qty, avg, mark_val) -> str:
+    try:
+        qty_val = float(qty)
+    except Exception:
+        qty_val = 0.0
+    try:
+        avg_val = float(avg)
+    except Exception:
+        avg_val = 0.0
+    try:
+        mark_value = float(mark_val)
+    except Exception:
+        mark_value = 0.0
+
+    side = "LONG" if qty_val > 0 else ("SHORT" if qty_val < 0 else "FLAT")
+    lev = 1
+    tp_price = None
+    sl_price = None
+
+    try:
+        st = load_state() or {}
+        sym_key1 = str(symbol).replace("/", "")
+        sym_key2 = str(symbol)
+        open_positions = st.get("open_positions", {}) or {}
+        pos_state = open_positions.get(sym_key1) or open_positions.get(sym_key2)
+        if isinstance(pos_state, dict):
+            lev_raw = pos_state.get("leverage") or 1
+            try:
+                lev_val = float(lev_raw)
+            except Exception:
+                lev_val = 1.0
+            if lev_val > 0:
+                lev = max(int(lev_val), 1)
+            tp_price = pos_state.get("tp")
+            sl_price = pos_state.get("sl")
+    except Exception:
+        pass
+
+    pnl_usd = (mark_value - avg_val) * qty_val
+    notional = abs(qty_val) * avg_val
+    margin_used = notional / max(lev, 1)
+    pnl_pct = 0.0 if margin_used <= 0 else (pnl_usd / margin_used) * 100.0
+
+    tp_txt = "—"
+    if tp_price not in (None, ""):
+        try:
+            tp_txt = f"{float(tp_price):,.2f}"
+        except Exception:
+            tp_txt = "—"
+
+    sl_txt = "—"
+    if sl_price not in (None, ""):
+        try:
+            sl_txt = f"{float(sl_price):,.2f}"
+        except Exception:
+            sl_txt = "—"
+
+    lev_txt = f" | lev x{lev}" if lev > 1 else ""
+
+    mode_txt = "Simulado" if not _is_engine_live(engine) else "Real"
+
+    msg = (
+        f"📍 *Posición del BOT*\n"
+        f"• Símbolo: {symbol} ({mode_txt})\n"
+        f"• Lado: *{side}*\n"
+        f"• Cantidad (bot qty): {abs(qty_val):.6f}\n"
+        f"• Entrada: {avg_val:,.2f} | Mark: {mark_value:,.2f}{lev_txt}\n"
+        f"• PnL: {pnl_usd:+.2f} (*{pnl_pct:+.2f}%*)\n"
+        f"• TP: {tp_txt}\n"
+        f"• SL: {sl_txt}"
+    )
+
+    return msg
 
 
 async def _on_error(update: Optional[Update], context: ContextTypes.DEFAULT_TYPE):
@@ -870,56 +967,14 @@ async def posicion_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         side = (st.get("side") or "").upper()
         entry = float(st.get("entry_price") or 0.0)
         mark = float(st.get("mark") or 0.0)
-        pnl = float(st.get("pnl") or 0.0)
         sym = st.get("symbol") or (engine.config or {}).get("symbol", "?")
-        extra = ""
-        tp_line = ""
-        sl_line = ""
-        try:
-            state_map = load_state() or {}
-            positions_state = state_map.get("open_positions", {}) or {}
-            sym_conf = str(sym)
-            pos_state = positions_state.get(sym_conf) or positions_state.get(sym_conf.replace("/", ""))
-            if isinstance(pos_state, dict):
-                levv = float(pos_state.get("leverage") or 0.0)
-                if levv > 0:
-                    extra = f" | lev x{int(levv)}"
-                tpv = float(pos_state.get("tp") or 0.0)
-                if tpv > 0:
-                    tp_line = f"\nTP: {tpv:.2f}"
-                slv = float(pos_state.get("sl") or 0.0)
-                if slv > 0:
-                    sl_line = f"\nSL: {slv:.2f}"
-        except Exception:
-            extra = ""
-            tp_line = ""
-            sl_line = ""
-        # Fecha/hora apertura y modo (si existen)
-        opened_at = st.get("opened_at")
-        mode_txt = (st.get("mode") or "").strip().lower()
-        if not mode_txt:
-            try:
-                mr = get_mode()
-                mode_txt = getattr(mr, "mode", "") or ("real" if not S.PAPER else "simulado")
-            except Exception:
-                mode_txt = "real" if not S.PAPER else "simulado"
-        opened_line = ""
-        if opened_at:
-            try:
-                from datetime import datetime, timezone
-
-                opened_local = fmt_ar(datetime.fromtimestamp(float(opened_at), tz=timezone.utc))
-                opened_line = f"• apertura: {opened_local}\n\n"
-            except Exception:
-                opened_line = ""
-        reply_text = (
-            "📍 *Posición del BOT*\n"
-            f"{opened_line}"
-            f"• Símbolo: *{sym}* ({mode_txt.title()})\n"
-            f"• Lado: *{side}*\n"
-            f"• Cantidad (bot qty): *{_num(q, 4)}*\n"
-            f"• Entrada: {_num(entry)}  |  Mark: {_num(mark)}{extra}\n"
-            f"• PnL: *{_num(pnl)}*{tp_line}{sl_line}"
+        qty_signed = _signed_qty(q, side)
+        reply_text = _build_bot_position_message(
+            engine=engine,
+            symbol=sym,
+            qty=qty_signed,
+            avg=entry,
+            mark_val=mark,
         )
     await message.reply_text(reply_text, parse_mode="Markdown")
 
@@ -967,20 +1022,14 @@ async def posiciones_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
             entry = float(st.get("entry_price") or 0.0)
             mark = float(st.get("mark") or 0.0)
             sym = st.get("symbol") or symbol_bot
-            upnl = float(st.get("pnl") or 0.0)
-            opened_at = st.get("opened_at")
-            mode_txt = (st.get("mode") or ("real" if not S.PAPER else "simulado"))
+            qty_signed = _signed_qty(q, side)
             blocks.append(
-                _format_position_block(
+                _build_bot_position_message(
+                    engine=engine,
                     symbol=sym,
-                    side=side,
-                    qty=q,
-                    entry=entry,
-                    mark=mark,
-                    pnl=upnl,
-                    mode_txt=mode_txt,
-                    opened_at=opened_at,
-                    is_bot=True,
+                    qty=qty_signed,
+                    avg=entry,
+                    mark_val=mark,
                 )
             )
             await message.reply_text("\n".join(blocks), parse_mode="Markdown")
@@ -989,12 +1038,6 @@ async def posiciones_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
 
     # Hay posiciones en el exchange → mostrarlas con el mismo formato
-    try:
-        st_bot = trading.POSITION_SERVICE.get_status() if trading.POSITION_SERVICE else None
-    except Exception:
-        st_bot = None
-    opened_bot = st_bot.get("opened_at") if st_bot else None
-
     for pos in live_positions:
         symbol = pos.get("symbol") or pos.get("symbolName") or symbol_bot
         side = (pos.get("side") or "").upper()
@@ -1004,19 +1047,31 @@ async def posiciones_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         upnl = float(pos.get("unrealizedPnl") or pos.get("unrealized_pnl") or 0.0)
         is_bot_symbol = str(symbol).upper() == str(symbol_bot).upper()
         mode_txt = "real" if not S.PAPER else "simulado"
-        blocks.append(
-            _format_position_block(
-                symbol=symbol,
-                side=side,
-                qty=size,
-                entry=entry,
-                mark=mark,
-                pnl=upnl,
-                mode_txt=mode_txt,
-                opened_at=(opened_bot if is_bot_symbol else None),
-                is_bot=is_bot_symbol,
+        qty_signed = _signed_qty(size, side)
+        if is_bot_symbol:
+            blocks.append(
+                _build_bot_position_message(
+                    engine=engine,
+                    symbol=symbol,
+                    qty=qty_signed,
+                    avg=entry,
+                    mark_val=mark,
+                )
             )
-        )
+        else:
+            blocks.append(
+                _format_position_block(
+                    symbol=symbol,
+                    side=side,
+                    qty=size,
+                    entry=entry,
+                    mark=mark,
+                    pnl=upnl,
+                    mode_txt=mode_txt,
+                    opened_at=None,
+                    is_bot=False,
+                )
+            )
     await message.reply_text("\n\n".join(blocks), parse_mode="Markdown")
 
 
