@@ -395,3 +395,37 @@ def _infer_fill_price(order_result: Any, fallback: float | None = None) -> float
             if total_qty > 0:
                 return total_notional / total_qty
     return None
+
+
+def close_bot_position_market() -> dict[str, Any]:
+    """Cierra la posición del bot mediante una orden MARKET reduce-only."""
+
+    ensure_initialized()
+    status = POSITION_SERVICE.get_status() if POSITION_SERVICE else None
+    if not status:
+        raise RuntimeError("Sin estado de posición.")
+
+    side = str(status.get("side", "FLAT")).upper()
+    qty_raw = status.get("qty") or status.get("pos_qty") or 0.0
+    try:
+        qty = abs(float(qty_raw))
+    except Exception as exc:
+        raise RuntimeError("Cantidad inválida para cerrar posición.") from exc
+    if side == "FLAT" or qty <= 0:
+        return {"ok": True, "info": "sin posición"}
+
+    symbol_conf = status.get("symbol") or getattr(S, "symbol", None) or "BTC/USDT"
+    symbol_clean = str(symbol_conf).replace("/", "")
+    close_side = "SELL" if side == "LONG" else "BUY"
+
+    if BROKER is None:
+        raise RuntimeError("Broker no inicializado.")
+
+    kwargs = {
+        "symbol": symbol_clean,
+        "reduce_only": True,
+        "newOrderRespType": "RESULT",
+    }
+    if hasattr(BROKER, "create_order"):
+        return BROKER.create_order(close_side, qty, None, **kwargs)
+    return BROKER.place_order(close_side, qty, None, **kwargs)

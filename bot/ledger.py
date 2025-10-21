@@ -243,10 +243,18 @@ def pnl_summary(
                     unreal += qty * (mark - avg)
                 else:
                     unreal += (-qty) * (avg - mark)
+        # Descontar fees del período
+        with _conn() as c2:
+            fees_row = c2.execute(
+                """SELECT COALESCE(SUM(fee),0) FROM fills
+                   WHERE mode=? AND bot_id=? AND ts>=?""",
+                (mode, bot_id, since),
+            ).fetchone()
+        fees_sum = float(fees_row[0] or 0.0)
         res[label] = {
-            "realized": realized,
+            "realized": realized - fees_sum,
             "unrealized": unreal,
-            "total": realized + unreal,
+            "total": (realized - fees_sum) + unreal,
         }
     return res
 

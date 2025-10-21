@@ -1,5 +1,13 @@
-import asyncio, logging, pandas as pd, datetime as dt, pytz, os
+import asyncio
+import datetime as dt
+import logging
+import os
+
+import pytz
 from telegram import Bot
+
+from bot.identity import get_bot_id
+from bot.ledger import pnl_summary as ledger_pnl_summary
 
 logger = logging.getLogger("reporting")
 
@@ -57,30 +65,21 @@ class ReportingScheduler:
             await self._send(txt)
 
     def build_report(self, days: int, title: str):
-        csv_dir = self.cfg.get("storage",{}).get("csv_dir","data")
         try:
-            eq = pd.read_csv(f"{csv_dir}/equity.csv", parse_dates=["ts"])
-            tr = pd.read_csv(f"{csv_dir}/trades.csv", parse_dates=["ts"])
+            mode = "live" if str(self.app.is_live).lower() in {"true", "1"} else "paper"
+            bid = get_bot_id()
+            pnl = ledger_pnl_summary(mode, bid)  # usa DB, no CSV
+            daily = pnl["daily"] if days == 1 else pnl["weekly"]
+            equity_now = float(self.app.trader.equity() or 0.0)
+            realized = float(daily.get("realized", 0.0))
+            unreal = float(daily.get("unrealized", 0.0))
+            total = float(daily.get("total", 0.0))
         except Exception:
             return None
-        now = pd.Timestamp.utcnow()
-        eq['ts'] = pd.to_datetime(eq['ts'], utc=True)
-        tr['ts'] = pd.to_datetime(tr['ts'], utc=True)
-        eqp = eq[eq['ts'] >= (now - pd.Timedelta(days=days))]
-        trp = tr[tr['ts'] >= (now - pd.Timedelta(days=days))]
 
-        pnl = float(eqp['pnl'].sum()) if not eqp.empty else 0.0
-        n = len(trp)
-        wins = int(((trp['pnl'] > 0).sum()) if 'pnl' in trp else 0)
-        winrate = (wins/n*100.0) if n>0 else 0.0
-        dd = 0.0
-        if not eqp.empty:
-            peak = eqp['equity'].cummax()
-            dd = float(((eqp['equity'] - peak)/peak).min() * 100.0)
-
-        return f"""{title}
-Equity: ${self.app.trader.equity():.2f}
-PnL ({days}d): ${pnl:.2f}
-Trades: {n} | Win-rate: {winrate:.1f}%
-Max Drawdown: {dd:.2f}%
-Posiciones abiertas: {sum(len(v) for v in self.app.trader.state.positions.values())}"""
+        return (
+            f"{title}\n"
+            f"Equity: ${equity_now:.2f}\n"
+            f"PnL ({'24h' if days==1 else '7d'}): ${total:.2f} "
+            f"(R={realized:+.2f} | U={unreal:+.2f})"
+        )

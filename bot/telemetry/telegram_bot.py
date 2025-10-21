@@ -9,7 +9,7 @@ from collections import deque
 from datetime import datetime, timedelta, time as dtime, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import pandas as pd
 import yaml
@@ -28,6 +28,8 @@ from bot.pnl import pnl_summary_bot
 from bot.runtime_state import get_equity_sim, set_equity_sim
 from bot.settings_utils import get_val, read_config_raw
 from bot.telemetry.command_registry import CommandRegistry, normalize
+from bot.telemetry.formatter import open_msg
+from state_store import load_state, update_open_position
 import trading
 
 logger = logging.getLogger("telegram")
@@ -689,6 +691,132 @@ def _normalized_symbol(symbol: str) -> str:
     return symbol.replace("/", "").upper()
 
 
+def _bot_position_info(engine) -> Optional[dict[str, Any]]:
+    try:
+        status = trading.POSITION_SERVICE.get_status() if trading.POSITION_SERVICE else None
+    except Exception:
+        status = None
+    if not status:
+        return None
+    side = str(status.get("side", "FLAT")).upper()
+    if side == "FLAT":
+        return None
+    qty_raw = status.get("qty") or status.get("size") or status.get("pos_qty") or 0.0
+    try:
+        qty = abs(float(qty_raw))
+    except Exception:
+        qty = 0.0
+    if qty <= 0:
+        return None
+    try:
+        entry = float(status.get("entry_price") or status.get("avg_price") or 0.0)
+    except Exception:
+        entry = 0.0
+    try:
+        mark = float(status.get("mark") or 0.0)
+    except Exception:
+        mark = 0.0
+    try:
+        leverage = float(status.get("leverage") or 0.0)
+    except Exception:
+        leverage = 0.0
+    symbol_conf = status.get("symbol") or ((getattr(engine, "config", {}) or {}).get("symbol") or "BTC/USDT")
+    symbol_norm = _normalized_symbol(str(symbol_conf))
+    return {
+        "side": side,
+        "qty": qty,
+        "entry": entry,
+        "mark": mark,
+        "symbol": symbol_norm,
+        "symbol_conf": symbol_conf,
+        "leverage": leverage,
+    }
+
+
+async def _handle_position_controls(engine, reply_md, text: str) -> bool:
+    if not text:
+        return False
+
+    broker = getattr(trading, "BROKER", None)
+    if broker is None:
+        return False
+
+    position = _bot_position_info(engine)
+    if position is None:
+        return False
+
+    lower = text.lower()
+
+    m_sl = re.search(r"\bsl\s*([+-])\s*(\d+(?:\.\d+)?)\b", lower)
+    if m_sl:
+        sign = m_sl.group(1)
+        try:
+            pct = float(m_sl.group(2))
+        except Exception:
+            await reply_md("Formato SL: sl +5  |  sl -3  (porcentaje)")
+            return True
+        entry = position.get("entry") or 0.0
+        if entry <= 0:
+            await reply_md("No tengo precio de entrada para calcular SL.")
+            return True
+        side_now = position["side"]
+        if side_now == "LONG":
+            target = entry * (1.0 + (pct / 100.0)) if sign == "+" else entry * (1.0 - (pct / 100.0))
+        else:
+            target = entry * (1.0 - (pct / 100.0)) if sign == "+" else entry * (1.0 + (pct / 100.0))
+        try:
+            broker.update_protections(position["symbol"], side_now, position["qty"], sl=target)
+            update_open_position(position["symbol_conf"], sl=target)
+        except Exception as exc:
+            await reply_md(f"No pude actualizar SL: {exc}")
+            return True
+        await reply_md(f"✅ SL actualizado a ${target:.2f} ({sign}{pct}%)")
+        return True
+
+    m_tp = re.search(r"\btp\s+(\d+(?:\.\d+)?)\b", lower)
+    if m_tp:
+        try:
+            new_tp_price = float(m_tp.group(1))
+        except Exception:
+            await reply_md("Formato TP: tp 45000")
+            return True
+        exchange = getattr(engine, "exchange", None)
+        if exchange is None:
+            await reply_md("Exchange no disponible para actualizar TP.")
+            return True
+        try:
+            mark_val = await exchange.get_current_price(position["symbol"])
+            mark = float(mark_val)
+        except Exception:
+            mark = None
+        side_now = position["side"]
+        should_close = False
+        if mark is not None:
+            if side_now == "LONG" and mark >= new_tp_price:
+                should_close = True
+            if side_now == "SHORT" and mark <= new_tp_price:
+                should_close = True
+        if should_close:
+            try:
+                trading.close_bot_position_market()
+                update_open_position(position["symbol_conf"], tp=new_tp_price)
+            except Exception as exc:
+                await reply_md(f"No pude cerrar la posición: {exc}")
+                return True
+            await reply_md("✅ TP alcanzado con el nuevo valor. Posición cerrada.")
+            return True
+        try:
+            broker.update_protections(position["symbol"], side_now, position["qty"], tp=new_tp_price)
+            update_open_position(position["symbol_conf"], tp=new_tp_price)
+        except Exception as exc:
+            await reply_md(f"No pude actualizar TP: {exc}")
+            return True
+        await reply_md(f"✅ TP actualizado a ${new_tp_price:.2f}")
+        return True
+
+    return False
+
+
 def _position_status_message(engine) -> str:
     symbol_default = _default_symbol(engine)
     try:
@@ -744,6 +872,28 @@ async def posicion_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         mark = float(st.get("mark") or 0.0)
         pnl = float(st.get("pnl") or 0.0)
         sym = st.get("symbol") or (engine.config or {}).get("symbol", "?")
+        extra = ""
+        tp_line = ""
+        sl_line = ""
+        try:
+            state_map = load_state() or {}
+            positions_state = state_map.get("open_positions", {}) or {}
+            sym_conf = str(sym)
+            pos_state = positions_state.get(sym_conf) or positions_state.get(sym_conf.replace("/", ""))
+            if isinstance(pos_state, dict):
+                levv = float(pos_state.get("leverage") or 0.0)
+                if levv > 0:
+                    extra = f" | lev x{int(levv)}"
+                tpv = float(pos_state.get("tp") or 0.0)
+                if tpv > 0:
+                    tp_line = f"\nTP: {tpv:.2f}"
+                slv = float(pos_state.get("sl") or 0.0)
+                if slv > 0:
+                    sl_line = f"\nSL: {slv:.2f}"
+        except Exception:
+            extra = ""
+            tp_line = ""
+            sl_line = ""
         # Fecha/hora apertura y modo (si existen)
         opened_at = st.get("opened_at")
         mode_txt = (st.get("mode") or "").strip().lower()
@@ -768,8 +918,8 @@ async def posicion_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"• Símbolo: *{sym}* ({mode_txt.title()})\n"
             f"• Lado: *{side}*\n"
             f"• Cantidad (bot qty): *{_num(q, 4)}*\n"
-            f"• Entrada: {_num(entry)}  |  Mark: {_num(mark)}\n"
-            f"• PnL: *{_num(pnl)}*"
+            f"• Entrada: {_num(entry)}  |  Mark: {_num(mark)}{extra}\n"
+            f"• PnL: *{_num(pnl)}*{tp_line}{sl_line}"
         )
     await message.reply_text(reply_text, parse_mode="Markdown")
 
@@ -968,17 +1118,29 @@ async def _cmd_open(engine, reply, raw_txt):
             sl = sl or (entry_price * (1 + float(sl_pct)))
 
     # ======= Mensaje final claro =======
-    tp_txt = f"${tp:,.2f}" if tp is not None else "—"
-    sl_txt = f"${sl:,.2f}" if sl is not None else "—"
+    try:
+        margin = float(engine.trader.equity()) if hasattr(engine, "trader") else float(eq)
+    except Exception:
+        margin = float(eq)
+    notional = float(qty) * float(entry_price) * max(1, lev)
+    tp1 = float(tp or 0.0)
+    tp2 = tp1
+    slv = float(sl or 0.0)
+    latency_ms = 0
+
     return await reply(
-        "🟢 OPEN {side} x{lev} | {sym}\n"
-        "equity: ${eq:,.2f}\n"
-        "qty: {q:.6f} @~{p:.2f}\n"
-        "tp : {tp}\n"
-        "sl : {sl}".format(
-            side=side_txt, lev=lev, sym=symbol,
-            eq=eq, q=qty, p=entry_price,
-            tp=tp_txt, sl=sl_txt,
+        open_msg(
+            symbol,
+            "long" if side_txt == "LONG" else "short",
+            margin,
+            lev,
+            notional,
+            float(entry_price),
+            tp1,
+            tp2,
+            slv,
+            "MARKET",
+            latency_ms,
         )
     )
 
@@ -1016,6 +1178,24 @@ async def _cmd_estado(engine, reply):
         except Exception:
             equity = 0.0
 
+    lev_txt = ""
+    try:
+        state = load_state() or {}
+        positions = state.get("open_positions", {}) or {}
+        sym_config = cfg.get("symbol") or "BTCUSDT"
+        candidates = [sym_config, str(sym_config).replace("/", "")]
+        pos_state = None
+        for key in candidates:
+            pos_state = positions.get(key)
+            if pos_state:
+                break
+        if isinstance(pos_state, dict):
+            lev_val = float(pos_state.get("leverage") or 0.0)
+            if lev_val > 0:
+                lev_txt = f"\\nLev: x{int(lev_val)}"
+    except Exception:
+        lev_txt = ""
+
     # Mark para PnL no realizado
     async def _mark(sym):
         try:
@@ -1033,7 +1213,7 @@ async def _cmd_estado(engine, reply):
     return await reply(
         f"Modo: *{'REAL' if mode=='live' else 'SIMULADO'}*\n"
         f"Símbolo: {symbol}\n"
-        f"Equity: {equity:,.2f}\n"
+        f"Equity: {equity:,.2f}{lev_txt}\n"
         f"PnL Diario: {d['total']:+.2f} (R={d['realized']:+.2f} | U={d['unrealized']:+.2f})\n"
         f"PnL Semanal: {w['total']:+.2f} (R={w['realized']:+.2f} | U={w['unrealized']:+.2f})"
     )
@@ -1819,8 +1999,11 @@ async def _dispatch_command(
     norm_noslash = norm.lstrip("/")
     candidates = (norm, norm_noslash)
 
+    reply_md = None
     if engine is not None and message is not None:
         reply_md = lambda txt: message.reply_text(txt, parse_mode="Markdown")
+        if await _handle_position_controls(engine, reply_md, text):
+            return
         for candidate in candidates:
             if not candidate:
                 continue

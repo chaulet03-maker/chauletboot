@@ -108,6 +108,45 @@ def persist_close(
     return state_obj
 
 
+def update_open_position(symbol: str, **changes: Any) -> bool:
+    """Actualiza campos simples (tp/sl/lev) de la posición abierta."""
+
+    if not changes:
+        return False
+
+    state = load_state()
+    open_positions = state.setdefault("open_positions", {})
+
+    candidates = []
+    if symbol:
+        candidates.append(symbol)
+        normalized = symbol.replace("/", "")
+        if normalized != symbol:
+            candidates.append(normalized)
+
+    for key in candidates:
+        pos = open_positions.get(key)
+        if pos is None and "/" in key:
+            alt_key = key.replace("/", "")
+            pos = open_positions.get(alt_key)
+            key = alt_key if pos is not None else key
+        if pos is None:
+            continue
+        updated = dict(pos)
+        for field, value in changes.items():
+            if value is None:
+                updated.pop(field, None)
+                continue
+            try:
+                updated[field] = float(value)
+            except (TypeError, ValueError):
+                updated[field] = value
+        open_positions[key] = updated
+        save_state(state)
+        return True
+    return False
+
+
 def broker_get_open_position(symbol: str) -> Optional[Dict[str, Any]]:
     """Obtiene una posición abierta directamente desde el broker si existe."""
 
@@ -233,6 +272,7 @@ __all__ = [
     "create_position",
     "persist_open",
     "persist_close",
+    "update_open_position",
     "on_open_filled",
     "on_close_filled",
     "position_status",
