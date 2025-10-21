@@ -1,4 +1,5 @@
 import os
+import math
 import logging
 import asyncio
 import sqlite3
@@ -40,6 +41,11 @@ import trading
 logger = logging.getLogger("telegram")
 
 REGISTRY = CommandRegistry()
+
+
+# Valores por defecto para TP/SL expresados como % del equity.
+DEFAULT_SL_PCT_EQUITY = -5.0
+DEFAULT_TP_PCT_EQUITY = 10.0
 
 
 # ===== Helpers de modo seguros (NO tocar is_live) =====
@@ -134,6 +140,25 @@ def _normalize_side_name(side: str) -> str:
     if s.startswith("S"):
         return "SHORT"
     return "LONG"
+
+
+def _normalize_percent_value(value: Any, *, prefer_sign: int | None = None) -> Optional[float]:
+    """Convierte valores que pueden venir como 0.10 ó 10 en porcentajes (10.0)."""
+    if value in (None, ""):
+        return None
+    try:
+        pct = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(pct):
+        return None
+    if abs(pct) <= 1.0:
+        pct *= 100.0
+    if prefer_sign == -1:
+        pct = -abs(pct)
+    elif prefer_sign == 1:
+        pct = abs(pct)
+    return pct
 
 
 def _target_from_equity_pct(entry: float, qty_abs: float, equity: float, side: str, pct: float) -> float:
@@ -1635,6 +1660,112 @@ async def _cmd_open(engine, reply, raw_txt):
             sl = sl or (entry_price * (1 + sl_pct_f))
 
     defaults = get_protection_defaults(symbol_conf)
+    persist_sl_default = False
+    persist_tp_default = False
+
+    sl_kind = str(defaults.get("sl_last_kind") or "").lower()
+    if sl_kind not in {"pct", "price"}:
+        defaults["sl_last_kind"] = "pct"
+        sl_kind = "pct"
+        persist_sl_default = True
+
+    tp_kind = str(defaults.get("tp_last_kind") or "").lower()
+    if tp_kind not in {"pct", "price"}:
+        defaults["tp_last_kind"] = "pct"
+        tp_kind = "pct"
+        persist_tp_default = True
+
+    cfg_strategy = cfg.get("strategy") if isinstance(cfg, dict) else None
+
+    sl_pct_equity_cfg: Optional[float]
+    if sl_kind == "pct":
+        sl_pct_equity_cfg = _normalize_percent_value(defaults.get("sl_pct_equity"))
+        if sl_pct_equity_cfg is None:
+            fallback_sl_candidates: list[Any] = []
+            if isinstance(cfg, dict):
+                fallback_sl_candidates.extend(
+                    [
+                        cfg.get("sl_pct_equity"),
+                        cfg.get("sl_eq_pct"),
+                        cfg.get("stop_eq_pnl_pct"),
+                    ]
+                )
+                if isinstance(cfg_strategy, dict):
+                    fallback_sl_candidates.extend(
+                        [
+                            cfg_strategy.get("sl_pct_equity"),
+                            cfg_strategy.get("sl_eq_pct"),
+                            cfg_strategy.get("stop_eq_pnl_pct"),
+                        ]
+                    )
+            if isinstance(raw_cfg, dict):
+                fallback_sl_candidates.extend(
+                    [
+                        raw_cfg.get("sl_pct_equity"),
+                        raw_cfg.get("sl_eq_pct"),
+                        raw_cfg.get("stop_eq_pnl_pct"),
+                    ]
+                )
+                raw_strategy_cfg = raw_cfg.get("strategy")
+                if isinstance(raw_strategy_cfg, dict):
+                    fallback_sl_candidates.extend(
+                        [
+                            raw_strategy_cfg.get("sl_pct_equity"),
+                            raw_strategy_cfg.get("sl_eq_pct"),
+                            raw_strategy_cfg.get("stop_eq_pnl_pct"),
+                        ]
+                    )
+            sl_pct_equity_cfg = None
+            for cand in fallback_sl_candidates:
+                sl_pct_equity_cfg = _normalize_percent_value(cand, prefer_sign=-1)
+                if sl_pct_equity_cfg is not None:
+                    break
+            if sl_pct_equity_cfg is None:
+                sl_pct_equity_cfg = DEFAULT_SL_PCT_EQUITY
+            defaults["sl_pct_equity"] = sl_pct_equity_cfg
+            persist_sl_default = True
+        else:
+            defaults["sl_pct_equity"] = sl_pct_equity_cfg
+    else:
+        sl_pct_equity_cfg = None
+
+    tp_pct_equity_cfg: Optional[float]
+    if tp_kind == "pct":
+        tp_pct_equity_cfg = _normalize_percent_value(defaults.get("tp_pct_equity"))
+        if tp_pct_equity_cfg is None:
+            fallback_tp_candidates: list[Any] = []
+            lev_keys: list[Any] = [str(int(lev))]
+            lev_int = int(lev)
+            if lev_int not in lev_keys:
+                lev_keys.append(lev_int)
+            for source in (cfg, raw_cfg):
+                if isinstance(source, dict):
+                    mapping = source.get("tp_eq_pct_by_leverage")
+                    if isinstance(mapping, dict):
+                        for key in lev_keys:
+                            if key in mapping:
+                                fallback_tp_candidates.append(mapping[key])
+                                break
+            for cand in (
+                cfg.get("target_eq_pnl_pct") if isinstance(cfg, dict) else None,
+                raw_cfg.get("target_eq_pnl_pct") if isinstance(raw_cfg, dict) else None,
+                strategy_cfg.get("target_eq_pnl_pct") if isinstance(strategy_cfg, dict) else None,
+            ):
+                fallback_tp_candidates.append(cand)
+            tp_pct_equity_cfg = None
+            for cand in fallback_tp_candidates:
+                tp_pct_equity_cfg = _normalize_percent_value(cand, prefer_sign=1)
+                if tp_pct_equity_cfg is not None:
+                    break
+            if tp_pct_equity_cfg is None:
+                tp_pct_equity_cfg = DEFAULT_TP_PCT_EQUITY
+            defaults["tp_pct_equity"] = tp_pct_equity_cfg
+            persist_tp_default = True
+        else:
+            defaults["tp_pct_equity"] = tp_pct_equity_cfg
+    else:
+        tp_pct_equity_cfg = None
+
     qty_abs = abs(float(qty))
     if sl is None and qty_abs > 0:
         if defaults.get("sl_last_kind") == "pct" and defaults.get("sl_pct_equity") not in (None, "") and eq > 0:
@@ -1680,6 +1811,44 @@ async def _cmd_open(engine, reply, raw_txt):
             update_open_position(symbol_conf, **changes)
         except Exception:
             logger.debug("open_command: no se pudo persistir protecciones en state_store", exc_info=True)
+
+    if persist_sl_default:
+        try:
+            if defaults.get("sl_last_kind") == "pct":
+                update_protection_defaults(
+                    symbol_conf,
+                    sl_last_kind="pct",
+                    sl_pct_equity=defaults.get("sl_pct_equity"),
+                    sl_price=None,
+                )
+            elif defaults.get("sl_last_kind") == "price":
+                update_protection_defaults(
+                    symbol_conf,
+                    sl_last_kind="price",
+                    sl_price=defaults.get("sl_price"),
+                    sl_pct_equity=None,
+                )
+        except Exception:
+            logger.debug("open_command: no se pudo guardar SL predeterminado", exc_info=True)
+
+    if persist_tp_default:
+        try:
+            if defaults.get("tp_last_kind") == "pct":
+                update_protection_defaults(
+                    symbol_conf,
+                    tp_last_kind="pct",
+                    tp_pct_equity=defaults.get("tp_pct_equity"),
+                    tp_price=None,
+                )
+            elif defaults.get("tp_last_kind") == "price":
+                update_protection_defaults(
+                    symbol_conf,
+                    tp_last_kind="price",
+                    tp_price=defaults.get("tp_price"),
+                    tp_pct_equity=None,
+                )
+        except Exception:
+            logger.debug("open_command: no se pudo guardar TP predeterminado", exc_info=True)
 
     # ======= Mensaje final claro =======
     margin = float(effective_equity)
@@ -1852,12 +2021,8 @@ async def cerrar_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     exit_txt = _num(exit_val) if exit_val not in (None, "") else "—"
                     lines.append(f"• Precio: entrada {entry_txt} | salida {exit_txt}")
                 pnl_val = summary.get("realized_pnl")
-                pnl_balance = summary.get("pnl_balance_delta")
                 if pnl_val not in (None, ""):
-                    pnl_line = f"• PnL: {_num(pnl_val)}"
-                    if pnl_balance not in (None, ""):
-                        pnl_line += f" | Δ equity: {_num(pnl_balance)}"
-                    lines.append(pnl_line)
+                    lines.append(f"• PnL: {_num(pnl_val)}")
                 lev_val = summary.get("leverage")
                 if lev_val not in (None, ""):
                     lines.append(f"• Leverage: x{_num(lev_val, 2)}")
