@@ -1400,10 +1400,90 @@ class TradingApp:
         logging.info("Bucle de trading programado. Iniciando polling de Telegram.")
         self.telegram_app.run_polling()
 
-    async def close_all(self) -> bool:
-        """Cierra SOLO la posición del BOT (reduceOnly). No toca posiciones manuales del usuario."""
+    async def close_all(self) -> Dict[str, Any] | bool:
+        """Cierra SOLO la posición del BOT (reduceOnly) y devuelve un resumen del cierre."""
         try:
             symbol = (self.config or {}).get("symbol", "BTC/USDT")
+            symbol_norm = str(symbol).replace("/", "").upper()
+
+            def _find_open_snapshot(state_obj: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+                open_positions = state_obj.get("open_positions", {}) if isinstance(state_obj, dict) else {}
+                if not isinstance(open_positions, dict):
+                    return None
+                candidates = [symbol, symbol_norm, str(symbol).upper(), str(symbol).lower()]
+                seen = set()
+                for key in candidates:
+                    key_clean = str(key).replace("/", "") if isinstance(key, str) else key
+                    for candidate in {key, key_clean}:
+                        if candidate in seen:
+                            continue
+                        seen.add(candidate)
+                        pos = open_positions.get(candidate)
+                        if pos:
+                            return dict(pos)
+                return None
+
+            def _latest_closed(state_obj: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+                closed = state_obj.get("closed_positions", []) if isinstance(state_obj, dict) else []
+                if not isinstance(closed, list):
+                    return None
+                for entry in reversed(closed):
+                    if not isinstance(entry, dict):
+                        continue
+                    sym_entry = str(entry.get("symbol", "")).replace("/", "").upper()
+                    if sym_entry == symbol_norm:
+                        return dict(entry)
+                return None
+
+            state_before = load_state()
+            snapshot_before = _find_open_snapshot(state_before)
+
+            service = getattr(trading, "POSITION_SERVICE", None)
+            status_before: Optional[Dict[str, Any]] = None
+            if service is not None:
+                try:
+                    status_before = service.get_status() or {}
+                except Exception:
+                    status_before = None
+
+            summary_base: Dict[str, Any] = {"symbol": symbol, "side": "LONG"}
+
+            def _set_if_missing(key: str, value) -> None:
+                if value in (None, ""):
+                    return
+                try:
+                    if key in {"qty", "entry_price", "leverage", "mark", "opened_at"}:
+                        summary_base.setdefault(key, float(value))
+                    else:
+                        summary_base.setdefault(key, value)
+                except Exception:
+                    return
+
+            if isinstance(snapshot_before, dict):
+                summary_base["side"] = str(snapshot_before.get("side") or summary_base["side"]).upper()
+                _set_if_missing("qty", snapshot_before.get("qty"))
+                _set_if_missing("entry_price", snapshot_before.get("entry_price"))
+                _set_if_missing("leverage", snapshot_before.get("leverage"))
+                _set_if_missing("opened_at", snapshot_before.get("opened_at"))
+
+            if isinstance(status_before, dict):
+                side_now = status_before.get("side") or status_before.get("positionSide")
+                if side_now:
+                    summary_base["side"] = str(side_now).upper()
+                for qty_key in ("qty", "pos_qty", "contracts", "positionAmt"):
+                    if qty_key in status_before and status_before[qty_key] not in (None, ""):
+                        _set_if_missing("qty", status_before[qty_key])
+                        break
+                for entry_key in ("entry_price", "avg_price", "entryPrice", "avgEntryPrice"):
+                    if entry_key in status_before and status_before[entry_key] not in (None, ""):
+                        _set_if_missing("entry_price", status_before[entry_key])
+                        break
+                for mark_key in ("mark", "mark_price", "markPrice"):
+                    if mark_key in status_before and status_before[mark_key] not in (None, ""):
+                        _set_if_missing("mark", status_before[mark_key])
+                        break
+                if "leverage" in status_before:
+                    _set_if_missing("leverage", status_before.get("leverage"))
 
             ex = getattr(self, "exchange", None)
 
@@ -1421,39 +1501,78 @@ class TradingApp:
                 except Exception:
                     return None
 
-            # --- snapshot antes del cierre (para PnL por delta de balance) ---
             bal_before = await _safe_fetch_balance()
 
-            # --- cerrar ahora (reduceOnly + positionSide correcto) ---
-            await asyncio.to_thread(trading.close_now, symbol)
+            close_result = await asyncio.to_thread(trading.close_now, symbol)
+            if not isinstance(close_result, dict):
+                close_result = {"status": "ok", "order": close_result}
 
-            # --- snapshot después del cierre ---
+            if str(close_result.get("status", "")).lower() == "noop":
+                reason = close_result.get("msg") or "No había posición del BOT para cerrar."
+                return {"status": "noop", "reason": reason}
+
             bal_after = await _safe_fetch_balance()
-
-            # --- persistir trade si podemos calcular PnL ---
             pnl_real = None
             if bal_before is not None and bal_after is not None:
                 pnl_real = float(bal_after) - float(bal_before)
 
-            storage = getattr(self, "storage", None)
-            if storage and pnl_real is not None:
-                side = "LONG"
-                try:
-                    from position_service import POSITION_SERVICE
+            state_after = load_state()
+            closed_snapshot = _latest_closed(state_after)
 
-                    status = POSITION_SERVICE.get_status() if POSITION_SERVICE else {}
-                    side = (status.get("side") or side).upper()
+            summary = dict(summary_base)
+
+            def _assign_float(target: Dict[str, Any], key: str, value) -> None:
+                if value in (None, ""):
+                    return
+                try:
+                    target[key] = float(value)
                 except Exception:
-                    pass
+                    return
+
+            if isinstance(closed_snapshot, dict):
+                summary["side"] = str(closed_snapshot.get("side") or summary.get("side", "LONG")).upper()
+                _assign_float(summary, "qty", closed_snapshot.get("qty"))
+                _assign_float(summary, "entry_price", closed_snapshot.get("entry_price"))
+                _assign_float(summary, "exit_price", closed_snapshot.get("exit_price"))
+                _assign_float(summary, "realized_pnl", closed_snapshot.get("realized_pnl"))
+                if closed_snapshot.get("closed_at") is not None:
+                    summary["closed_at"] = closed_snapshot.get("closed_at")
+            else:
+                close_price = close_result.get("close_price")
+                if close_price is not None:
+                    _assign_float(summary, "exit_price", close_price)
+                entry_px = summary.get("entry_price")
+                qty_val = summary.get("qty")
+                side_val = str(summary.get("side", "LONG")).upper()
+                if (
+                    entry_px not in (None, 0)
+                    and qty_val not in (None, 0)
+                    and close_price is not None
+                ):
+                    sign = 1.0 if side_val == "LONG" else -1.0
+                    realized = (float(close_price) - float(entry_px)) * float(qty_val) * sign
+                    summary["realized_pnl"] = realized
+
+            if pnl_real is not None:
+                summary["pnl_balance_delta"] = pnl_real
+
+            storage = getattr(self, "storage", None)
+            realized_for_store = summary.get("realized_pnl")
+            if storage and (pnl_real is not None or realized_for_store is not None):
+                trade_pnl = pnl_real if pnl_real is not None else float(realized_for_store)
                 storage.persist_trade(
                     {
                         "symbol": symbol,
-                        "side": side,
-                        "pnl": pnl_real,
+                        "side": str(summary.get("side", "LONG")).upper(),
+                        "pnl": float(trade_pnl),
                         "note": "close_all/manual",
                     }
                 )
-            return True
+
+            if close_result.get("close_price") is not None and "exit_price" not in summary:
+                _assign_float(summary, "exit_price", close_result.get("close_price"))
+
+            return {"status": "closed", "summary": summary, "order": close_result.get("order")}
         except Exception as exc:
             self.logger.exception("close_all failed: %s", exc)
             return False

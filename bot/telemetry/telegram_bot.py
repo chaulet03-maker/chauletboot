@@ -178,6 +178,7 @@ def _build_bot_position_message(*, engine, symbol, qty, avg, mark_val) -> str:
     lev = 1
     tp_price = None
     sl_price = None
+    pos_state = None
 
     try:
         st = load_state() or {}
@@ -205,8 +206,34 @@ def _build_bot_position_message(*, engine, symbol, qty, avg, mark_val) -> str:
                 lev_val = 1.0
             if lev_val > 0:
                 lev = max(int(lev_val), 1)
-            tp_price = _pick(pos_state, "tp", "tp_price", "take_profit")
-            sl_price = _pick(pos_state, "sl", "sl_price", "stop_loss")
+            tp_price = _pick(
+                pos_state,
+                "tp",
+                "tp_price",
+                "take_profit",
+                "tp2",
+                "tp1",
+            )
+            sl_price = _pick(pos_state, "sl", "sl_price", "stop_loss", "stop")
+
+            if tp_price is None and isinstance(pos_state, dict):
+                alt_levels = None
+                for key in ("tp_targets", "take_profits", "tps"):
+                    if key in pos_state:
+                        alt_levels = pos_state.get(key)
+                        break
+                if isinstance(alt_levels, (list, tuple)):
+                    numeric_levels = []
+                    for candidate in alt_levels:
+                        try:
+                            numeric_levels.append(float(candidate))
+                        except Exception:
+                            continue
+                    if numeric_levels:
+                        if side == "SHORT":
+                            tp_price = min(numeric_levels)
+                        else:
+                            tp_price = max(numeric_levels)
     except Exception:
         pass
 
@@ -242,6 +269,54 @@ def _build_bot_position_message(*, engine, symbol, qty, avg, mark_val) -> str:
             f"• {name}: {target:,.2f} "
             f"({price_move_pct:+.2f}% vs entrada | PnL {pnl_pct_equity:+.2f}%)"
         )
+
+    if tp_price is None:
+        entry_for_tp = avg_val
+        if entry_for_tp <= 0 and isinstance(pos_state, dict):
+            try:
+                entry_for_tp = float((pos_state or {}).get("entry_price") or 0.0)
+            except Exception:
+                entry_for_tp = avg_val
+
+        def _first_float_optional(*values):
+            for value in values:
+                if value in (None, ""):
+                    continue
+                try:
+                    return float(value)
+                except (TypeError, ValueError):
+                    continue
+            return None
+
+        cfg = getattr(engine, "config", {}) or {}
+        tp_pct_candidates = []
+        if isinstance(pos_state, dict):
+            tp_pct_candidates.append(pos_state.get("tp_pct"))
+        tp_pct_candidates.append(cfg.get("tp_pct"))
+        strategy_cfg = cfg.get("strategy") if isinstance(cfg, dict) else None
+        if isinstance(strategy_cfg, dict):
+            tp_pct_candidates.append(strategy_cfg.get("tp_pct"))
+        tp_pct_candidates.append(getattr(S, "tp_pct", None))
+        try:
+            raw_cfg = read_config_raw()
+        except Exception:
+            raw_cfg = None
+        if isinstance(raw_cfg, dict):
+            tp_pct_candidates.append(raw_cfg.get("tp_pct"))
+            strat_cfg = raw_cfg.get("strategy")
+            if isinstance(strat_cfg, dict):
+                tp_pct_candidates.append(strat_cfg.get("tp_pct"))
+
+        tp_pct_val = _first_float_optional(*tp_pct_candidates)
+        if entry_for_tp > 0 and tp_pct_val is not None:
+            tp_pct_f = abs(tp_pct_val)
+            if tp_pct_f > 1:
+                tp_pct_f = min(tp_pct_f, 100.0) / 100.0
+            if tp_pct_f > 0:
+                if side == "SHORT":
+                    tp_price = entry_for_tp * (1 - tp_pct_f)
+                else:
+                    tp_price = entry_for_tp * (1 + tp_pct_f)
 
     tp_line = _line_tp_sl("TP", tp_price)
     sl_line = _line_tp_sl("SL", sl_price)
@@ -1559,8 +1634,41 @@ async def cerrar_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _reply_chunks(update, "Engine no disponible para cerrar posiciones.")
         return
     try:
-        ok = await engine.close_all()
-        if ok:
+        result = await engine.close_all()
+        if isinstance(result, dict):
+            status = str(result.get("status", "")).lower()
+            if status == "closed":
+                summary = result.get("summary") or {}
+                lines = ["✅ Cerré la **posición del BOT**."]
+                side_txt = summary.get("side")
+                if side_txt:
+                    lines.append(f"• Lado: *{str(side_txt).upper()}*")
+                qty_val = summary.get("qty")
+                if qty_val not in (None, ""):
+                    lines.append(f"• Cantidad: {_num(qty_val, 6)}")
+                entry_val = summary.get("entry_price")
+                exit_val = summary.get("exit_price")
+                if entry_val not in (None, "") or exit_val not in (None, ""):
+                    entry_txt = _num(entry_val) if entry_val not in (None, "") else "—"
+                    exit_txt = _num(exit_val) if exit_val not in (None, "") else "—"
+                    lines.append(f"• Precio: entrada {entry_txt} | salida {exit_txt}")
+                pnl_val = summary.get("realized_pnl")
+                pnl_balance = summary.get("pnl_balance_delta")
+                if pnl_val not in (None, ""):
+                    pnl_line = f"• PnL: {_num(pnl_val)}"
+                    if pnl_balance not in (None, ""):
+                        pnl_line += f" | Δ equity: {_num(pnl_balance)}"
+                    lines.append(pnl_line)
+                lev_val = summary.get("leverage")
+                if lev_val not in (None, ""):
+                    lines.append(f"• Leverage: x{_num(lev_val, 2)}")
+                await _reply_chunks(update, "\n".join(lines))
+            elif status == "noop":
+                reason = result.get("reason") or "No había **posición del BOT** para cerrar."
+                await _reply_chunks(update, f"⚠️ {reason}")
+            else:
+                await _reply_chunks(update, "⚠️ No pude confirmar el cierre de la **posición del BOT**.")
+        elif result:
             await _reply_chunks(update, "✅ Cerré la **posición del BOT**.")
         else:
             await _reply_chunks(update, "⚠️ No había **posición del BOT** para cerrar.")
