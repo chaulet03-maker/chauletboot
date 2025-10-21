@@ -1371,24 +1371,6 @@ async def _cmd_estado(engine, reply):
         except Exception:
             equity = 0.0
 
-    lev_txt = ""
-    try:
-        state = load_state() or {}
-        positions = state.get("open_positions", {}) or {}
-        sym_config = cfg.get("symbol") or "BTCUSDT"
-        candidates = [sym_config, str(sym_config).replace("/", "")]
-        pos_state = None
-        for key in candidates:
-            pos_state = positions.get(key)
-            if pos_state:
-                break
-        if isinstance(pos_state, dict):
-            lev_val = float(pos_state.get("leverage") or 0.0)
-            if lev_val > 0:
-                lev_txt = f"\\nLev: x{int(lev_val)}"
-    except Exception:
-        lev_txt = ""
-
     # Mark para PnL no realizado
     async def _mark(sym):
         try:
@@ -1406,7 +1388,7 @@ async def _cmd_estado(engine, reply):
     return await reply(
         f"Modo: *{'REAL' if mode=='live' else 'SIMULADO'}*\n"
         f"Símbolo: {symbol}\n"
-        f"Equity: {equity:,.2f}{lev_txt}\n"
+        f"saldo: {equity:,.2f}\n"
         f"PnL Diario: {d['total']:+.2f} (R={d['realized']:+.2f} | U={d['unrealized']:+.2f})\n"
         f"PnL Semanal: {w['total']:+.2f} (R={w['realized']:+.2f} | U={w['unrealized']:+.2f})"
     )
