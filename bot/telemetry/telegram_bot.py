@@ -108,6 +108,40 @@ def _signed_qty(qty: float, side: str) -> float:
     return q
 
 
+# ==== Helpers de TP/SL por % del EQUITY y métricas de presentación ====
+
+
+def _side_from_qty(qty: float) -> str:
+    return "LONG" if qty > 0 else ("SHORT" if qty < 0 else "FLAT")
+
+
+def _target_from_equity_pct(entry: float, qty_abs: float, equity: float, side: str, pct: float) -> float:
+    """pct puede ser + (TP) o - (SL). Basado en % del equity."""
+    if qty_abs <= 0 or equity <= 0 or entry <= 0:
+        return entry
+    dollars = equity * abs(pct) / 100.0  # cuánto querés ganar/perder en USD
+    if side == "LONG":
+        sign = +1 if pct > 0 else -1
+    else:  # SHORT
+        sign = -1 if pct > 0 else +1
+    return entry + sign * (dollars / qty_abs)
+
+
+def _pcts_for_target(entry: float, target: float, qty_abs: float, equity: float, side: str):
+    """
+    Devuelve:
+      price_pct: % de movimiento de precio desde entry (con signo de 'beneficio' para ese side)
+      pnl_pct_equity: % de impacto esperado en PnL sobre el equity (con signo)
+    """
+    if entry <= 0 or qty_abs <= 0:
+        return 0.0, 0.0
+    dir_sign = 1.0 if side == "LONG" else -1.0
+    price_pct = dir_sign * ((target - entry) / entry) * 100.0
+    pnl_usd = dir_sign * (target - entry) * qty_abs
+    pnl_pct_equity = (pnl_usd / equity) * 100.0 if equity > 0 else 0.0
+    return price_pct, pnl_pct_equity
+
+
 def _build_bot_position_message(*, engine, symbol, qty, avg, mark_val) -> str:
     try:
         qty_val = float(qty)
@@ -122,7 +156,7 @@ def _build_bot_position_message(*, engine, symbol, qty, avg, mark_val) -> str:
     except Exception:
         mark_value = 0.0
 
-    side = "LONG" if qty_val > 0 else ("SHORT" if qty_val < 0 else "FLAT")
+    side = _side_from_qty(qty_val)
     lev = 1
     tp_price = None
     sl_price = None
@@ -146,26 +180,40 @@ def _build_bot_position_message(*, engine, symbol, qty, avg, mark_val) -> str:
     except Exception:
         pass
 
+    trader = getattr(engine, "trader", None)
+    try:
+        equity = float(trader.equity()) if trader is not None else 0.0
+    except Exception:
+        equity = 0.0
+
+    qty_abs = abs(qty_val)
     pnl_usd = (mark_value - avg_val) * qty_val
-    notional = abs(qty_val) * avg_val
+    notional = qty_abs * avg_val
     margin_used = notional / max(lev, 1)
-    pnl_pct = 0.0 if margin_used <= 0 else (pnl_usd / margin_used) * 100.0
-
-    tp_txt = "—"
-    if tp_price not in (None, ""):
-        try:
-            tp_txt = f"{float(tp_price):,.2f}"
-        except Exception:
-            tp_txt = "—"
-
-    sl_txt = "—"
-    if sl_price not in (None, ""):
-        try:
-            sl_txt = f"{float(sl_price):,.2f}"
-        except Exception:
-            sl_txt = "—"
+    if equity > 0:
+        pnl_pct = (pnl_usd / equity) * 100.0
+        pnl_pct_label = "equity"
+    else:
+        pnl_pct = 0.0 if margin_used <= 0 else (pnl_usd / margin_used) * 100.0
+        pnl_pct_label = "margen"
 
     lev_txt = f" | lev x{lev}" if lev > 1 else ""
+
+    def _line_tp_sl(name: str, target_val) -> str:
+        if target_val in (None, ""):
+            return f"• {name}: —"
+        try:
+            target = float(target_val)
+        except (TypeError, ValueError):
+            return f"• {name}: —"
+        price_pct, pnl_pct_equity = _pcts_for_target(avg_val, target, qty_abs, equity, side)
+        return (
+            f"• {name}: {target:,.2f} "
+            f"({price_pct:+.2f}% precio | PnL {pnl_pct_equity:+.2f}%)"
+        )
+
+    tp_line = _line_tp_sl("TP", tp_price)
+    sl_line = _line_tp_sl("SL", sl_price)
 
     mode_txt = "Simulado" if not _is_engine_live(engine) else "Real"
 
@@ -173,11 +221,11 @@ def _build_bot_position_message(*, engine, symbol, qty, avg, mark_val) -> str:
         f"📍 *Posición del BOT*\n"
         f"• Símbolo: {symbol} ({mode_txt})\n"
         f"• Lado: *{side}*\n"
-        f"• Cantidad (bot qty): {abs(qty_val):.6f}\n"
+        f"• Cantidad (bot qty): {qty_abs:.6f}\n"
         f"• Entrada: {avg_val:,.2f} | Mark: {mark_value:,.2f}{lev_txt}\n"
-        f"• PnL: {pnl_usd:+.2f} (*{pnl_pct:+.2f}%*)\n"
-        f"• TP: {tp_txt}\n"
-        f"• SL: {sl_txt}"
+        f"• PnL: {pnl_usd:+.2f} (*{pnl_pct:+.2f}% {pnl_pct_label}*)\n"
+        f"{tp_line}\n"
+        f"{sl_line}"
     )
 
     return msg
@@ -843,72 +891,148 @@ async def _handle_position_controls(engine, reply_md, text: str) -> bool:
         return False
 
     lower = text.lower()
+    qty_abs = float(position.get("qty") or 0.0)
+    entry = float(position.get("entry") or 0.0)
+    side_now = position["side"]
+    symbol_norm = position["symbol"]
+    symbol_conf = position.get("symbol_conf", symbol_norm)
+    exchange = getattr(engine, "exchange", None)
 
-    m_sl = re.search(r"\bsl\s*([+-])\s*(\d+(?:\.\d+)?)\b", lower)
-    if m_sl:
-        sign = m_sl.group(1)
-        try:
-            pct = float(m_sl.group(2))
-        except Exception:
-            await reply_md("Formato SL: sl +5  |  sl -3  (porcentaje)")
+    trader = getattr(engine, "trader", None)
+    try:
+        equity = float(trader.equity()) if trader is not None else 0.0
+    except Exception:
+        equity = 0.0
+
+    async def _current_mark() -> Optional[float]:
+        mark_val: Optional[float] = None
+        if exchange is not None and hasattr(exchange, "get_current_price"):
+            try:
+                mark_raw = await exchange.get_current_price(symbol_norm)
+                mark_val = float(mark_raw)
+            except Exception:
+                mark_val = None
+        if mark_val is None:
+            try:
+                mark_val = float(position.get("mark")) if position.get("mark") is not None else None
+            except Exception:
+                mark_val = None
+        return mark_val
+
+    m_sl_pct = re.search(r"\bsl\s*([+-])\s*(\d+(?:\.\d+)?)\b", lower)
+    m_sl_abs = re.search(r"\bsl\s*(\d+(?:\.\d+)?)\b", lower) if not m_sl_pct else None
+    if m_sl_pct or m_sl_abs:
+        if qty_abs <= 0 or entry <= 0:
+            await reply_md("No tengo datos de la posición para calcular SL.")
             return True
-        entry = position.get("entry") or 0.0
-        if entry <= 0:
-            await reply_md("No tengo precio de entrada para calcular SL.")
-            return True
-        side_now = position["side"]
-        if side_now == "LONG":
-            target = entry * (1.0 + (pct / 100.0)) if sign == "+" else entry * (1.0 - (pct / 100.0))
+        if m_sl_pct:
+            sign = m_sl_pct.group(1)
+            try:
+                pct = float(m_sl_pct.group(2))
+            except Exception:
+                await reply_md("Formato SL: `sl +5`, `sl -2` o `sl 105000`")
+                return True
+            if equity <= 0:
+                await reply_md("Equity <= 0. Configuralo con `equity 1000` antes de usar SL %.")
+                return True
+            pct_signed = +pct if sign == "+" else -pct
+            target = _target_from_equity_pct(entry, qty_abs, equity, side_now, pct_signed)
         else:
-            target = entry * (1.0 - (pct / 100.0)) if sign == "+" else entry * (1.0 + (pct / 100.0))
+            try:
+                target = float(m_sl_abs.group(1))  # type: ignore[union-attr]
+            except Exception:
+                await reply_md("Formato SL: `sl +5`, `sl -2` o `sl 105000`")
+                return True
+        price_pct, pnl_pct_equity = _pcts_for_target(entry, target, qty_abs, equity, side_now)
         try:
-            broker.update_protections(position["symbol"], side_now, position["qty"], sl=target)
-            update_open_position(position["symbol_conf"], sl=target)
+            broker.update_protections(symbol_norm, side_now, qty_abs, sl=target)
+            update_open_position(symbol_conf, sl=target)
         except Exception as exc:
             await reply_md(f"No pude actualizar SL: {exc}")
             return True
-        await reply_md(f"✅ SL actualizado a ${target:.2f} ({sign}{pct}%)")
-        return True
-
-    m_tp = re.search(r"\btp\s+(\d+(?:\.\d+)?)\b", lower)
-    if m_tp:
-        try:
-            new_tp_price = float(m_tp.group(1))
-        except Exception:
-            await reply_md("Formato TP: tp 45000")
-            return True
-        exchange = getattr(engine, "exchange", None)
-        if exchange is None:
-            await reply_md("Exchange no disponible para actualizar TP.")
-            return True
-        try:
-            mark_val = await exchange.get_current_price(position["symbol"])
-            mark = float(mark_val)
-        except Exception:
-            mark = None
-        side_now = position["side"]
-        should_close = False
-        if mark is not None:
-            if side_now == "LONG" and mark >= new_tp_price:
-                should_close = True
-            if side_now == "SHORT" and mark <= new_tp_price:
-                should_close = True
-        if should_close:
+        mark_val = await _current_mark()
+        crossed = False
+        if mark_val is not None:
+            if side_now == "LONG" and mark_val <= target:
+                crossed = True
+            if side_now == "SHORT" and mark_val >= target:
+                crossed = True
+        if crossed:
+            closed = False
             try:
                 trading.close_bot_position_market()
-                update_open_position(position["symbol_conf"], tp=new_tp_price)
-            except Exception as exc:
-                await reply_md(f"No pude cerrar la posición: {exc}")
-                return True
-            await reply_md("✅ TP alcanzado con el nuevo valor. Posición cerrada.")
+                closed = True
+            except Exception:
+                closed = False
+            if closed:
+                await reply_md(f"✅ SL alcanzado. Posición cerrada (SL: ${target:,.2f}).")
+            else:
+                await reply_md(
+                    f"SL cruzado (mark {_num(mark_val)}). Intentá cerrar manualmente."
+                )
             return True
+        await reply_md(
+            f"✅ SL actualizado a ${target:,.2f} "
+            f"({price_pct:+.2f}% precio | PnL {pnl_pct_equity:+.2f}%)"
+        )
+        return True
+
+    m_tp_pct = re.search(r"\btp\s*([+-])\s*(\d+(?:\.\d+)?)\b", lower)
+    m_tp_abs = re.search(r"\btp\s*(\d+(?:\.\d+)?)\b", lower) if not m_tp_pct else None
+    if m_tp_pct or m_tp_abs:
+        if qty_abs <= 0 or entry <= 0:
+            await reply_md("No tengo datos de la posición para calcular TP.")
+            return True
+        if m_tp_pct:
+            sign = m_tp_pct.group(1)
+            try:
+                pct = float(m_tp_pct.group(2))
+            except Exception:
+                await reply_md("Formato TP: `tp +5` o `tp 109000`")
+                return True
+            if equity <= 0:
+                await reply_md("Equity <= 0. Configuralo con `equity 1000` antes de usar TP %.")
+                return True
+            pct_signed = +pct if sign == "+" else -pct
+            target = _target_from_equity_pct(entry, qty_abs, equity, side_now, pct_signed)
+        else:
+            try:
+                target = float(m_tp_abs.group(1))  # type: ignore[union-attr]
+            except Exception:
+                await reply_md("Formato TP: `tp +5` o `tp 109000`")
+                return True
+        price_pct, pnl_pct_equity = _pcts_for_target(entry, target, qty_abs, equity, side_now)
         try:
-            broker.update_protections(position["symbol"], side_now, position["qty"], tp=new_tp_price)
-            update_open_position(position["symbol_conf"], tp=new_tp_price)
+            broker.update_protections(symbol_norm, side_now, qty_abs, tp=target)
+            update_open_position(symbol_conf, tp=target)
         except Exception as exc:
             await reply_md(f"No pude actualizar TP: {exc}")
             return True
-        await reply_md(f"✅ TP actualizado a ${new_tp_price:.2f}")
+        mark_val = await _current_mark()
+        reached = False
+        if mark_val is not None:
+            if side_now == "LONG" and mark_val >= target:
+                reached = True
+            if side_now == "SHORT" and mark_val <= target:
+                reached = True
+        if reached:
+            closed = False
+            try:
+                trading.close_bot_position_market()
+                closed = True
+            except Exception:
+                closed = False
+            if closed:
+                await reply_md(f"✅ TP alcanzado. Posición cerrada (TP: ${target:,.2f}).")
+            else:
+                await reply_md(
+                    f"TP cruzado (mark {_num(mark_val)}). Intentá cerrar manualmente."
+                )
+            return True
+        await reply_md(
+            f"✅ TP actualizado a ${target:,.2f} "
+            f"({price_pct:+.2f}% precio | PnL {pnl_pct_equity:+.2f}%)"
+        )
         return True
 
     return False
