@@ -184,6 +184,14 @@ class SimBroker:
             fee_paid = abs(float(fill_price) * float(qty)) * self.fee_rate if fill_price is not None else 0.0
         except Exception:
             fee_paid = 0.0
+        payload["fee"] = float(fee_paid)
+        payload["fills"] = [
+            {
+                "price": float(fill_price),
+                "qty": float(qty),
+                "commission": float(fee_paid),
+            }
+        ]
         try:
             ledger_fill(
                 mode,

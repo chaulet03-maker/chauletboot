@@ -26,6 +26,8 @@ class Position:
     status: str = "open"  # "open" | "closed"
     realized_pnl: float = 0.0
     mode: str = "paper"  # "paper" | "live"
+    fees: float = 0.0
+    gross_pnl: float = 0.0
 
 
 def _atomic_write(path: str, data: bytes) -> None:
@@ -67,6 +69,7 @@ def create_position(
     tp: Optional[float] = None,
     sl: Optional[float] = None,
     mode: str = "paper",
+    fee: float = 0.0,
 ) -> Position:
     return Position(
         id=str(uuid.uuid4()),
@@ -78,6 +81,7 @@ def create_position(
         tp=tp,
         sl=sl,
         mode=mode,
+        fees=float(fee or 0.0),
     )
 
 
@@ -93,15 +97,26 @@ def persist_close(
     symbol: str,
     exit_price: float,
     realized_pnl: float,
+    *,
+    fee: float = 0.0,
+    gross_pnl: Optional[float] = None,
     state: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     state_obj = state or load_state()
     open_positions = state_obj.setdefault("open_positions", {})
     pos = open_positions.pop(symbol, None)
+    if pos is None and "/" in symbol:
+        pos = open_positions.pop(symbol.replace("/", ""), None)
+        symbol = symbol.replace("/", "") if pos is not None else symbol
     if pos:
         pos["closed_at"] = time.time()
         pos["status"] = "closed"
         pos["exit_price"] = float(exit_price)
+        existing_fees = float(pos.get("fees") or 0.0)
+        total_fees = existing_fees + float(fee or 0.0)
+        pos["fees"] = total_fees
+        if gross_pnl is not None:
+            pos["gross_pnl"] = float(gross_pnl)
         pos["realized_pnl"] = float(realized_pnl)
         state_obj.setdefault("closed_positions", []).append(pos)
         save_state(state_obj)
@@ -206,14 +221,25 @@ def on_open_filled(
     tp: Optional[float] = None,
     sl: Optional[float] = None,
     mode: str = "paper",
+    fee: float = 0.0,
 ) -> None:
-    pos = create_position(symbol, side, qty, price, lev, tp, sl, mode)
+    pos = create_position(symbol, side, qty, price, lev, tp, sl, mode, fee)
     persist_open(pos)
 
 
-def on_close_filled(symbol: str, exit_price: float) -> None:
+def on_close_filled(symbol: str, exit_price: float, fee: float = 0.0) -> None:
     state = load_state()
-    pos = state.get("open_positions", {}).get(symbol)
+    open_positions = state.get("open_positions", {})
+    pos = open_positions.get(symbol)
+    key_used = symbol
+    if pos is None and "/" in symbol:
+        alt = symbol.replace("/", "")
+        pos = open_positions.get(alt)
+        if pos is not None:
+            key_used = alt
+    if pos is None and symbol.replace("/", "") in open_positions:
+        key_used = symbol.replace("/", "")
+        pos = open_positions.get(key_used)
     if not pos:
         return
     side = pos.get("side", "LONG").upper()
@@ -230,8 +256,18 @@ def on_close_filled(symbol: str, exit_price: float) -> None:
         leverage = float(pos.get("leverage", 1.0) or 1.0)
     except Exception:
         leverage = 1.0
-    realized = (float(exit_price) - entry) * sign * qty * leverage
-    persist_close(symbol, exit_price, realized, state=state)
+    existing_fees = float(pos.get("fees") or 0.0)
+    gross = (float(exit_price) - entry) * sign * qty
+    total_fees = existing_fees + float(fee or 0.0)
+    realized = gross - total_fees
+    persist_close(
+        key_used,
+        exit_price,
+        realized,
+        fee=total_fees,
+        gross_pnl=gross,
+        state=state,
+    )
 
 
 def position_status(symbol: str, mode: str) -> str:
