@@ -1104,7 +1104,19 @@ class TradingApp:
         try:
             symbols = self.symbols or [self.config.get('symbol', 'BTC/USDT')]
             for sym in symbols:
-                px = await self.exchange.get_current_price(sym)
+                try:
+                    px = await asyncio.wait_for(
+                        self.exchange.get_current_price(sym), timeout=5.0
+                    )
+                except asyncio.TimeoutError:
+                    logging.warning("Timeout obteniendo precio para %s", sym)
+                    continue
+                except Exception as exc:
+                    logging.warning(
+                        "Error inesperado obteniendo precio para %s: %s", sym, exc
+                    )
+                    continue
+
                 if px is not None:
                     self.price_cache[sym] = float(px)
         except Exception as e:
