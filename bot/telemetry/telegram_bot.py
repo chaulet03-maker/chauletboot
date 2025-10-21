@@ -944,8 +944,16 @@ async def _handle_position_controls(engine, reply_md, text: str) -> bool:
             except Exception:
                 await reply_md("Formato SL: `sl +5`, `sl -2` o `sl 105000`")
                 return True
+            if equity <= 0 and trader is not None and not S.PAPER:
+                try:
+                    equity = float(trader.equity(force_refresh=True))
+                except Exception:
+                    logger.debug("No se pudo refrescar equity live para SL %%.", exc_info=True)
             if equity <= 0:
-                await reply_md("Equity <= 0. Configuralo con `equity 1000` antes de usar SL %.")
+                if S.PAPER:
+                    await reply_md("Equity <= 0. Configuralo con `equity 1000` antes de usar SL %.")
+                else:
+                    await reply_md("No pude obtener el equity live desde Binance. Intentá nuevamente en unos segundos.")
                 return True
             pct_signed = (+pct if sign == "+" else (-pct if sign == "-" else -pct))
             target = _target_from_equity_pct(entry, qty_abs, equity, side_now, pct_signed)
@@ -971,14 +979,51 @@ async def _handle_position_controls(engine, reply_md, text: str) -> bool:
             if side_now == "SHORT" and mark_val >= target:
                 crossed = True
         if crossed:
-            closed = False
+            def _classify_close_result(payload: Any) -> str | None:
+                if not isinstance(payload, dict):
+                    return None
+                info = str(payload.get("info") or "").strip().lower()
+                if info and "sin posición" in info:
+                    return "no_position"
+                try:
+                    ok_val = payload.get("ok")
+                    if ok_val is False:
+                        return "failed"
+                except Exception:
+                    pass
+                executed = 0.0
+                for key in (
+                    "executedQty",
+                    "executed_qty",
+                    "filled",
+                    "fills_qty",
+                    "cumQty",
+                    "cumqty",
+                ):
+                    if key not in payload:
+                        continue
+                    try:
+                        executed = max(executed, abs(float(payload.get(key) or 0.0)))
+                    except Exception:
+                        continue
+                if executed > 0:
+                    return "filled"
+                status = str(payload.get("status") or "").strip().upper()
+                if status in {"FILLED", "PARTIALLY_FILLED"}:
+                    return "filled"
+                return None
+
+            close_result: Any = None
             try:
-                trading.close_bot_position_market()
-                closed = True
-            except Exception:
-                closed = False
-            if closed:
+                close_result = trading.close_bot_position_market()
+            except Exception as exc:
+                logger.debug("No se pudo cerrar posición tras cruzar SL: %s", exc)
+
+            classification = _classify_close_result(close_result)
+            if classification == "filled":
                 await reply_md(f"✅ SL alcanzado. Posición cerrada (SL: ${target:,.2f}).")
+            elif classification == "no_position":
+                await reply_md("SL cruzado, pero no hay posición abierta para cerrar.")
             else:
                 await reply_md(
                     f"SL cruzado (mark {_num(mark_val)}). Intentá cerrar manualmente."
