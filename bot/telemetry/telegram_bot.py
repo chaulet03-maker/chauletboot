@@ -1295,7 +1295,14 @@ async def _cmd_open(engine, reply, raw_txt):
     if eq <= 0:
         return await reply("Equity = 0. Setealo con: equity 1200")
 
-    qty = (eq * lev) / float(px)
+    fraction = float(_get_equity_fraction(engine))
+    if not (0.0 < fraction <= 1.0):
+        fraction = 1.0
+    effective_equity = eq * fraction
+    if effective_equity <= 0:
+        return await reply("Equity % = 0. Ajustalo con: equity 50")
+
+    qty = (effective_equity * lev) / float(px)
     try:
         round_qty_fn = getattr(exchange, "round_qty", None)
         if callable(round_qty_fn):
@@ -2068,7 +2075,10 @@ async def equity_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     txt = (message.text or "").strip().lower()
-    match = re.search(r"equity\s+(\d+(?:[.,]\d+)?)(\s*%?)", txt)
+    pattern = re.compile(
+        r"equity\s+(?:(usd|usdt|\$)\s+)?(\d+(?:[.,]\d+)?)(?:\s*(usd|usdt|\$|%))?"
+    )
+    match = pattern.search(txt)
     if not match:
         fraction = float(_get_equity_fraction(engine))
         pct = round(fraction * 100.0, 2)
@@ -2081,15 +2091,18 @@ async def equity_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     try:
-        value = float(match.group(1).replace(",", "."))
+        value = float(match.group(2).replace(",", "."))
     except Exception:
-        await message.reply_text("Formato: equity 1200  |  equity 25%")
+        await message.reply_text("Formato: equity 50  |  equity 50%  |  equity usd 1200")
         return
 
-    suffix = match.group(2) or ""
-    if "%" in suffix:
-        if not (1.0 <= value <= 100.0):
-            await message.reply_text("El porcentaje debe estar entre 1 y 100.")
+    prefix = (match.group(1) or "").strip()
+    suffix = (match.group(3) or "").strip()
+    is_usd = prefix in {"usd", "usdt", "$"} or suffix in {"usd", "usdt", "$"}
+
+    if not is_usd:
+        if not (0.0 < value <= 100.0):
+            await message.reply_text("El porcentaje debe estar entre 0 y 100.")
             return
 
         frac = round(value / 100.0, 4)
@@ -2118,6 +2131,7 @@ async def equity_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    # Equity explícito en USDT
     set_equity_sim(value)
     try:
         trader = getattr(engine, "trader", None)
@@ -2126,7 +2140,7 @@ async def equity_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         logger.debug("No se pudo actualizar trader.set_paper_equity", exc_info=True)
 
-    await message.reply_text(f"Equity seteado: {value:.2f}")
+    await message.reply_text(f"✅ Equity base seteado: {value:.2f} USDT")
 
 
 async def diag_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
