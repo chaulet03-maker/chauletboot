@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 from paper_store import PaperStore
+from state_store import update_open_position
 
 try:
     from binance.error import BinanceAPIException, BinanceOrderException, BinanceRequestException  # type: ignore
@@ -299,6 +300,31 @@ class BinanceBroker:
                 protections,
                 position_side,
             )
+        if tp is not None or sl is not None:
+            changes: dict[str, float] = {}
+            if tp is not None:
+                try:
+                    changes["tp"] = float(tp)
+                except (TypeError, ValueError):
+                    pass
+            if sl is not None:
+                try:
+                    changes["sl"] = float(sl)
+                except (TypeError, ValueError):
+                    pass
+            if changes:
+                candidates = [symbol]
+                if symbol and "/" not in symbol and symbol.upper().endswith("USDT"):
+                    candidates.append(f"{symbol[:-4]}/USDT")
+                for candidate in candidates:
+                    try:
+                        if update_open_position(candidate, **changes):
+                            break
+                    except Exception:
+                        logger.debug(
+                            "BinanceBroker.update_protections: no se pudo persistir cambios",
+                            exc_info=True,
+                        )
         return {"ok": True}
 
     # ------------------------------------------------------------------
