@@ -258,20 +258,25 @@ def place_order_safe(side: str, qty: float, price: float | None = None, **kwargs
                         POSITION_SERVICE.get_status(),
                     )
                     inferred_price = fill_price
-        if inferred_price is not None:
-            try:
-                on_open_filled(
-                    symbol,
-                    "LONG" if str(side).upper() in {"BUY", "LONG"} else "SHORT",
-                    float(qty),
-                    float(inferred_price),
-                    lev_value,
-                    tp=tp_value,
-                    sl=sl_value,
-                    mode=mode_label,
-                )
-            except Exception:
-                logger.debug("No se pudo persistir estado en state_store al abrir.", exc_info=True)
+                if inferred_price is not None:
+                    fee_paid = _extract_order_fee(result)
+                    try:
+                        on_open_filled(
+                            symbol,
+                            "LONG" if str(side).upper() in {"BUY", "LONG"} else "SHORT",
+                            float(qty),
+                            float(inferred_price),
+                            lev_value,
+                            tp=tp_value,
+                            sl=sl_value,
+                            mode=mode_label,
+                            fee=fee_paid,
+                        )
+                    except Exception:
+                        logger.debug(
+                            "No se pudo persistir estado en state_store al abrir.",
+                            exc_info=True,
+                        )
     except Exception:
         if isinstance(result, dict) and result.get("sim"):
             logger.warning("PAPER: no se pudo reflejar estado tras abrir.", exc_info=True)
@@ -336,10 +341,11 @@ def close_now(symbol: str | None = None):
                 bot_side = "SHORT" if side == "LONG" else "LONG"
                 if close_price is not None:
                     POSITION_SERVICE.apply_fill(bot_side, float(qty), float(close_price))
+        fee_paid = _extract_order_fee(result)
         if close_price is not None:
             try:
                 target = target_symbol or symbol or getattr(S, "symbol", None) or "BTC/USDT"
-                on_close_filled(str(target), float(close_price))
+                on_close_filled(str(target), float(close_price), fee=fee_paid)
             except Exception:
                 logger.debug("No se pudo persistir cierre en state_store.", exc_info=True)
     except Exception:
@@ -404,6 +410,53 @@ def _infer_fill_price(order_result: Any, fallback: float | None = None) -> float
             if total_qty > 0:
                 return total_notional / total_qty
     return None
+
+
+def _extract_order_fee(order_result: Any) -> float:
+    """Extrae el fee total (en USDT) de la respuesta del broker."""
+
+    total_fee = 0.0
+    if not isinstance(order_result, dict):
+        return total_fee
+
+    direct_keys = ("fee", "commission", "commissionAmount", "commission_amount")
+    for key in direct_keys:
+        if key in order_result and order_result[key] not in (None, ""):
+            try:
+                total_fee += abs(float(order_result[key]))
+            except Exception:
+                continue
+
+    fees_field = order_result.get("fees")
+    if isinstance(fees_field, (list, tuple)):
+        for entry in fees_field:
+            if isinstance(entry, dict):
+                for key in ("fee", "commission", "cost"):
+                    if entry.get(key) not in (None, ""):
+                        try:
+                            total_fee += abs(float(entry[key]))
+                        except Exception:
+                            continue
+            else:
+                try:
+                    total_fee += abs(float(entry))
+                except Exception:
+                    continue
+
+    fills = order_result.get("fills")
+    if isinstance(fills, list):
+        for fill in fills:
+            if not isinstance(fill, dict):
+                continue
+            for key in ("commission", "fee", "cost"):
+                if fill.get(key) in (None, ""):
+                    continue
+                try:
+                    total_fee += abs(float(fill.get(key)))
+                except Exception:
+                    continue
+
+    return total_fee
 
 
 def close_bot_position_market() -> dict[str, Any]:

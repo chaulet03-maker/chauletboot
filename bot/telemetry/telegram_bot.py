@@ -25,7 +25,12 @@ from bot.mode_manager import get_mode
 from bot.identity import get_bot_id
 from bot.ledger import bot_position
 from bot.pnl import pnl_summary_bot
-from bot.runtime_state import get_equity_sim, set_equity_sim
+from bot.runtime_state import (
+    get_equity_sim,
+    get_protection_defaults,
+    set_equity_sim,
+    update_protection_defaults,
+)
 from bot.settings_utils import get_val, read_config_raw
 from bot.telemetry.command_registry import CommandRegistry, normalize
 from bot.telemetry.formatter import open_msg
@@ -1003,16 +1008,136 @@ async def _handle_position_controls(engine, reply_md, text: str) -> bool:
     if broker is None:
         return False
 
+    cfg_engine = getattr(engine, "config", {}) or {}
+    symbol_conf_default = cfg_engine.get("symbol", "BTC/USDT")
+    symbol_norm_default = _normalized_symbol(symbol_conf_default)
+
     position = _bot_position_info(engine)
+    lower = text.lower()
+    symbol_conf = (
+        position.get("symbol_conf")
+        if isinstance(position, dict) and position.get("symbol_conf")
+        else symbol_conf_default
+    )
+    symbol_norm = (
+        position.get("symbol")
+        if isinstance(position, dict) and position.get("symbol")
+        else symbol_norm_default
+    )
+
     if position is None:
+        text_raw = (text or "").strip()
+        defaults = get_protection_defaults(symbol_conf)
+
+        if re.match(r"^/?sl\s*$", text_raw, re.IGNORECASE):
+            stored_kind = defaults.get("sl_last_kind")
+            if stored_kind == "pct" and defaults.get("sl_pct_equity") not in (None, ""):
+                pct_val = float(defaults["sl_pct_equity"])
+                await reply_md(f"SL predeterminado: {pct_val:+.2f}% del equity")
+            elif stored_kind == "price" and defaults.get("sl_price") not in (None, ""):
+                await reply_md(f"SL predeterminado: {_num(defaults['sl_price'])}")
+            else:
+                await reply_md("SL predeterminado: —")
+            await reply_md("Uso: `sl +5`, `sl -2`, `sl 105000`")
+            return True
+
+        m_sl_pct = re.match(r"^/?sl\s*([+\-]?)(\d+(?:\.\d+)?)%?\s*$", text_raw, re.IGNORECASE)
+        m_sl_abs = None
+        if not m_sl_pct:
+            m_sl_abs = re.match(r"^/?sl\s*\$?\s*(\d+(?:\.\d+)?)\s*$", text_raw, re.IGNORECASE)
+        if m_sl_pct or m_sl_abs:
+            if m_sl_pct:
+                sign = m_sl_pct.group(1)
+                try:
+                    pct = float(m_sl_pct.group(2))
+                except Exception:
+                    await reply_md("Formato SL: `sl +5`, `sl -2` o `sl 105000`")
+                    return True
+                pct_signed = (+pct if sign == "+" else (-pct if sign == "-" else -pct))
+                update_protection_defaults(
+                    symbol_conf,
+                    sl_last_kind="pct",
+                    sl_pct_equity=pct_signed,
+                    sl_price=None,
+                )
+                await reply_md(
+                    f"✅ SL predeterminado guardado: {pct_signed:+.2f}% del equity (se aplicará al próximo trade)."
+                )
+            else:
+                try:
+                    raw = m_sl_abs.group(1)  # type: ignore[union-attr]
+                    target = float(str(raw).replace(".", "").replace(",", "."))
+                except Exception:
+                    await reply_md("Formato SL: `sl +5`, `sl -2` o `sl 105000`")
+                    return True
+                update_protection_defaults(
+                    symbol_conf,
+                    sl_last_kind="price",
+                    sl_price=target,
+                    sl_pct_equity=None,
+                )
+                await reply_md(
+                    f"✅ SL predeterminado guardado en {_num(target)} (se aplicará al próximo trade)."
+                )
+            return True
+
+        if re.match(r"^/?tp\s*$", text_raw, re.IGNORECASE):
+            stored_kind = defaults.get("tp_last_kind")
+            if stored_kind == "pct" and defaults.get("tp_pct_equity") not in (None, ""):
+                pct_val = float(defaults["tp_pct_equity"])
+                await reply_md(f"TP predeterminado: {pct_val:+.2f}% del equity")
+            elif stored_kind == "price" and defaults.get("tp_price") not in (None, ""):
+                await reply_md(f"TP predeterminado: {_num(defaults['tp_price'])}")
+            else:
+                await reply_md("TP predeterminado: —")
+            await reply_md("Uso: `tp +5` o `tp 109000`")
+            return True
+
+        m_tp_pct = re.match(r"^/?tp\s*([+\-]?)(\d+(?:\.\d+)?)%?\s*$", text_raw, re.IGNORECASE)
+        m_tp_abs = None
+        if not m_tp_pct:
+            m_tp_abs = re.match(r"^/?tp\s*\$?\s*(\d+(?:\.\d+)?)\s*$", text_raw, re.IGNORECASE)
+        if m_tp_pct or m_tp_abs:
+            if m_tp_pct:
+                sign = m_tp_pct.group(1)
+                try:
+                    pct = float(m_tp_pct.group(2))
+                except Exception:
+                    await reply_md("Formato TP: `tp +5` o `tp 109000`")
+                    return True
+                pct_signed = (+pct if sign == "+" else (-pct if sign == "-" else +pct))
+                update_protection_defaults(
+                    symbol_conf,
+                    tp_last_kind="pct",
+                    tp_pct_equity=pct_signed,
+                    tp_price=None,
+                )
+                await reply_md(
+                    f"✅ TP predeterminado guardado: {pct_signed:+.2f}% del equity (se aplicará al próximo trade)."
+                )
+            else:
+                try:
+                    raw = m_tp_abs.group(1)  # type: ignore[union-attr]
+                    target = float(str(raw).replace(".", "").replace(",", "."))
+                except Exception:
+                    await reply_md("Formato TP: `tp +5` o `tp 109000`")
+                    return True
+                update_protection_defaults(
+                    symbol_conf,
+                    tp_last_kind="price",
+                    tp_price=target,
+                    tp_pct_equity=None,
+                )
+                await reply_md(
+                    f"✅ TP predeterminado guardado en {_num(target)} (se aplicará al próximo trade)."
+                )
+            return True
+
         return False
 
-    lower = text.lower()
     qty_abs = float(position.get("qty") or 0.0)
     entry = float(position.get("entry") or 0.0)
     side_now = position["side"]
-    symbol_norm = position["symbol"]
-    symbol_conf = position.get("symbol_conf", symbol_norm)
     exchange = getattr(engine, "exchange", None)
 
     trader = getattr(engine, "trader", None)
@@ -1073,6 +1198,20 @@ async def _handle_position_controls(engine, reply_md, text: str) -> bool:
         try:
             broker.update_protections(symbol_norm, side_now, qty_abs, sl=target)
             update_open_position(symbol_conf, sl=target)
+            if m_sl_pct:
+                update_protection_defaults(
+                    symbol_conf,
+                    sl_last_kind="pct",
+                    sl_pct_equity=pct_signed,
+                    sl_price=None,
+                )
+            else:
+                update_protection_defaults(
+                    symbol_conf,
+                    sl_last_kind="price",
+                    sl_price=target,
+                    sl_pct_equity=None,
+                )
         except Exception as exc:
             await reply_md(f"No pude actualizar SL: {exc}")
             return True
@@ -1169,6 +1308,20 @@ async def _handle_position_controls(engine, reply_md, text: str) -> bool:
         try:
             broker.update_protections(symbol_norm, side_now, qty_abs, tp=target)
             update_open_position(symbol_conf, tp=target)
+            if m_tp_pct:
+                update_protection_defaults(
+                    symbol_conf,
+                    tp_last_kind="pct",
+                    tp_pct_equity=pct_signed,
+                    tp_price=None,
+                )
+            else:
+                update_protection_defaults(
+                    symbol_conf,
+                    tp_last_kind="price",
+                    tp_price=target,
+                    tp_pct_equity=None,
+                )
         except Exception as exc:
             await reply_md(f"No pude actualizar TP: {exc}")
             return True
@@ -1376,7 +1529,8 @@ async def _cmd_open(engine, reply, raw_txt):
     side_txt = m.group(1).upper()   # LONG/SHORT
     lev      = int(m.group(2))
     cfg      = getattr(engine, "config", {}) or {}
-    symbol   = _sym(cfg.get("symbol"))
+    symbol_conf = cfg.get("symbol", "BTC/USDT")
+    symbol   = _sym(symbol_conf)
     side     = "BUY" if side_txt=="LONG" else "SELL"
 
     exchange = getattr(engine, "exchange", None)
@@ -1480,11 +1634,56 @@ async def _cmd_open(engine, reply, raw_txt):
             tp = tp or (entry_price * (1 - tp_pct_f))
             sl = sl or (entry_price * (1 + sl_pct_f))
 
+    defaults = get_protection_defaults(symbol_conf)
+    qty_abs = abs(float(qty))
+    if sl is None and qty_abs > 0:
+        if defaults.get("sl_last_kind") == "pct" and defaults.get("sl_pct_equity") not in (None, "") and eq > 0:
+            try:
+                pct_val = float(defaults.get("sl_pct_equity"))
+                sl = _target_from_equity_pct(entry_price, qty_abs, eq, side_txt, pct_val)
+            except Exception:
+                logger.debug("open_command: no se pudo aplicar SL % por defecto", exc_info=True)
+        elif defaults.get("sl_last_kind") == "price" and defaults.get("sl_price") not in (None, ""):
+            try:
+                sl = float(defaults.get("sl_price"))
+            except Exception:
+                logger.debug("open_command: SL precio por defecto inválido", exc_info=True)
+    if tp is None and qty_abs > 0:
+        if defaults.get("tp_last_kind") == "pct" and defaults.get("tp_pct_equity") not in (None, "") and eq > 0:
+            try:
+                pct_val = float(defaults.get("tp_pct_equity"))
+                tp = _target_from_equity_pct(entry_price, qty_abs, eq, side_txt, pct_val)
+            except Exception:
+                logger.debug("open_command: no se pudo aplicar TP % por defecto", exc_info=True)
+        elif defaults.get("tp_last_kind") == "price" and defaults.get("tp_price") not in (None, ""):
+            try:
+                tp = float(defaults.get("tp_price"))
+            except Exception:
+                logger.debug("open_command: TP precio por defecto inválido", exc_info=True)
+
+    tp_price = float(tp) if tp is not None else None
+    sl_price = float(sl) if sl is not None else None
+
+    backend_broker = getattr(trading, "BROKER", None)
+    changes: dict[str, float] = {}
+    if tp_price is not None:
+        changes["tp"] = tp_price
+    if sl_price is not None:
+        changes["sl"] = sl_price
+    if backend_broker is not None and qty_abs > 0 and changes:
+        try:
+            backend_broker.update_protections(symbol, side_txt, qty_abs, tp=tp_price, sl=sl_price)
+        except Exception:
+            logger.debug("open_command: no se pudo fijar protecciones por defecto", exc_info=True)
+    if changes:
+        try:
+            update_open_position(symbol_conf, **changes)
+        except Exception:
+            logger.debug("open_command: no se pudo persistir protecciones en state_store", exc_info=True)
+
     # ======= Mensaje final claro =======
     margin = float(effective_equity)
     notional = float(qty) * float(entry_price)
-    tp_price = float(tp) if tp is not None else None
-    sl_price = float(sl) if sl is not None else None
     latency_ms = 0
 
     return await reply(

@@ -70,4 +70,62 @@ def set_equity_sim(value: float) -> None:
     _save_state(state)
 
 
-__all__ = ["get_mode", "set_mode", "get_equity_sim", "set_equity_sim"]
+def _symbol_key(symbol: str) -> str:
+    return str(symbol or "BTCUSDT").replace("/", "").upper()
+
+
+def get_protection_defaults(symbol: str) -> Dict[str, Any]:
+    """Return persisted TP/SL defaults for the given symbol (if any)."""
+
+    state = _load_state()
+    protections = state.get("protections", {})
+    if not isinstance(protections, dict):
+        return {}
+    entry = protections.get(_symbol_key(symbol), {})
+    return dict(entry) if isinstance(entry, dict) else {}
+
+
+def update_protection_defaults(symbol: str, **changes: Any) -> Dict[str, Any]:
+    """Persist TP/SL defaults for the next manual trade."""
+
+    state = _load_state()
+    protections = state.setdefault("protections", {})
+    if not isinstance(protections, dict):
+        protections = {}
+        state["protections"] = protections
+
+    key = _symbol_key(symbol)
+    current = dict(protections.get(key) or {})
+
+    mutated = False
+    for field, value in changes.items():
+        if value is None:
+            if field in current:
+                current.pop(field, None)
+                mutated = True
+            continue
+        try:
+            current[field] = float(value) if isinstance(value, (int, float)) else value
+        except Exception:
+            current[field] = value
+        mutated = True
+
+    if current:
+        protections[key] = current
+    elif key in protections:
+        protections.pop(key, None)
+        mutated = True
+
+    if mutated:
+        _save_state(state)
+    return dict(protections.get(key, {}))
+
+
+__all__ = [
+    "get_mode",
+    "set_mode",
+    "get_equity_sim",
+    "set_equity_sim",
+    "get_protection_defaults",
+    "update_protection_defaults",
+]
