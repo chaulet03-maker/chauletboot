@@ -923,21 +923,64 @@ async def _cmd_open(engine, reply, raw_txt):
     except Exception as e:
         return await reply(f"Fallo al abrir: {e}")
 
+    entry_price = float(
+        res.get("price") if isinstance(res, dict) and res.get("price") is not None else px
+    )
+
     try:
         # Enganchá TP/SL de tu estrategia (si tenés método)
         strategy = getattr(engine, "strategy", None)
         attach = getattr(strategy, "attach_tp_sl", None)
         if callable(attach):
-            entry_price = float(
-                res.get("price") if isinstance(res, dict) and res.get("price") is not None else px
-            )
             maybe_coro = attach(symbol=symbol, side_txt=side_txt, entry_price=entry_price)
             if inspect.isawaitable(maybe_coro):
                 await maybe_coro
     except Exception:
         pass
 
-    return await reply(f"🟢 OPEN {side_txt} x{lev} | {symbol}\nqty: {qty:.6f} @~{float(px):.2f}\nGestionada por la estrategia (TP/SL activos).")
+    # ======= TP / SL (intento 1: que la estrategia los devuelva) =======
+    tp = sl = None
+    try:
+        strategy = getattr(engine, "strategy", None)
+        attach = getattr(strategy, "attach_tp_sl", None)
+        if callable(attach):
+            out = attach(symbol=symbol, side_txt=side_txt, entry_price=entry_price, return_levels=True)
+            out = await out if inspect.isawaitable(out) else out
+            if isinstance(out, dict):
+                tp = out.get("tp") or out.get("tp_price") or out.get("take_profit")
+                sl = out.get("sl") or out.get("sl_price") or out.get("stop_loss")
+    except Exception:
+        pass
+
+    # ======= TP / SL (fallback por config si no hay niveles de la estrategia) =======
+    from bot.settings_utils import get_val, read_config_raw
+    from config import S
+
+    raw_cfg = read_config_raw()
+    tp_pct = get_val(S, raw_cfg, "tp_pct", default=None)   # ej: 0.01  -> 1%
+    sl_pct = get_val(S, raw_cfg, "sl_pct", default=None)   # ej: 0.005 -> 0.5%
+    if (tp is None or sl is None) and isinstance(tp_pct, (int, float)) and isinstance(sl_pct, (int, float)):
+        if side_txt == "LONG":
+            tp = tp or (entry_price * (1 + float(tp_pct)))
+            sl = sl or (entry_price * (1 - float(sl_pct)))
+        else:
+            tp = tp or (entry_price * (1 - float(tp_pct)))
+            sl = sl or (entry_price * (1 + float(sl_pct)))
+
+    # ======= Mensaje final claro =======
+    tp_txt = f"${tp:,.2f}" if tp is not None else "—"
+    sl_txt = f"${sl:,.2f}" if sl is not None else "—"
+    return await reply(
+        "🟢 OPEN {side} x{lev} | {sym}\n"
+        "equity: ${eq:,.2f}\n"
+        "qty: {q:.6f} @~{p:.2f}\n"
+        "tp : {tp}\n"
+        "sl : {sl}".format(
+            side=side_txt, lev=lev, sym=symbol,
+            eq=eq, q=qty, p=entry_price,
+            tp=tp_txt, sl=sl_txt,
+        )
+    )
 
 
 async def open_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
