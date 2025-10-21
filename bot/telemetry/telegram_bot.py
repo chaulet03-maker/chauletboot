@@ -393,20 +393,31 @@ def _num(val, decimals=2):
         return str(val)
 
 
+def _parse_fraction(value) -> Optional[float]:
+    if value in (None, ""):
+        return None
+    try:
+        raw = value.strip().rstrip("%") if isinstance(value, str) else value
+        frac = float(raw)
+    except (AttributeError, TypeError, ValueError):
+        return None
+    if frac <= 0:
+        return None
+    if frac > 1:
+        frac = min(frac, 100.0) / 100.0
+    return min(frac, 1.0)
+
+
 def _get_equity_fraction(engine) -> float:
     # PRIORIDAD: ENV -> engine.config -> default
-    env = os.getenv("EQUITY_PCT")
-    if env:
-        try:
-            f = float(env)
-            if 0 < f <= 1:
-                return f
-        except Exception:
-            pass
+    env = _parse_fraction(os.getenv("EQUITY_PCT"))
+    if env is not None:
+        return env
     cfg = getattr(engine, "config", {}) or {}
     frac = cfg.get("order_sizing", {}).get("default_pct")
-    if isinstance(frac, (int, float)) and 0 < frac <= 1:
-        return float(frac)
+    parsed = _parse_fraction(frac)
+    if parsed is not None:
+        return parsed
     return 1.0
 
 def _pct_rel(entry: float, level: float) -> float:
@@ -1367,29 +1378,38 @@ async def _cmd_open(engine, reply, raw_txt):
         pass
 
     # ======= TP / SL (fallback por config si no hay niveles de la estrategia) =======
-    from bot.settings_utils import get_val, read_config_raw
+    from bot.settings_utils import read_config_raw
     from config import S
 
     raw_cfg = read_config_raw()
-    tp_pct = get_val(S, raw_cfg, "tp_pct", default=None)   # ej: 0.01  -> 1%
-    sl_pct = get_val(S, raw_cfg, "sl_pct", default=None)   # ej: 0.005 -> 0.5%
-    if (tp is None or sl is None) and isinstance(tp_pct, (int, float)) and isinstance(sl_pct, (int, float)):
+    strategy_cfg = raw_cfg.get("strategy", {}) if isinstance(raw_cfg, dict) else {}
+    tp_pct = _first_float(
+        getattr(S, "tp_pct", None),
+        raw_cfg.get("tp_pct") if isinstance(raw_cfg, dict) else None,
+        strategy_cfg.get("tp_pct") if isinstance(strategy_cfg, dict) else None,
+        default=None,
+    )
+    sl_pct = _first_float(
+        getattr(S, "sl_pct", None),
+        raw_cfg.get("sl_pct") if isinstance(raw_cfg, dict) else None,
+        strategy_cfg.get("sl_pct") if isinstance(strategy_cfg, dict) else None,
+        default=None,
+    )
+    if (tp is None or sl is None) and tp_pct is not None and sl_pct is not None:
+        tp_pct_f = float(tp_pct)
+        sl_pct_f = float(sl_pct)
         if side_txt == "LONG":
-            tp = tp or (entry_price * (1 + float(tp_pct)))
-            sl = sl or (entry_price * (1 - float(sl_pct)))
+            tp = tp or (entry_price * (1 + tp_pct_f))
+            sl = sl or (entry_price * (1 - sl_pct_f))
         else:
-            tp = tp or (entry_price * (1 - float(tp_pct)))
-            sl = sl or (entry_price * (1 + float(sl_pct)))
+            tp = tp or (entry_price * (1 - tp_pct_f))
+            sl = sl or (entry_price * (1 + sl_pct_f))
 
     # ======= Mensaje final claro =======
-    try:
-        margin = float(engine.trader.equity()) if hasattr(engine, "trader") else float(eq)
-    except Exception:
-        margin = float(eq)
-    notional = float(qty) * float(entry_price) * max(1, lev)
-    tp1 = float(tp or 0.0)
-    tp2 = tp1
-    slv = float(sl or 0.0)
+    margin = float(effective_equity)
+    notional = float(qty) * float(entry_price)
+    tp_price = float(tp) if tp is not None else None
+    sl_price = float(sl) if sl is not None else None
     latency_ms = 0
 
     return await reply(
@@ -1400,9 +1420,9 @@ async def _cmd_open(engine, reply, raw_txt):
             lev,
             notional,
             float(entry_price),
-            tp1,
-            tp2,
-            slv,
+            tp_price,
+            None,
+            sl_price,
             "MARKET",
             latency_ms,
         )
