@@ -1606,6 +1606,7 @@ async def _cmd_open(engine, reply, raw_txt):
 
     exchange = getattr(engine, "exchange", None)
     broker = getattr(engine, "broker", None)
+    trader = getattr(engine, "trader", None)
     if exchange is None or broker is None:
         return await reply("No pude obtener acceso a exchange/broker para abrir.")
 
@@ -1619,11 +1620,20 @@ async def _cmd_open(engine, reply, raw_txt):
 
     # equity para sizing (como pediste: el que seteás con 'equity', en ambos modos)
     try:
-        eq = float(engine.trader.equity())
+        eq = float(trader.equity()) if trader is not None else 0.0
     except Exception:
         eq = 0.0
+
+    if eq <= 0 and trader is not None:
+        try:
+            refreshed = await trader.get_balance(exchange)
+            if refreshed is not None:
+                eq = float(refreshed)
+        except Exception:
+            logger.debug("open_command: no se pudo refrescar equity desde el exchange", exc_info=True)
+
     if eq <= 0:
-        return await reply("Equity = 0. Setealo con: equity 1200")
+        return await reply(f"Equity = ${eq:,.2f}")
 
     fraction = float(_get_equity_fraction(engine))
     if not (0.0 < fraction <= 1.0):
