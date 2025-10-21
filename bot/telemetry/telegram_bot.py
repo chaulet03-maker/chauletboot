@@ -197,6 +197,17 @@ def _pcts_for_target(entry: float, target: float, qty_abs: float, equity: float,
     return price_pct, pnl_pct_equity
 
 
+def _first_float_optional(*values):
+    for value in values:
+        if value in (None, ""):
+            continue
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
 def _build_bot_position_message(*, engine, symbol, qty, avg, mark_val) -> str:
     try:
         qty_val = float(qty)
@@ -274,6 +285,13 @@ def _build_bot_position_message(*, engine, symbol, qty, avg, mark_val) -> str:
     except Exception:
         pass
 
+    try:
+        defaults = get_protection_defaults(symbol) or {}
+    except Exception:
+        defaults = {}
+
+    cfg = getattr(engine, "config", {}) or {}
+
     trader = getattr(engine, "trader", None)
     try:
         equity = float(trader.equity()) if trader is not None else 0.0
@@ -307,25 +325,11 @@ def _build_bot_position_message(*, engine, symbol, qty, avg, mark_val) -> str:
             f"({price_move_pct:+.2f}% vs entrada | PnL {pnl_pct_equity:+.2f}%)"
         )
 
-    if tp_price is None:
-        entry_for_tp = avg_val
-        if entry_for_tp <= 0 and isinstance(pos_state, dict):
-            try:
-                entry_for_tp = float((pos_state or {}).get("entry_price") or 0.0)
-            except Exception:
-                entry_for_tp = avg_val
+    entry_for_tp = avg_val
+    if entry_for_tp <= 0 and isinstance(pos_state, dict):
+        entry_for_tp = _first_float_optional((pos_state or {}).get("entry_price"), avg_val) or 0.0
 
-        def _first_float_optional(*values):
-            for value in values:
-                if value in (None, ""):
-                    continue
-                try:
-                    return float(value)
-                except (TypeError, ValueError):
-                    continue
-            return None
-
-        cfg = getattr(engine, "config", {}) or {}
+    if tp_price is None and entry_for_tp > 0:
         tp_pct_candidates = []
         if isinstance(pos_state, dict):
             tp_pct_candidates.append(pos_state.get("tp_pct"))
@@ -345,7 +349,7 @@ def _build_bot_position_message(*, engine, symbol, qty, avg, mark_val) -> str:
                 tp_pct_candidates.append(strat_cfg.get("tp_pct"))
 
         tp_pct_val = _first_float_optional(*tp_pct_candidates)
-        if entry_for_tp > 0 and tp_pct_val is not None:
+        if tp_pct_val is not None:
             tp_pct_f = abs(tp_pct_val)
             if tp_pct_f > 1:
                 tp_pct_f = min(tp_pct_f, 100.0) / 100.0
@@ -354,6 +358,41 @@ def _build_bot_position_message(*, engine, symbol, qty, avg, mark_val) -> str:
                     tp_price = entry_for_tp * (1 - tp_pct_f)
                 else:
                     tp_price = entry_for_tp * (1 + tp_pct_f)
+
+    if tp_price is None and entry_for_tp > 0:
+        lev_key = str(int(lev)) if lev else "1"
+        tp_pct_by_lev = {}
+        if isinstance(cfg, dict):
+            raw_map = cfg.get("tp_eq_pct_by_leverage")
+            if isinstance(raw_map, dict):
+                tp_pct_by_lev = raw_map
+        kind = str(defaults.get("tp_last_kind") or "pct").lower()
+        if kind == "price":
+            tp_price = _first_float_optional(defaults.get("tp_price"))
+        else:
+            tp_pct = _first_float_optional(
+                defaults.get("tp_pct_equity"),
+                defaults.get("tp_pct"),
+                tp_pct_by_lev.get(lev_key) if tp_pct_by_lev else None,
+            )
+            if tp_pct is not None:
+                tp_price = _target_from_price_pct(entry_for_tp, side, float(tp_pct))
+
+    entry_for_sl = avg_val
+    if entry_for_sl <= 0 and isinstance(pos_state, dict):
+        entry_for_sl = _first_float_optional((pos_state or {}).get("entry_price"), avg_val) or 0.0
+
+    if sl_price is None and entry_for_sl > 0:
+        kind = str(defaults.get("sl_last_kind") or "pct").lower()
+        if kind == "price":
+            sl_price = _first_float_optional(defaults.get("sl_price"))
+        else:
+            sl_pct = _first_float_optional(
+                defaults.get("sl_pct_equity"),
+                defaults.get("sl_pct"),
+            )
+            if sl_pct is not None:
+                sl_price = _target_from_price_pct(entry_for_sl, side, float(sl_pct))
 
     tp_line = _line_tp_sl("TP", tp_price)
     sl_line = _line_tp_sl("SL", sl_price)

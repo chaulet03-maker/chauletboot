@@ -17,6 +17,9 @@ DEFAULT_STATE: Dict[str, Any] = {
     "realized_pnl": 0.0,
     "fees": 0.0,
     "mark": 0.0,
+    "tp": None,
+    "sl": None,
+    "leverage": 1,
     "updated": 0,
 }
 
@@ -70,7 +73,9 @@ class PaperStore:
         except json.JSONDecodeError:
             data = {}
         state = dict(DEFAULT_STATE)
-        state.update({k: v for k, v in data.items() if k in state})
+        for key, value in (data or {}).items():
+            if key in DEFAULT_STATE or key in {"tp", "sl"}:
+                state[key] = value
         if state.get("equity") is None:
             state["equity"] = self.start_equity
         return state

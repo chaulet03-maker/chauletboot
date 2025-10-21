@@ -245,6 +245,36 @@ def place_order_safe(side: str, qty: float, price: float | None = None, **kwargs
                     logging.info("paper refresh -> %s", POSITION_SERVICE.get_status())
                 except Exception:
                     logging.warning("paper refresh falló (store)", exc_info=True)
+                try:
+                    inferred_price_sim = _infer_fill_price(result, price)
+                    if inferred_price_sim is None:
+                        state_data = result.get("state") if isinstance(result, dict) else None
+                        if isinstance(state_data, Mapping):
+                            try:
+                                inferred_price_sim = float(state_data.get("avg_price") or 0.0)
+                            except Exception:
+                                inferred_price_sim = None
+                    if inferred_price_sim in (None, 0.0):
+                        try:
+                            inferred_price_sim = float(price or 0.0)
+                        except Exception:
+                            inferred_price_sim = 0.0
+                    fee_paid = _extract_order_fee(result)
+                    on_open_filled(
+                        symbol,
+                        "LONG" if str(side).upper() in {"BUY", "LONG"} else "SHORT",
+                        float(qty),
+                        float(inferred_price_sim or 0.0),
+                        lev_value,
+                        tp=tp_value,
+                        sl=sl_value,
+                        mode=mode_label,
+                        fee=fee_paid,
+                    )
+                    if inferred_price_sim:
+                        inferred_price = inferred_price_sim
+                except Exception:
+                    logger.debug("PAPER: on_open_filled() falló", exc_info=True)
             else:
                 fill_price = _infer_fill_price(result, price)
                 if fill_price is not None:
