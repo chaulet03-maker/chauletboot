@@ -86,7 +86,12 @@ def get_ccxt():
         client.set_sandbox_mode(True)
 
     try:
-        client.load_markets()
+        # Binance USD-M futures keys can fail on the SAPI endpoint used by
+        # ``fetch_currencies`` which ccxt calls by default inside
+        # ``load_markets``. Skipping currencies avoids hitting that endpoint
+        # and prevents AuthenticationError (-1022) when only futures
+        # permissions are enabled.
+        client.load_markets(params={"fetchCurrencies": False})
         logger.info("Cliente CCXT (binanceusdm) inicializado OK.")
     except Exception:
         logger.exception("No pude inicializar CCXT binanceusdm")
