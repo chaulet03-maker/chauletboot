@@ -144,10 +144,35 @@ def ensure_position_mode(hedged: bool) -> None:
         logger.info("Position mode ya era %s", "HEDGE" if target else "ONE-WAY")
         return
 
+    def _retry_with_time_sync(exc: Exception) -> bool:
+        """Try to resync the Binance clock when signature issues appear."""
+
+        message = str(exc)
+        if "-1022" not in message and "Signature" not in message:
+            return False
+        if not hasattr(client, "load_time_difference"):
+            return False
+        try:
+            logger.info(
+                "Reintentando set_position_mode tras sincronizar tiempo por error de firma"
+            )
+            client.load_time_difference()
+            client.set_position_mode(target)
+            return True
+        except Exception:
+            logger.warning(
+                "Reintento de set_position_mode tras sincronizar tiempo falló",
+                exc_info=True,
+            )
+            return False
+
     try:
         client.set_position_mode(target)
         logger.info("Position mode seteado a %s", "HEDGE" if target else "ONE-WAY")
-    except Exception:
+    except Exception as exc:
+        if _retry_with_time_sync(exc):
+            logger.info("Position mode seteado a %s", "HEDGE" if target else "ONE-WAY")
+            return
         logger.warning("No pude setear position mode", exc_info=True)
         raise
 
