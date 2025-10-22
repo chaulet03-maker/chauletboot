@@ -35,6 +35,60 @@ from risk_guards import (
 )
 from reanudar_listener import listen_reanudar
 
+
+def _compute_order_qty_from_equity(
+    equity_usdt: float,
+    price: float,
+    leverage: float,
+    risk_pct: float = 1.0,
+) -> float:
+    try:
+        eq = float(equity_usdt)
+        px = float(price)
+        lev = float(leverage)
+        risk = float(risk_pct)
+    except Exception:
+        return 0.0
+    if eq <= 0 or px <= 0 or risk <= 0 or lev <= 0:
+        return 0.0
+    notional = eq * risk * lev
+    return notional / px
+
+
+def _quantize_amount(
+    filters: Optional[Dict[str, float]],
+    raw_qty: float,
+    price: Optional[float] = None,
+) -> float:
+    try:
+        qty = float(raw_qty)
+    except Exception:
+        return 0.0
+    if qty <= 0 or not math.isfinite(qty):
+        return 0.0
+    if not filters:
+        return qty
+
+    step = float(filters.get("stepSize", 0.0) or 0.0)
+    min_qty = float(filters.get("minQty", 0.0) or 0.0)
+    min_notional = float(filters.get("minNotional", 0.0) or 0.0)
+
+    if step > 0:
+        qty = math.floor(qty / step) * step
+
+    if min_qty > 0 and qty < min_qty:
+        return 0.0
+
+    if min_notional > 0 and price is not None:
+        try:
+            if qty * float(price) < min_notional:
+                return 0.0
+        except Exception:
+            return 0.0
+
+    return qty
+
+
 class _EngineBrokerAdapter:
     def __init__(self, app: "TradingApp"):
         self.app = app
@@ -1006,14 +1060,23 @@ class TradingApp:
                 _emit_motive({"reasons": ["exchange_error: precio de entrada no disponible"]}, side_value=signal)
                 return
             entry_price = float(entry_price)
-            qty = (eq_on_open * leverage) / max(entry_price, 1e-12)
+            raw_qty = _compute_order_qty_from_equity(eq_on_open, entry_price, leverage)
+            filters = await self.exchange.get_symbol_filters(
+                self.config.get("symbol", "BTC/USDT")
+            )
+            qty = _quantize_amount(filters, raw_qty, entry_price)
             if qty <= 0:
-                logging.warning(
-                    "Qty=0: eq=%.2f lev=%.2f px=%.2f → no se abre.",
-                    eq_on_open,
-                    leverage,
-                    entry_price,
+                reason = (
+                    f"Equity insuficiente o stepSize/minNotional demasiado altos. "
+                    f"equity={eq_on_open:.2f} raw_qty={raw_qty:.8f}"
                 )
+                logging.warning("Qty=0 tras cuantización: %s", reason)
+                try:
+                    await self.notifier.send(
+                        f"⚠️ No se pudo abrir posición: {reason}"
+                    )
+                except Exception:
+                    logging.debug("No se pudo notificar fallo de qty=0", exc_info=True)
                 return
 
             sl_price = self.strategy.calculate_sl(entry_price, last_candle, signal, eq_on_open)

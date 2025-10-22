@@ -15,6 +15,115 @@ from bot.exchanges.binance_filters import build_filters
 
 logger = logging.getLogger(__name__)
 
+_CCXT = None
+
+
+def _to_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def reset_ccxt_client() -> None:
+    """Reset the shared CCXT client (mainly for tests or mode switches)."""
+
+    global _CCXT
+    _CCXT = None
+
+
+def get_ccxt():
+    """Return a singleton CCXT client authenticated for Binance USD-M futures."""
+
+    global _CCXT
+    if _CCXT is not None:
+        return _CCXT
+
+    api_key = (
+        os.getenv("BINANCE_API_KEY")
+        or os.getenv("BINANCE_FUTURES_API_KEY")
+        or os.getenv("BINANCE_API_KEY_REAL")
+        or getattr(S, "binance_api_key", "")
+    )
+    secret = (
+        os.getenv("BINANCE_API_SECRET")
+        or os.getenv("BINANCE_FUTURES_API_SECRET")
+        or os.getenv("BINANCE_API_SECRET_REAL")
+        or getattr(S, "binance_api_secret", "")
+    )
+    if not api_key or not secret:
+        raise RuntimeError(
+            "Faltan credenciales BINANCE_API_KEY / BINANCE_API_SECRET para inicializar CCXT"
+        )
+
+    options: Dict[str, Any] = {
+        "defaultType": "future",
+        "adjustForTimeDifference": True,
+    }
+
+    hedge_hint = getattr(S, "hedge_mode", None)
+    if hedge_hint is None:
+        hedge_hint = getattr(S, "hedgeMode", None)
+    if hedge_hint is not None:
+        options["hedgeMode"] = _to_bool(hedge_hint)
+
+    client = ccxt.binanceusdm(
+        {
+            "apiKey": api_key,
+            "secret": secret,
+            "enableRateLimit": True,
+            "options": options,
+            "timeout": 15000,
+        }
+    )
+
+    use_testnet = _to_bool(
+        os.getenv("BINANCE_UMFUTURES_TESTNET")
+        or getattr(S, "binance_umfutures_testnet", None)
+    )
+    if use_testnet and hasattr(client, "set_sandbox_mode"):
+        client.set_sandbox_mode(True)
+
+    try:
+        client.load_markets()
+        logger.info("Cliente CCXT (binanceusdm) inicializado OK.")
+    except Exception:
+        logger.exception("No pude inicializar CCXT binanceusdm")
+        raise
+
+    _CCXT = client
+    return _CCXT
+
+
+def ensure_position_mode(hedged: bool) -> None:
+    """Ensure the account position mode matches *hedged* (True = Hedge)."""
+
+    client = get_ccxt()
+    current = None
+    try:
+        resp = client.fapiPrivateGetPositionSideDual()
+        raw_value = resp.get("dualSidePosition") if isinstance(resp, dict) else None
+        if isinstance(raw_value, bool):
+            current = raw_value
+        elif raw_value is not None:
+            current = _to_bool(raw_value)
+    except Exception:
+        logger.debug("No pude leer PositionSideDual", exc_info=True)
+        current = None
+
+    target = bool(hedged)
+    if current is not None and current == target:
+        logger.info("Position mode ya era %s", "HEDGE" if target else "ONE-WAY")
+        return
+
+    try:
+        client.set_position_mode(target)
+        logger.info("Position mode seteado a %s", "HEDGE" if target else "ONE-WAY")
+    except Exception:
+        logger.warning("No pude setear position mode", exc_info=True)
+        raise
+
 
 class Exchange:
     def __init__(self, cfg):
@@ -271,13 +380,6 @@ class Exchange:
 
         return True
 
-    def _credentials_available(self) -> bool:
-        return (
-            (not S.PAPER)
-            and bool(getattr(S, "binance_api_key", None))
-            and bool(getattr(S, "binance_api_secret", None))
-        )
-
     def _new_usdm_client(self):
         exchange_cfg = self.config.get("exchange") if isinstance(self.config, Mapping) else None
 
@@ -306,30 +408,44 @@ class Exchange:
             client.set_sandbox_mode(True)
         return client
 
+    def _apply_client_options(self, client: Any) -> None:
+        if client is None:
+            return
+        try:
+            opts = getattr(client, "options", {}) or {}
+            opts["defaultType"] = "future"
+            opts["adjustForTimeDifference"] = True
+            opts["hedgeMode"] = bool(self._hedge_mode)
+            client.options = opts
+        except Exception:
+            logger.debug("No se pudieron aplicar opciones al cliente CCXT", exc_info=True)
+
     async def upgrade_to_real_if_needed(self):
         """Si cambiaste a REAL y este Exchange sigue 'público', lo reautentico en caliente."""
-        if not self._credentials_available():
+        if S.PAPER:
             return
         if self.is_authenticated and getattr(self.client, "apiKey", None):
             return
         try:
-            client = self._new_usdm_client()
-            client.apiKey = S.binance_api_key
-            client.secret = S.binance_api_secret
-            await asyncio.to_thread(client.load_markets)
-            self.client = client
-            self.public_client = client
-            self.is_authenticated = True
-            logger.info("Cliente CCXT actualizado a AUTENTICADO tras cambio de modo.")
-            self._stop_price_stream()
-            self._start_price_stream()
+            client = get_ccxt()
         except Exception:
             logger.warning("No pude reautenticar CCXT tras cambio a REAL.", exc_info=True)
+            return
+
+        self._apply_client_options(client)
+        self.client = client
+        self.public_client = client
+        self.is_authenticated = True
+        logger.info("Cliente CCXT actualizado a AUTENTICADO tras cambio de modo.")
+        self._stop_price_stream()
+        self._start_price_stream()
 
     async def downgrade_to_paper(self):
         """Vuelve a modo paper: cliente público sin credenciales."""
         try:
+            reset_ccxt_client()
             client = self._new_usdm_client()
+            self._apply_client_options(client)
             self.client = client
             self.public_client = client
             self.is_authenticated = False
@@ -343,30 +459,29 @@ class Exchange:
         """ Configura e inicializa el cliente del exchange. """
         self.is_authenticated = False  # Bandera de estado
 
-        if not self._credentials_available():
+        if S.PAPER:
             client = self._new_usdm_client()
+            self._apply_client_options(client)
             self.public_client = client
             return client
 
         try:
-            client = self._new_usdm_client()
-            client.apiKey = S.binance_api_key
-            client.secret = S.binance_api_secret
-            client.load_markets()
-            self.is_authenticated = True
-            logger.info("Cliente de CCXT AUTENTICADO e inicializado correctamente.")
-            return client
-
-        except Exception as e:
+            client = get_ccxt()
+        except Exception as exc:
             logger.warning(
-                "ADVERTENCIA: Fallo de autenticación. El bot operará en modo SÓLO LECTURA. Error: %s",
-                e,
+                "ADVERTENCIA: Fallo de autenticación CCXT. El bot operará en modo SÓLO LECTURA. Error: %s",
+                exc,
             )
             logger.warning("Verifique las claves de Testnet en su archivo .env.")
+            client = self._new_usdm_client()
+            self._apply_client_options(client)
+            self.public_client = client
+            return client
 
-            public_client = self._new_usdm_client()
-            self.public_client = public_client
-            return public_client
+        self._apply_client_options(client)
+        self.public_client = client
+        self.is_authenticated = True
+        return client
 
     @property
     def hedge_mode(self) -> bool:
@@ -390,25 +505,9 @@ class Exchange:
             )
             return
 
-        await self._ensure_auth_for_private()
-
         hedged = not bool(one_way)
         try:
-            client = self.client
-            if hasattr(client, "set_position_mode"):
-                await asyncio.to_thread(client.set_position_mode, hedged)
-                return
-            if hasattr(client, "setPositionMode"):
-                await asyncio.to_thread(client.setPositionMode, hedged)
-                return
-
-            request = {"dualSidePosition": "true" if hedged else "false"}
-            rest_method = getattr(client, "fapiPrivate_post_positionside_dual", None)
-            if rest_method is None:
-                rest_method = getattr(client, "fapiPrivatePostPositionSideDual", None)
-            if rest_method is None:
-                raise AttributeError("Método PositionSideDual no disponible en el cliente CCXT")
-            await asyncio.to_thread(rest_method, request)
+            await asyncio.to_thread(ensure_position_mode, hedged)
         except OperationRejected as exc:
             message = str(exc)
             if "-4059" in message or "No need to change position side" in message:
@@ -630,6 +729,12 @@ class Exchange:
         price = await self.get_current_price(symbol)
         if price is None:
             raise RuntimeError(f"No se pudo obtener precio para ejecutar la orden de {symbol}.")
+
+        if not S.PAPER:
+            try:
+                await asyncio.to_thread(ensure_position_mode, self.hedge_mode)
+            except Exception:
+                logger.warning("No se pudo asegurar el modo de posición antes de abrir", exc_info=True)
 
         order_kwargs = dict(symbol=symbol, sl=sl_price, tp=tp_price, order_type="MARKET")
         if self.hedge_mode:

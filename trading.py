@@ -11,6 +11,7 @@ from binance_client import client_factory
 from position_service import PositionService
 from paper_store import PaperStore
 from state_store import on_close_filled, on_open_filled
+from bot.exchange import get_ccxt, reset_ccxt_client
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +55,13 @@ def _build_public_ccxt() -> Optional[Any]:
     En REAL: setea apiKey/secret y sandbox según BINANCE_UMFUTURES_TESTNET.
     En SIM: público (sin keys), pero sigue siendo UM Futures.
     """
+    if not S.PAPER:
+        try:
+            return get_ccxt()
+        except Exception as exc:
+            logger.warning("No se pudo construir ccxt/binanceusdm autenticado: %s", exc)
+            return None
+
     try:
         import ccxt  # type: ignore
     except ImportError:
@@ -79,17 +87,13 @@ def _build_public_ccxt() -> Optional[Any]:
         if _config_uses_hedge(RAW_CONFIG):
             options["hedgeMode"] = True
 
+        reset_ccxt_client()
         exchange = ccxt.binanceusdm({"enableRateLimit": True, "options": options})
-
-        from config import S
 
         use_testnet = os.getenv("BINANCE_UMFUTURES_TESTNET", "false").lower() == "true"
         if (S.PAPER or use_testnet) and hasattr(exchange, "set_sandbox_mode"):
             exchange.set_sandbox_mode(True)
 
-        if not S.PAPER:
-            exchange.apiKey = S.binance_api_key
-            exchange.secret = S.binance_api_secret
         return exchange
     except Exception as exc:
         logger.warning("No se pudo construir ccxt/binanceusdm: %s", exc)
