@@ -6,22 +6,22 @@ import time
 from typing import Any, Dict, List, Mapping, Optional
 
 import ccxt
-from ccxt.base.errors import AuthenticationError, OperationRejected
+from ccxt.base.errors import AuthenticationError, ExchangeError
 
 from config import S
-from trading import place_order_safe
 from bot.exchanges.binance_filters import build_filters
 
 
 logger = logging.getLogger(__name__)
 
 _CCXT = None
+_POSMODE_CACHE = {"known": None, "ts": 0.0, "ttl": 60.0}
 
 
-def _clean(value):
-    if value is None:
+def _clean(s):
+    if s is None:
         return ""
-    return str(value).strip().strip("\"").strip("'")
+    return str(s).strip().strip('"').strip("'").replace("\r", "").replace("\n", "")
 
 
 
@@ -43,36 +43,24 @@ def reset_ccxt_client() -> None:
 
 
 def get_ccxt():
-    """Return a singleton CCXT client authenticated for Binance USD-M futures."""
-
     global _CCXT
     if _CCXT is not None:
         return _CCXT
 
-    def _first_credential(*values):
-        for candidate in values:
-            cleaned = _clean(candidate)
-            if cleaned:
-                return cleaned
-        return ""
-
-    api_key = _first_credential(
-        os.getenv("BINANCE_API_KEY"),
-        os.getenv("BINANCE_FUTURES_API_KEY"),
-        os.getenv("BINANCE_API_KEY_REAL"),
-        getattr(S, "binance_api_key", ""),
+    api_key = _clean(
+        os.getenv("BINANCE_API_KEY")
+        or os.getenv("BINANCE_FUTURES_API_KEY")
+        or os.getenv("BINANCE_API_KEY_REAL")
+        or getattr(S, "binance_api_key", "")
     )
-    secret = _first_credential(
-        os.getenv("BINANCE_API_SECRET"),
-        os.getenv("BINANCE_FUTURES_API_SECRET"),
-        os.getenv("BINANCE_API_SECRET_REAL"),
-        getattr(S, "binance_api_secret", ""),
+    secret = _clean(
+        os.getenv("BINANCE_API_SECRET")
+        or os.getenv("BINANCE_FUTURES_API_SECRET")
+        or os.getenv("BINANCE_API_SECRET_REAL")
+        or getattr(S, "binance_api_secret", "")
     )
-
     if not api_key or not secret:
-        raise RuntimeError(
-            "Faltan credenciales BINANCE_API_KEY / BINANCE_API_SECRET para inicializar CCXT"
-        )
+        raise RuntimeError("Faltan credenciales BINANCE_API_KEY / BINANCE_API_SECRET")
 
     options: Dict[str, Any] = {
         "defaultType": "future",
@@ -84,20 +72,22 @@ def get_ccxt():
     if hedge_hint is None:
         hedge_hint = getattr(S, "hedgeMode", None)
     if hedge_hint is not None:
-        options["hedgeMode"] = _to_bool(hedge_hint)
+        try:
+            options["hedgeMode"] = bool(_to_bool(hedge_hint))
+        except Exception:
+            options["hedgeMode"] = bool(hedge_hint)
 
-    client = ccxt.binanceusdm(
+    ex = ccxt.binanceusdm(
         {
             "apiKey": api_key,
             "secret": secret,
             "enableRateLimit": True,
-            "options": options,
             "timeout": 20000,
+            "options": options,
         }
     )
-
     try:
-        client.has["fetchCurrencies"] = False
+        ex.has["fetchCurrencies"] = False
     except Exception:
         pass
 
@@ -105,84 +95,89 @@ def get_ccxt():
         os.getenv("BINANCE_UMFUTURES_TESTNET")
         or getattr(S, "binance_umfutures_testnet", None)
     )
-    if use_testnet and hasattr(client, "set_sandbox_mode"):
-        client.set_sandbox_mode(True)
+    if use_testnet and hasattr(ex, "set_sandbox_mode"):
+        try:
+            ex.set_sandbox_mode(True)
+        except Exception:
+            logger.debug("No pude activar sandbox_mode en CCXT", exc_info=True)
 
     try:
-        client.fapiPublicGetPing()
-        client.load_markets(reload=True)
         try:
-            # Sincronizar el reloj para evitar errores de firma (-1022)
-            client.load_time_difference()
+            ex.load_time_difference()
         except Exception:
-            logger.debug(
-                "No pude sincronizar tiempo con Binance al inicializar", exc_info=True
-            )
+            logger.debug("load_time_difference falló; continúo.", exc_info=True)
+        ex.load_markets(reload=True)
         logger.info("Cliente CCXT (binanceusdm) inicializado OK.")
-    except AuthenticationError:
-        logger.exception("No pude inicializar CCXT binanceusdm (Auth).")
-        raise
     except Exception:
         logger.exception("No pude inicializar CCXT binanceusdm")
         raise
 
-    _CCXT = client
+    _CCXT = ex
     return _CCXT
 
 
-def ensure_position_mode(hedged: bool) -> None:
-    """Ensure the account position mode matches *hedged* (True = Hedge)."""
+def get_position_mode_cached():
+    """True=HEDGE, False=ONE-WAY, None=desconocido (no romper si falla)."""
 
-    client = get_ccxt()
-    current = None
+    now = time.time()
+    cached = _POSMODE_CACHE.get("known")
+    cached_ts = float(_POSMODE_CACHE.get("ts", 0.0))
+    ttl = float(_POSMODE_CACHE.get("ttl", 60.0))
+    if cached is not None and (now - cached_ts) < ttl:
+        return cached
+
+    ex = get_ccxt()
     try:
-        resp = client.fapiPrivateGetPositionSideDual()
-        raw_value = resp.get("dualSidePosition") if isinstance(resp, dict) else None
-        if isinstance(raw_value, bool):
-            current = raw_value
-        elif raw_value is not None:
-            current = _to_bool(raw_value)
+        resp = ex.fapiPrivateGetPositionSideDual()
+        cur = resp.get("dualSidePosition") if isinstance(resp, dict) else None
+        if isinstance(cur, bool):
+            current = cur
+        else:
+            current = str(cur).lower() == "true"
+        _POSMODE_CACHE.update(known=current, ts=now)
+        return current
+    except AuthenticationError as e:
+        logger.warning("No puedo leer PositionSideDual (auth). No toco nada. %s", e)
     except Exception:
         logger.debug("No pude leer PositionSideDual", exc_info=True)
-        current = None
 
-    target = bool(hedged)
-    if current is not None and current == target:
-        logger.info("Position mode ya era %s", "HEDGE" if target else "ONE-WAY")
-        return
+    _POSMODE_CACHE.update(known=None, ts=now)
+    return None
 
-    def _retry_with_time_sync(exc: Exception) -> bool:
-        """Try to resync the Binance clock when signature issues appear."""
 
-        message = str(exc)
-        if "-1022" not in message and "Signature" not in message:
-            return False
-        if not hasattr(client, "load_time_difference"):
-            return False
-        try:
-            if isinstance(getattr(client, "options", None), dict):
-                client.options.setdefault("adjustForTimeDifference", True)
-            logger.info(
-                "Reintentando set_position_mode tras sincronizar tiempo por error de firma"
-            )
-            client.load_time_difference()
-            client.set_position_mode(target)
-            return True
-        except Exception:
-            logger.warning(
-                "Reintento de set_position_mode tras sincronizar tiempo falló",
-                exc_info=True,
-            )
-            return False
+def ensure_position_mode(_hedged: bool) -> bool:
+    """DEPRECATED: no fuerces el modo. Mantengo por compatibilidad: no lanza, no toca."""
 
+    cur = get_position_mode_cached()
+    if cur is None:
+        logger.info(
+            "Modo de posiciones desconocido; no lo cambio (evito /positionSide/dual)."
+        )
+        return False
+    return cur == bool(_hedged)
+
+
+def create_order_smart(symbol: str, side: str, qty: float, *, price=None, **extra_params):
+    """
+    Crea orden MARKET/limit de forma tolerante al modo:
+    - Intenta SIN positionSide (ONE-WAY compatible).
+    - Si Binance devuelve -4061 / mismatch => reintenta con positionSide=LONG/SHORT.
+    """
+
+    ex = get_ccxt()
+    side_up = str(side).upper()
+    order_type = "market" if price is None else "limit"
+    params = dict(extra_params or {})
     try:
-        client.set_position_mode(target)
-        logger.info("Position mode seteado a %s", "HEDGE" if target else "ONE-WAY")
-    except Exception as exc:
-        if _retry_with_time_sync(exc):
-            logger.info("Position mode seteado a %s", "HEDGE" if target else "ONE-WAY")
-            return
-        logger.warning("No pude setear position mode", exc_info=True)
+        return ex.create_order(symbol, order_type, side_up, qty, price, params)
+    except ExchangeError as e:
+        message = str(e)
+        if ("-4061" in message) or ("position side does not match" in message.lower()):
+            ps = "LONG" if side_up in ("BUY", "LONG") else "SHORT"
+            retry_params = dict(params)
+            retry_params["positionSide"] = ps
+            logger.info("Reintento con positionSide=%s (cuenta en HEDGE)", ps)
+            return ex.create_order(symbol, order_type, side_up, qty, price, retry_params)
         raise
 
 
@@ -568,19 +563,17 @@ class Exchange:
 
         hedged = not bool(one_way)
         try:
-            await asyncio.to_thread(ensure_position_mode, hedged)
-        except OperationRejected as exc:
-            message = str(exc)
-            if "-4059" in message or "No need to change position side" in message:
-                logger.info(
-                    "set_position_mode(one_way=%s) omitido: ya estaba configurado.",
-                    one_way,
+            matched = await asyncio.to_thread(ensure_position_mode, hedged)
+            if matched:
+                logger.debug(
+                    "Modo de posiciones ya era %s",
+                    "HEDGE" if hedged else "ONE-WAY",
                 )
-                return
-            raise
         except Exception:
-            logger.warning(
-                "set_position_mode(one_way=%s) falló", one_way, exc_info=True
+            logger.debug(
+                "ensure_position_mode(one_way=%s) falló (no crítico)",
+                one_way,
+                exc_info=True,
             )
 
     async def _ensure_auth_for_private(self):
@@ -803,6 +796,8 @@ class Exchange:
             order_kwargs["positionSide"] = (
                 "SHORT" if side_upper in {"SELL", "SHORT"} else "LONG"
             )
+
+        from trading import place_order_safe
 
         order = await asyncio.to_thread(
             place_order_safe,

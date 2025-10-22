@@ -5,6 +5,7 @@ from typing import Any, Dict, List, Optional
 
 from .order_store import OrderStore
 from .side_map import normalize_side
+from bot.exchange import ensure_position_mode
 
 @dataclass
 class Fill:
@@ -49,12 +50,9 @@ class RealExchange:
 
     async def set_position_mode(self, one_way: bool = True):
         try:
-            hedged = not one_way
-            if hasattr(self.client, "setPositionMode"):
-                return await self.client.setPositionMode(hedged)
-            return await self.client.fapiPrivate_post_positionside_dual({"dualSidePosition": "true" if hedged else "false"})
+            await asyncio.to_thread(ensure_position_mode, not bool(one_way))
         except Exception as e:
-            self.log.warning("set_position_mode failed: %s", e)
+            self.log.warning("ensure_position_mode falló: %s", e)
 
     async def set_leverage(self, symbol: str, lev: int):
         """Wrapper compatible con CCXT Python para USDM."""
