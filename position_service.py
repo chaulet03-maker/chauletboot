@@ -7,13 +7,15 @@ from typing import Any, Optional
 import brokers
 from config import S
 from paper_store import PaperStore
-from bot.exchange import get_ccxt
 
 logger = logging.getLogger(__name__)
 
 
 def _fetch_live_equity_usdm() -> float:
     """Obtiene el equity real de la cuenta de Futuros USD-M (USDT)."""
+
+    # Import lazily to avoid circular dependencies during application start-up.
+    from bot.exchange import get_ccxt
 
     client = get_ccxt()
 

@@ -11,7 +11,6 @@ from binance_client import client_factory
 from position_service import PositionService
 from paper_store import PaperStore
 from state_store import on_close_filled, on_open_filled
-from bot.exchange import get_ccxt, reset_ccxt_client
 
 logger = logging.getLogger(__name__)
 
@@ -55,6 +54,8 @@ def _build_public_ccxt() -> Optional[Any]:
     En REAL: setea apiKey/secret y sandbox según BINANCE_UMFUTURES_TESTNET.
     En SIM: público (sin keys), pero sigue siendo UM Futures.
     """
+    from bot.exchange import get_ccxt, reset_ccxt_client
+
     if not S.PAPER:
         try:
             return get_ccxt()
