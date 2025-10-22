@@ -13,7 +13,8 @@ from telegram.ext import ContextTypes
 
 from anchor_freezer import Side
 from deps import FREEZER
-from bot.exchange import Exchange, ensure_position_mode
+from bot.exchange import Exchange
+from bot.exchange_client import ensure_position_mode
 from bot.trader import Trader
 from bot.storage import Storage
 from bot.telemetry.notifier import Notifier

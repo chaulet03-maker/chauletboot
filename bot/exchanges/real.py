@@ -5,7 +5,7 @@ from typing import Any, Dict, List, Optional
 
 from .order_store import OrderStore
 from .side_map import normalize_side
-from bot.exchange import ensure_position_mode
+from bot.exchange_client import ensure_position_mode
 
 @dataclass
 class Fill:
