@@ -3,9 +3,49 @@ from dataclasses import dataclass
 from time import time as _t
 from typing import Any, Dict, List, Optional
 
+from ccxt.base.errors import ExchangeError
+
 from .order_store import OrderStore
-from .side_map import normalize_side
-from bot.exchange_client import ensure_position_mode
+
+
+async def _create_order_tolerant(
+    place_order,
+    symbol: str,
+    order_type: str,
+    side: str,
+    qty: float,
+    price: float | None = None,
+    params: Optional[dict] = None,
+    logger: Optional[logging.Logger] = None,
+):
+    """Intenta crear una orden sin ``positionSide`` y reintenta en modo hedge."""
+
+    params_dict = dict(params or {})
+    side_u = (side or "").upper()
+
+    try:
+        order = await place_order(symbol, order_type, side_u, qty, price, params_dict)
+        return order, params_dict
+    except ExchangeError as exc:
+        msg = str(exc or "").lower()
+        code = getattr(exc, "code", None)
+        mismatch = any(
+            token in msg for token in ("-4061", "position side does not match")
+        ) or code == -4061
+        if not mismatch:
+            raise
+
+        retry_params = dict(params_dict)
+        retry_params["positionSide"] = "LONG" if side_u in {"BUY", "LONG"} else "SHORT"
+
+        if logger is not None:
+            logger.debug(
+                "Reintento de orden con positionSide=%s tras mismatch de modo de posición",
+                retry_params["positionSide"],
+            )
+
+        order = await place_order(symbol, order_type, side_u, qty, price, retry_params)
+        return order, retry_params
 
 @dataclass
 class Fill:
@@ -38,6 +78,53 @@ class RealExchange:
         h = hashlib.sha1(raw.encode("utf-8")).hexdigest()[:24]
         return f"{prefix}-{h}"
 
+    def _normalize_order_side(self, side: str) -> str:
+        side_u = (side or "").upper()
+        if side_u in {"BUY", "LONG"}:
+            return "BUY"
+        if side_u in {"SELL", "SHORT"}:
+            return "SELL"
+        raise ValueError(f"Lado de orden inválido: {side}")
+
+    async def _place_order(
+        self,
+        symbol: str,
+        order_type: str,
+        side: str,
+        qty: float,
+        price: float | None,
+        params: Optional[dict] = None,
+    ):
+        return await self._place(
+            self.client.create_order,
+            symbol,
+            order_type,
+            side,
+            qty,
+            price,
+            params,
+        )
+
+    async def _create_order_adaptive(
+        self,
+        symbol: str,
+        order_type: str,
+        side: str,
+        qty: float,
+        price: float | None,
+        params: Optional[dict] = None,
+    ):
+        return await _create_order_tolerant(
+            self._place_order,
+            symbol,
+            order_type,
+            side,
+            qty,
+            price,
+            params,
+            logger=self.log,
+        )
+
     async def _place(self, fn, *args, retries=4, base_delay=0.25, **kwargs):
         last = None
         for i in range(retries):
@@ -49,10 +136,10 @@ class RealExchange:
         raise last
 
     async def set_position_mode(self, one_way: bool = True):
-        try:
-            await asyncio.to_thread(ensure_position_mode, not bool(one_way))
-        except Exception as e:
-            self.log.warning("ensure_position_mode falló: %s", e)
+        self.log.debug(
+            "set_position_mode(one_way=%s) omitido: se utiliza el modo configurado en la cuenta",
+            one_way,
+        )
 
     async def set_leverage(self, symbol: str, lev: int):
         """Wrapper compatible con CCXT Python para USDM."""
@@ -74,7 +161,8 @@ class RealExchange:
 
     async def market_order(self, symbol: str, side: str, qty: float, price_hint: float = None):
         params = {"newClientOrderId": self._idemp_key("MO", symbol=symbol, side=side, qty=qty)}
-        o = await self._place(self.client.create_order, symbol, "market", side, qty, None, params=params)
+        order_side = self._normalize_order_side(side)
+        o, _ = await self._create_order_adaptive(symbol, "market", order_side, qty, None, params)
         price = float(
             o.get("average")
             or o.get("price")
@@ -96,33 +184,23 @@ class RealExchange:
     ):
         params = dict(params or {})
 
-        options = getattr(self.client, "options", {}) or {}
-        default_type = options.get("defaultType") or options.get("default_type")
-        client_type = getattr(self.client, "type", None)
-        is_futures = (default_type in {"future", "swap", "delivery"}) or (
-            client_type in {"future", "swap", "delivery"}
-        )
-        hedge_mode = bool(options.get("hedgeMode") or options.get("hedge_mode"))
-
-        side_map = normalize_side(internal_side, futures=is_futures, hedge_mode=hedge_mode)
-
         order_type = (type_ or "market").upper()
         binance_type = order_type.lower()
         if order_type not in {"MARKET", "LIMIT"}:
-            self.log.warning("Tipo de orden no contemplado (%s), usando CCXT tal cual", order_type)
+            self.log.warning(
+                "Tipo de orden no contemplado (%s), enviándolo directamente a CCXT",
+                order_type,
+            )
 
-        binance_side = side_map.order_side
-        if side_map.position_side:
-            params.setdefault("positionSide", side_map.position_side)
-
+        order_side = self._normalize_order_side(internal_side)
+        internal_norm = "LONG" if order_side == "BUY" else "SHORT"
         price_arg = price if order_type == "LIMIT" else None
 
         try:
-            order = await self._place(
-                self.client.create_order,
+            order, used_params = await self._create_order_adaptive(
                 symbol,
                 binance_type,
-                binance_side,
+                order_side,
                 qty,
                 price_arg,
                 params,
@@ -146,9 +224,9 @@ class RealExchange:
             {
                 "ts": _t(),
                 "symbol": symbol,
-                "internal_side": side_map.internal,
-                "side": binance_side,
-                "positionSide": params.get("positionSide"),
+                "internal_side": internal_norm,
+                "side": order_side,
+                "positionSide": (used_params or {}).get("positionSide"),
                 "type": order_type,
                 "qty": qty,
                 "price": price_arg,
@@ -367,6 +445,7 @@ class RealExchange:
         tp_final = tp2 if tp2 and tp2 > 0 else (tp1 if tp1 and tp1 > 0 else None)
         s = (side or "").lower()
         closing_side = "sell" if s == "long" else "buy"
+        closing_order_side = self._normalize_order_side(closing_side)
         params_base = {"reduceOnly": True}
         if position_side:
             params_base["positionSide"] = position_side
@@ -376,7 +455,14 @@ class RealExchange:
             coid_sl = self._idemp_key("SL", symbol=symbol, side=closing_side, qty=qty, sl=sl)
             params_sl = dict(params_base, newClientOrderId=coid_sl, stopPrice=float(sl), workingType="CONTRACT_PRICE")
             try:
-                o_sl = await self._place(self.client.create_order, symbol, "STOP_MARKET", closing_side, qty, None, params_sl)
+                o_sl, _ = await self._create_order_adaptive(
+                    symbol,
+                    "STOP_MARKET",
+                    closing_order_side,
+                    qty,
+                    None,
+                    params_sl,
+                )
                 placed.append(o_sl)
             except Exception as e:
                 self.log.warning("place SL failed: %s", e)
@@ -386,11 +472,18 @@ class RealExchange:
             coid_tp = self._idemp_key("TP", symbol=symbol, side=closing_side, qty=qty, tp=tp_final)
             params_tp = dict(params_base, newClientOrderId=coid_tp, stopPrice=float(tp_final), workingType="CONTRACT_PRICE")
             try:
-                o_tp = await self._place(self.client.create_order, symbol, "TAKE_PROFIT_MARKET", closing_side, qty, None, params_tp)
+                o_tp, _ = await self._create_order_adaptive(
+                    symbol,
+                    "TAKE_PROFIT_MARKET",
+                    closing_order_side,
+                    qty,
+                    None,
+                    params_tp,
+                )
                 placed.append(o_tp)
             except Exception as e:
                 self.log.warning("place TP failed: %s", e)
-        
+
         return placed
 
     async def close_all(self, positions: dict):
