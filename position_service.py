@@ -11,7 +11,7 @@ from paper_store import PaperStore
 logger = logging.getLogger(__name__)
 
 
-def _fetch_live_equity_usdm() -> float:
+def fetch_live_equity_usdm() -> float:
     """Obtiene el equity real de la cuenta de Futuros USD-M (USDT)."""
 
     # Import lazily to avoid circular dependencies during application start-up.
@@ -242,7 +242,7 @@ class PositionService:
 
         equity = 0.0
         try:
-            equity = _fetch_live_equity_usdm()
+            equity = fetch_live_equity_usdm()
         except Exception:
             logger.debug("No se pudo obtener equity live.", exc_info=True)
 
@@ -363,5 +363,5 @@ __all__ = [
     "PositionService",
     "build_position_service",
     "pos_svc",
-    "_fetch_live_equity_usdm",
+    "fetch_live_equity_usdm",
 ]

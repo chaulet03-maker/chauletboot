@@ -37,7 +37,7 @@ from bot.telemetry.command_registry import CommandRegistry, normalize
 from bot.telemetry.formatter import open_msg
 from state_store import load_state, update_open_position
 import trading
-from position_service import _fetch_live_equity_usdm
+from position_service import fetch_live_equity_usdm
 
 logger = logging.getLogger("telegram")
 
@@ -1958,14 +1958,19 @@ async def _cmd_estado(engine, reply):
     # EQUITY correcto según modo
     if mode == "live":
         try:
-            equity = await asyncio.to_thread(_fetch_live_equity_usdm)
+            equity = await asyncio.to_thread(fetch_live_equity_usdm)
         except Exception:
             equity = 0.0
-    else:
-        try:
-            equity = float(trader.equity()) if trader else 0.0  # el que seteás con 'equity'
-        except Exception:
-            equity = 0.0
+        return await reply(
+            "Modo: REAL\n"
+            f"Símbolo: {symbol}\n"
+            f"saldo: {equity:,.2f}"
+        )
+
+    try:
+        equity = float(trader.equity()) if trader else 0.0  # el que seteás con 'equity'
+    except Exception:
+        equity = 0.0
 
     # Mark para PnL no realizado
     async def _mark(sym):
@@ -1988,7 +1993,6 @@ async def _cmd_estado(engine, reply):
         f"PnL Diario: {d['total']:+.2f} (R={d['realized']:+.2f} | U={d['unrealized']:+.2f})\n"
         f"PnL Semanal: {w['total']:+.2f} (R={w['realized']:+.2f} | U={w['unrealized']:+.2f})"
     )
-
 
 async def estado_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.effective_message

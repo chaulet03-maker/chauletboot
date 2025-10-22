@@ -6,7 +6,7 @@ import time
 from typing import Any, Dict, List, Mapping, Optional
 
 import ccxt
-from ccxt.base.errors import OperationRejected
+from ccxt.base.errors import AuthenticationError, OperationRejected
 
 from config import S
 from trading import place_order_safe
@@ -16,6 +16,15 @@ from bot.exchanges.binance_filters import build_filters
 logger = logging.getLogger(__name__)
 
 _CCXT = None
+
+
+def _clean(value):
+    if value is None:
+        return ""
+    return str(value).strip().strip("\"").strip("'")
+
+
+
 
 
 def _to_bool(value: Any) -> bool:
@@ -40,18 +49,26 @@ def get_ccxt():
     if _CCXT is not None:
         return _CCXT
 
-    api_key = (
-        os.getenv("BINANCE_API_KEY")
-        or os.getenv("BINANCE_FUTURES_API_KEY")
-        or os.getenv("BINANCE_API_KEY_REAL")
-        or getattr(S, "binance_api_key", "")
+    def _first_credential(*values):
+        for candidate in values:
+            cleaned = _clean(candidate)
+            if cleaned:
+                return cleaned
+        return ""
+
+    api_key = _first_credential(
+        os.getenv("BINANCE_API_KEY"),
+        os.getenv("BINANCE_FUTURES_API_KEY"),
+        os.getenv("BINANCE_API_KEY_REAL"),
+        getattr(S, "binance_api_key", ""),
     )
-    secret = (
-        os.getenv("BINANCE_API_SECRET")
-        or os.getenv("BINANCE_FUTURES_API_SECRET")
-        or os.getenv("BINANCE_API_SECRET_REAL")
-        or getattr(S, "binance_api_secret", "")
+    secret = _first_credential(
+        os.getenv("BINANCE_API_SECRET"),
+        os.getenv("BINANCE_FUTURES_API_SECRET"),
+        os.getenv("BINANCE_API_SECRET_REAL"),
+        getattr(S, "binance_api_secret", ""),
     )
+
     if not api_key or not secret:
         raise RuntimeError(
             "Faltan credenciales BINANCE_API_KEY / BINANCE_API_SECRET para inicializar CCXT"
@@ -60,6 +77,7 @@ def get_ccxt():
     options: Dict[str, Any] = {
         "defaultType": "future",
         "adjustForTimeDifference": True,
+        "recvWindow": 60000,
     }
 
     hedge_hint = getattr(S, "hedge_mode", None)
@@ -74,9 +92,14 @@ def get_ccxt():
             "secret": secret,
             "enableRateLimit": True,
             "options": options,
-            "timeout": 15000,
+            "timeout": 20000,
         }
     )
+
+    try:
+        client.has["fetchCurrencies"] = False
+    except Exception:
+        pass
 
     use_testnet = _to_bool(
         os.getenv("BINANCE_UMFUTURES_TESTNET")
@@ -86,8 +109,12 @@ def get_ccxt():
         client.set_sandbox_mode(True)
 
     try:
-        client.load_markets()
+        client.fapiPublicGetPing()
+        client.load_markets(reload=True)
         logger.info("Cliente CCXT (binanceusdm) inicializado OK.")
+    except AuthenticationError:
+        logger.exception("No pude inicializar CCXT binanceusdm (Auth).")
+        raise
     except Exception:
         logger.exception("No pude inicializar CCXT binanceusdm")
         raise
