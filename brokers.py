@@ -17,6 +17,7 @@ except Exception:  # pragma: no cover - python-binance opcional en tests
 
 from bot.identity import get_bot_id, make_client_oid
 from bot.ledger import init as ledger_init, record_fill as ledger_fill, record_order as ledger_order
+from bot.exchange import create_order_smart
 
 from bot.exchanges.binance_filters import (
     SymbolFilters,
@@ -466,10 +467,9 @@ class BinanceBroker:
             if price is None:
                 raise ValueError("Orden LIMIT requiere precio")
             px_f = quantize_price(filters, price)
-            params["price"] = px_f
             params.setdefault("timeInForce", "GTC")
         else:
-            params.pop("price", None)
+            px_f = None
             params.pop("timeInForce", None)
 
         if reduce_only_flag:
@@ -492,6 +492,15 @@ class BinanceBroker:
 
         new_order_resp_type = params.pop("newOrderRespType", "RESULT")
 
+        def _as_ccxt_symbol(sym: str) -> str:
+            if not sym:
+                return sym
+            if "/" in sym:
+                return sym
+            if sym.upper().endswith("USDT"):
+                return f"{sym[:-4]}/USDT"
+            return sym
+
         order_payload = dict(
             symbol=self._normalize_symbol(symbol),
             side=normalized_side,
@@ -500,34 +509,60 @@ class BinanceBroker:
             newOrderRespType=new_order_resp_type,
             **params,
         )
+        if px_f is not None:
+            order_payload["price"] = px_f
+
+        ccxt_symbol = _as_ccxt_symbol(symbol)
+        ccxt_params = dict(params)
+        if new_order_resp_type is not None:
+            ccxt_params["newOrderRespType"] = new_order_resp_type
+
+        reduce_only_requested = bool(ccxt_params.get("reduceOnly"))
 
         try:
-            response = self._call_with_backoff(self.client.futures_create_order, **order_payload)
+            response = self._call_with_backoff(
+                create_order_smart,
+                ccxt_symbol,
+                normalized_side,
+                qty_f,
+                price=px_f,
+                **ccxt_params,
+            )
         except Exception as exc:
-            classification = self._classify_error(exc)
-            if classification == "insufficient_margin" and order_payload.get("reduceOnly"):
-                try:
-                    live = self.client.futures_position_information(symbol=filters.symbol)
-                    live_amt = 0.0
-                    for p in live or []:
-                        if str(p.get("symbol") or "").upper() == filters.symbol.upper():
-                            live_amt = float(p.get("positionAmt") or 0.0)
-                            break
-                    live_qty = abs(live_amt)
-                    if live_qty <= 0.0:
-                        return {"status": "noop", "reason": "no live position"}
-                    capped = min(float(order_payload.get("quantity", live_qty)), live_qty)
-                    new_qty = quantize_qty(filters, capped)
-                    if new_qty <= 0:
-                        return {"status": "noop", "reason": "no live position"}
-                    order_payload["quantity"] = new_qty
-                    response = self._call_with_backoff(
-                        self.client.futures_create_order, **order_payload
-                    )
-                except Exception:
-                    raise
+            message = str(exc)
+            if isinstance(exc, RuntimeError) and "Faltan credenciales" in message:
+                response = self._call_with_backoff(
+                    self.client.futures_create_order, **order_payload
+                )
             else:
-                raise
+                classification = self._classify_error(exc)
+                if classification == "insufficient_margin" and reduce_only_requested:
+                    try:
+                        live = self.client.futures_position_information(symbol=filters.symbol)
+                        live_amt = 0.0
+                        for p in live or []:
+                            if str(p.get("symbol") or "").upper() == filters.symbol.upper():
+                                live_amt = float(p.get("positionAmt") or 0.0)
+                                break
+                        live_qty = abs(live_amt)
+                        if live_qty <= 0.0:
+                            return {"status": "noop", "reason": "no live position"}
+                        capped = min(float(qty_f or live_qty), live_qty)
+                        new_qty = quantize_qty(filters, capped)
+                        if new_qty <= 0:
+                            return {"status": "noop", "reason": "no live position"}
+                        response = self._call_with_backoff(
+                            create_order_smart,
+                            ccxt_symbol,
+                            normalized_side,
+                            new_qty,
+                            price=px_f,
+                            **ccxt_params,
+                        )
+                    except Exception:
+                        raise
+                else:
+                    raise
 
         sl_price = kwargs.get("sl")
         tp_price = kwargs.get("tp")
@@ -541,6 +576,25 @@ class BinanceBroker:
             self._place_protections(filters, side_clean, qty_f, protections, position_side)
 
         result: dict[str, Any] = response if isinstance(response, dict) else {}
+        info = result.get("info") if isinstance(result.get("info"), dict) else {}
+        if isinstance(info, dict):
+            for key in (
+                "orderId",
+                "order_id",
+                "clientOrderId",
+                "status",
+                "executedQty",
+                "cumQty",
+                "avgPrice",
+                "avg_price",
+                "price",
+            ):
+                if key not in result and key in info:
+                    result[key] = info.get(key)
+            if "id" in result and "orderId" not in result:
+                result.setdefault("orderId", result["id"])
+        if "id" in result and "orderId" not in result:
+            result["orderId"] = result.get("id")
         order_id = ""
         try:
             order_id = str(result.get("orderId") or result.get("order_id") or "")

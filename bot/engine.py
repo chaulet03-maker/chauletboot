@@ -13,7 +13,7 @@ from telegram.ext import ContextTypes
 
 from anchor_freezer import Side
 from deps import FREEZER
-from bot.exchange import Exchange
+from bot.exchange import Exchange, ensure_position_mode
 from bot.trader import Trader
 from bot.storage import Storage
 from bot.telemetry.notifier import Notifier
@@ -1478,7 +1478,7 @@ class TradingApp:
             self._start_internal_scheduler(loop)
 
         bootstrap_tasks = [
-            self.exchange.set_position_mode(one_way=not self.exchange.hedge_mode),
+            asyncio.to_thread(ensure_position_mode, self.exchange.hedge_mode),
             self._preload_position_from_store(),
         ]
         for task in bootstrap_tasks:
