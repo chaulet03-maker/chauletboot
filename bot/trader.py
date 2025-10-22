@@ -6,6 +6,7 @@ from typing import Any, Dict, Optional
 from config import S
 import trading
 from bot.paper_store import get_equity as paper_get_equity, set_equity as paper_set_equity
+from position_service import _fetch_live_equity_usdm
 
 
 class Trader:
@@ -64,6 +65,13 @@ class Trader:
                 return self._balance
             except Exception:
                 logging.debug("No se pudo refrescar equity en modo paper.", exc_info=True)
+
+        try:
+            live_equity = await asyncio.to_thread(_fetch_live_equity_usdm)
+            self._balance = float(live_equity)
+            return self._balance
+        except Exception:
+            logging.debug("No se pudo obtener equity live vía CCXT.", exc_info=True)
 
         if exchange and getattr(exchange, 'client', None):
             try:

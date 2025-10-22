@@ -7,8 +7,60 @@ from typing import Any, Optional
 import brokers
 from config import S
 from paper_store import PaperStore
+from bot.exchange import get_ccxt
 
 logger = logging.getLogger(__name__)
+
+
+def _fetch_live_equity_usdm() -> float:
+    """Obtiene el equity real de la cuenta de Futuros USD-M (USDT)."""
+
+    client = get_ccxt()
+
+    try:
+        bal = client.fetch_balance({"type": "future"})
+        if isinstance(bal, dict):
+            usdt = bal.get("USDT")
+            if isinstance(usdt, dict):
+                total = usdt.get("total")
+                if total is not None:
+                    return float(total)
+                alt_total = (usdt.get("free", 0.0) or 0.0) + (usdt.get("used", 0.0) or 0.0)
+                return float(alt_total)
+            info = bal.get("info") or {}
+            if isinstance(info, dict):
+                twb = info.get("totalWalletBalance")
+                if twb is not None:
+                    return float(twb)
+                assets = info.get("assets") or []
+                for asset in assets:
+                    if (asset or {}).get("asset") == "USDT":
+                        for key in ("walletBalance", "marginBalance", "crossWalletBalance"):
+                            value = (asset or {}).get(key)
+                            if value is not None:
+                                return float(value)
+    except Exception:
+        logger.debug("fetch_balance(type=future) falló; intento fallback", exc_info=True)
+
+    try:
+        if hasattr(client, "fapiPrivateV2GetAccount"):
+            acct = client.fapiPrivateV2GetAccount()
+        else:
+            acct = client.fapiPrivateGetAccount()
+        twb = acct.get("totalWalletBalance") if isinstance(acct, dict) else None
+        if twb is not None:
+            return float(twb)
+        assets = acct.get("assets") if isinstance(acct, dict) else []
+        for asset in assets or []:
+            if (asset or {}).get("asset") == "USDT":
+                for key in ("walletBalance", "marginBalance"):
+                    value = (asset or {}).get(key)
+                    if value is not None:
+                        return float(value)
+    except Exception:
+        logger.debug("fapiPrivateV2GetAccount falló", exc_info=True)
+
+    return 0.0
 
 
 class PositionService:
@@ -153,40 +205,6 @@ class PositionService:
             "mark": round(mark, 2),
         }
 
-    def _fetch_live_equity(self, client: Any) -> float:
-        try:
-            if hasattr(client, "fapiPrivateGetAccount"):
-                account = client.fapiPrivateGetAccount()
-            elif hasattr(client, "fapiPrivate_get_account"):
-                account = client.fapiPrivate_get_account()
-            else:
-                account = client.futures_account()
-        except Exception as exc:  # pragma: no cover - live only
-            raise RuntimeError(f"No se pudo obtener equity live: {exc}") from exc
-
-        equity = 0.0
-        if isinstance(account, dict):
-            for key in ("totalWalletBalance", "totalMarginBalance", "equity"):
-                if account.get(key) is not None:
-                    try:
-                        equity = float(account.get(key) or 0.0)
-                        break
-                    except Exception:
-                        continue
-            else:
-                assets = account.get("assets") or []
-                for asset in assets:
-                    if str(asset.get("asset", "")).upper() == "USDT":
-                        for k in ("walletBalance", "marginBalance", "balance"):
-                            if asset.get(k) is not None:
-                                try:
-                                    equity = float(asset.get(k) or 0.0)
-                                    break
-                                except Exception:
-                                    continue
-                        break
-        return equity
-
     def _status_live(self) -> dict[str, Any]:
         pos_qty = 0.0
         avg_price = 0.0
@@ -221,11 +239,10 @@ class PositionService:
             side = "SHORT"
 
         equity = 0.0
-        if client:
-            try:
-                equity = self._fetch_live_equity(client)
-            except Exception:
-                logger.debug("No se pudo obtener equity live.", exc_info=True)
+        try:
+            equity = _fetch_live_equity_usdm()
+        except Exception:
+            logger.debug("No se pudo obtener equity live.", exc_info=True)
 
         pnl = 0.0
         qty = abs(pos_qty)
@@ -340,4 +357,9 @@ def build_position_service(
 pos_svc: Optional[PositionService] = None
 
 
-__all__ = ["PositionService", "build_position_service", "pos_svc"]
+__all__ = [
+    "PositionService",
+    "build_position_service",
+    "pos_svc",
+    "_fetch_live_equity_usdm",
+]

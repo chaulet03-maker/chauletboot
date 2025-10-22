@@ -37,6 +37,7 @@ from bot.telemetry.command_registry import CommandRegistry, normalize
 from bot.telemetry.formatter import open_msg
 from state_store import load_state, update_open_position
 import trading
+from position_service import _fetch_live_equity_usdm
 
 logger = logging.getLogger("telegram")
 
@@ -1957,7 +1958,7 @@ async def _cmd_estado(engine, reply):
     # EQUITY correcto según modo
     if mode == "live":
         try:
-            equity = float(await exchange.get_account_equity()) if exchange else 0.0
+            equity = await asyncio.to_thread(_fetch_live_equity_usdm)
         except Exception:
             equity = 0.0
     else:
