@@ -1473,7 +1473,38 @@ async def posicion_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         st = trading.POSITION_SERVICE.get_status() if trading.POSITION_SERVICE else None
     except Exception:
         st = None
-    if not st or (st.get("side", "FLAT").upper() == "FLAT"):
+    side_flat = (not st) or (str(st.get("side","FLAT")).upper() == "FLAT")
+
+    # Si en LIVE el store está flat, consultamos la posición LIVE del exchange
+    if side_flat and _is_engine_live(engine):
+        symbol_conf = (engine.config or {}).get("symbol", "BTC/USDT")
+        exchange = getattr(engine, "exchange", None)
+        live_pos = None
+        if exchange is not None and hasattr(exchange, "get_open_position"):
+            try:
+                live_pos = await exchange.get_open_position(symbol_conf)
+            except Exception as exc:
+                logger.debug("get_open_position falló: %s", exc, exc_info=True)
+
+        if live_pos:
+            # Formateamos con el mismo builder para unificar salida
+            size = float(
+                live_pos.get("contracts")
+                or live_pos.get("positionAmt")
+                or live_pos.get("size")
+                or 0.0
+            )
+            side = "LONG" if size > 0 else "SHORT"
+            qty_signed = _signed_qty(abs(size), side)
+            entry = float(live_pos.get("entryPrice") or live_pos.get("entry") or 0.0)
+            mark  = float(live_pos.get("markPrice")  or live_pos.get("mark")  or entry)
+            sym   = live_pos.get("symbol") or symbol_conf
+            reply_text = _build_bot_position_message(
+                engine=engine, symbol=sym, qty=qty_signed, avg=entry, mark_val=mark
+            )
+            return await message.reply_text(reply_text, parse_mode="Markdown")
+
+    if side_flat:
         reply_text = "📍 Posición del BOT: *SIN POSICIÓN*"
     else:
         q = float(st.get("qty") or st.get("size") or 0.0)
@@ -1957,10 +1988,21 @@ async def _cmd_estado(engine, reply):
 
     # EQUITY correcto según modo
     if mode == "live":
-        try:
-            equity = await asyncio.to_thread(fetch_live_equity_usdm)
-        except Exception:
-            equity = 0.0
+        # 1) Usar SIEMPRE el Exchange del engine (ya autenticado y con defaultType=future)
+        equity = 0.0
+        if exchange is not None and hasattr(exchange, "fetch_balance_usdt"):
+            try:
+                equity = await exchange.fetch_balance_usdt()
+            except Exception:
+                logger.debug("fetch_balance_usdt falló (exchange).", exc_info=True)
+
+        # 2) Fallback adicional por si el cliente del exchange no trajo nada
+        if equity <= 0.0:
+            try:
+                equity = await asyncio.to_thread(fetch_live_equity_usdm)
+            except Exception:
+                logger.debug("fetch_live_equity_usdm fallback falló.", exc_info=True)
+                equity = 0.0
         return await reply(
             "Modo: REAL\n"
             f"Símbolo: {symbol}\n"
