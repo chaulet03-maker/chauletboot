@@ -111,6 +111,13 @@ def get_ccxt():
     try:
         client.fapiPublicGetPing()
         client.load_markets(reload=True)
+        try:
+            # Sincronizar el reloj para evitar errores de firma (-1022)
+            client.load_time_difference()
+        except Exception:
+            logger.debug(
+                "No pude sincronizar tiempo con Binance al inicializar", exc_info=True
+            )
         logger.info("Cliente CCXT (binanceusdm) inicializado OK.")
     except AuthenticationError:
         logger.exception("No pude inicializar CCXT binanceusdm (Auth).")
@@ -153,6 +160,8 @@ def ensure_position_mode(hedged: bool) -> None:
         if not hasattr(client, "load_time_difference"):
             return False
         try:
+            if isinstance(getattr(client, "options", None), dict):
+                client.options.setdefault("adjustForTimeDifference", True)
             logger.info(
                 "Reintentando set_position_mode tras sincronizar tiempo por error de firma"
             )
