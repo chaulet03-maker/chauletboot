@@ -459,35 +459,60 @@ def _extract_order_fee(order_result: Any) -> float:
     return total_fee
 
 
+def _normalize_symbol(symbol: str) -> str:
+    return str(symbol or "").replace("/", "").replace(":USDT", "").upper()
+
+
 def close_bot_position_market() -> dict[str, Any]:
     """Cierra la posición del bot mediante una orden MARKET reduce-only."""
 
     ensure_initialized()
+    if BROKER is None:
+        raise RuntimeError("Broker no inicializado.")
+
     status = POSITION_SERVICE.get_status() if POSITION_SERVICE else None
     if not status:
-        raise RuntimeError("Sin estado de posición.")
+        return {"status": "noop", "reason": "no_position"}
 
     side = str(status.get("side", "FLAT")).upper()
     qty_raw = status.get("qty") or status.get("pos_qty") or 0.0
     try:
-        qty = abs(float(qty_raw))
+        qty_now = abs(float(qty_raw))
     except Exception as exc:
         raise RuntimeError("Cantidad inválida para cerrar posición.") from exc
-    if side == "FLAT" or qty <= 0:
-        return {"ok": True, "info": "sin posición"}
+    if side == "FLAT" or qty_now <= 0:
+        return {"status": "noop", "reason": "no_position"}
 
     symbol_conf = status.get("symbol") or getattr(S, "symbol", None) or "BTC/USDT"
-    symbol_clean = str(symbol_conf).replace("/", "")
-    close_side = "SELL" if side == "LONG" else "BUY"
-
-    if BROKER is None:
-        raise RuntimeError("Broker no inicializado.")
+    mark_price = status.get("mark") or status.get("mark_price")
+    hedged = _config_uses_hedge(RAW_CONFIG)
 
     kwargs = {
-        "symbol": symbol_clean,
+        "symbol": symbol_conf,
         "reduce_only": True,
         "newOrderRespType": "RESULT",
     }
-    if hasattr(BROKER, "create_order"):
-        return BROKER.create_order(close_side, qty, None, **kwargs)
-    return BROKER.place_order(close_side, qty, None, **kwargs)
+    if hedged and side in {"LONG", "SHORT"}:
+        kwargs["positionSide"] = side
+
+    close_side = "SELL" if side == "LONG" else "BUY"
+
+    try:
+        if hasattr(BROKER, "create_order"):
+            result = BROKER.create_order(close_side, qty_now, None, **kwargs)
+        else:
+            result = BROKER.place_order(close_side, qty_now, None, **kwargs)
+    except Exception as exc:
+        return {"status": "error", "reason": str(exc)}
+
+    close_price = _infer_fill_price(result, mark_price)
+    summary = {
+        "status": "closed",
+        "side": side,
+        "qty": float(qty_now),
+        "price": close_price,
+        "order": result,
+        "symbol": symbol_conf,
+        "symbol_normalized": _normalize_symbol(symbol_conf),
+    }
+    return summary

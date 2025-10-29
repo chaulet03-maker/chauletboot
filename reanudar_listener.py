@@ -4,8 +4,8 @@ import requests
 
 from notifier import notify
 
-TELEGRAM_BOT_TOKEN = os.getenv("TG_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TG_CHAT_ID")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 
 def listen_reanudar(on_reanudar_callback):

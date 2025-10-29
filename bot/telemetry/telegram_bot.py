@@ -15,7 +15,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 import pandas as pd
 import yaml
 from telegram import Update
-from telegram.ext import Application, ContextTypes, MessageHandler, filters
+from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 from telegram.request import HTTPXRequest
 
 from logging_setup import LOG_DIR, LOG_FILE
@@ -1294,10 +1294,17 @@ async def _handle_position_controls(engine, reply_md, text: str) -> bool:
                 crossed = True
             if side_now == "SHORT" and mark_val >= target:
                 crossed = True
-        if crossed:
+            if crossed:
             def _classify_close_result(payload: Any) -> str | None:
                 if not isinstance(payload, dict):
                     return None
+                status_val = str(payload.get("status") or "").strip().lower()
+                if status_val == "noop":
+                    return "no_position"
+                if status_val == "closed":
+                    return "filled"
+                if status_val == "error":
+                    return "failed"
                 info = str(payload.get("info") or "").strip().lower()
                 if info and "sin posición" in info:
                     return "no_position"
@@ -1405,14 +1412,18 @@ async def _handle_position_controls(engine, reply_md, text: str) -> bool:
             if side_now == "SHORT" and mark_val <= target:
                 reached = True
         if reached:
-            closed = False
             try:
-                trading.close_bot_position_market()
-                closed = True
-            except Exception:
-                closed = False
-            if closed:
+                result = trading.close_bot_position_market()
+            except Exception as exc:
+                logger.debug("tp_command: cierre tras TP falló: %s", exc)
+                result = {"status": "error"}
+            status_val = (
+                str(result.get("status")) if isinstance(result, dict) else ""
+            ).strip().lower()
+            if status_val == "closed":
                 await reply_md(f"✅ TP alcanzado. Posición cerrada (TP: ${target:,.2f}).")
+            elif status_val == "noop":
+                await reply_md("TP cruzado, pero no hay posición abierta para cerrar.")
             else:
                 await reply_md(
                     f"TP cruzado (mark {_num(mark_val)}). Intentá cerrar manualmente."
@@ -2362,14 +2373,22 @@ async def sl_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             crossed = True
     if crossed:
         try:
-            trading.close_bot_position_market()
+            result = trading.close_bot_position_market()
+        except Exception as exc:
+            logger.debug("sl_command: cierre tras SL falló: %s", exc)
+            result = {"status": "error"}
+        status_val = (
+            str(result.get("status")) if isinstance(result, dict) else ""
+        ).strip().lower()
+        if status_val == "closed":
             await reply_md(f"✅ SL alcanzado. Posición cerrada (SL: {_num(target)}).")
-            return
-        except Exception:
+        elif status_val == "noop":
+            await reply_md("SL cruzado, pero no hay posición abierta para cerrar.")
+        else:
             await reply_md(
                 f"SL cruzado (mark {_num(mark_val)}). Intentá cerrar manualmente."
             )
-            return
+        return
 
     await reply_md(_format_sl_message("✅ SL actualizado a", target, mark_val))
 
@@ -2503,18 +2522,30 @@ async def tp_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             crossed = True
                         if crossed:
                             try:
-                                trading.close_bot_position_market()
+                                result = trading.close_bot_position_market()
+                            except Exception as exc:
+                                logger.debug("tp_command(fallback): cierre falló: %s", exc)
+                                result = {"status": "error"}
+                            status_val = (
+                                str(result.get("status")) if isinstance(result, dict) else ""
+                            ).strip().lower()
+                            if status_val == "closed":
                                 await message.reply_text(
                                     f"✅ TP alcanzado. Posición cerrada (TP: {_num(tp_price)}).",
                                     parse_mode="Markdown",
                                 )
                                 return
-                            except Exception:
+                            if status_val == "noop":
                                 await message.reply_text(
-                                    f"TP cruzado (mark {_num(mark_val)}). Intentá cerrar manualmente.",
+                                    "TP cruzado, pero no hay posición abierta para cerrar.",
                                     parse_mode="Markdown",
                                 )
                                 return
+                            await message.reply_text(
+                                f"TP cruzado (mark {_num(mark_val)}). Intentá cerrar manualmente.",
+                                parse_mode="Markdown",
+                            )
+                            return
     except Exception:
         logger.debug("tp_command: fallback inmediato falló", exc_info=True)
 
@@ -3325,6 +3356,25 @@ class TelegramNotifier:
 # =========================
 # Arranque del bot (con flags)
 # =========================
+async def run_telegram_bot(token: str, engine) -> Application:
+    """Inicializa y lanza un bot básico con polling usando telegram.ext v20."""
+
+    application = Application.builder().token(token).build()
+    application.bot_data["engine"] = engine
+    try:
+        application.user_data["engine"] = engine
+    except Exception:
+        pass
+
+    register_commands(application)
+    application.add_handler(CommandHandler(["cerrar", "close"], cerrar_command))
+
+    await application.initialize()
+    await application.start()
+    await application.updater.start_polling()
+    return application
+
+
 async def start_telegram_bot(app, config):
     config_dict = config if isinstance(config, dict) else _app_config(app)
 
@@ -3388,7 +3438,7 @@ async def start_telegram_bot(app, config):
     await application.updater.start_polling()
 
 # >>> MEJORA: Wrapper compatible con engine.py
-def run_telegram_bot(app, config, engine_api=None):
+def launch_telegram_bot(app, config, engine_api=None):
     """
     Arranca el bot de Telegram en segundo plano usando la config del bot/engine.
     engine_api se ignora porque 'app' YA expone la API que usa start_telegram_bot.
