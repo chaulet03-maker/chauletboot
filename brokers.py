@@ -29,6 +29,17 @@ from bot.exchanges.binance_filters import (
 
 logger = logging.getLogger(__name__)
 
+
+def _normalize_symbol(symbol: str) -> str:
+    """Normaliza símbolos a la forma esperada por Binance (BTCUSDT)."""
+
+    if not symbol:
+        return ""
+    value = str(symbol).replace("/", "")
+    if value.endswith(":USDT"):
+        value = value[: -len(":USDT")]
+    return value.upper()
+
 _RAW_DATA_DIR = Path(os.getenv("DATA_DIR", "/app/data")).expanduser()
 if not _RAW_DATA_DIR.is_absolute():
     _RAW_DATA_DIR = (Path("/app") / _RAW_DATA_DIR).resolve()
@@ -106,7 +117,7 @@ class SimBroker:
     def place_order(self, side: str, qty: float, price: float | None, **kwargs: Any) -> dict[str, Any]:
         mode = "paper"
         symbol_val = kwargs.get("symbol") or "BTC/USDT"
-        symbol_ledger = str(symbol_val).replace("/", "").upper()
+        symbol_ledger = _normalize_symbol(symbol_val)
         bot_id = get_bot_id()
         side_u = str(side).upper()
         reduce_only = bool(kwargs.get("reduce_only", False))
@@ -115,16 +126,42 @@ class SimBroker:
         )
         kwargs["newClientOrderId"] = client_oid
 
+        state_snapshot = self.store.load()
+        pos_qty = float(state_snapshot.get("pos_qty", 0.0) or 0.0)
+        side_now = "LONG" if pos_qty > 0 else "SHORT" if pos_qty < 0 else "FLAT"
+
         fill_price: float | None = None if price is None else float(price)
         if fill_price is None:
-            state = self.store.load()
-            fallback = state.get("mark") or state.get("avg_price")
+            fallback = state_snapshot.get("mark") or state_snapshot.get("avg_price")
             if fallback is None:
                 raise ValueError("SimBroker requiere un precio para simular fills")
             fill_price = float(fallback)
 
+        if reduce_only:
+            if side_now == "FLAT":
+                return {
+                    "status": "noop",
+                    "reason": "no position",
+                    "sim": True,
+                    "symbol": symbol_val,
+                }
+            try:
+                qty_val = abs(float(qty))
+            except (TypeError, ValueError):
+                qty_val = None
+            target_qty = min(abs(pos_qty), qty_val) if qty_val is not None else abs(pos_qty)
+            if target_qty <= 0:
+                return {
+                    "status": "noop",
+                    "reason": "no position",
+                    "sim": True,
+                    "symbol": symbol_val,
+                }
+            side_u = "SELL" if side_now == "LONG" else "BUY"
+            qty = target_qty
+
         oid = f"sim-{int(time.time() * 1000)}"
-        new_state = self._apply_fill(side, qty, float(fill_price))
+        new_state = self._apply_fill(side_u, qty, float(fill_price))
         try:
             # Persistimos el estado actualizado antes de responder al caller.
             if isinstance(new_state, dict):
@@ -134,7 +171,7 @@ class SimBroker:
         except Exception:
             logger.warning("PAPER: no se pudo persistir el fill en store", exc_info=True)
         avg_price = float(new_state.get("avg_price", fill_price)) if isinstance(new_state, dict) else float(fill_price)
-        logger.info("PAPER ORDER %s %.6f @ %.2f → FILLED [%s]", side, qty, float(fill_price), oid)
+        logger.info("PAPER ORDER %s %.6f @ %.2f → FILLED [%s]", side_u, qty, float(fill_price), oid)
         payload: dict[str, Any] = {
             "orderId": oid,
             "status": "FILLED",
@@ -142,7 +179,7 @@ class SimBroker:
             "executedQty": float(qty),
             "avgPrice": float(avg_price),
             "avg_price": float(avg_price),
-            "side": str(side).upper(),
+            "side": side_u,
             "sim": True,
             "state": new_state,
         }
@@ -150,6 +187,16 @@ class SimBroker:
         payload["newClientOrderId"] = client_oid
         if reduce_only:
             payload["reduceOnly"] = True
+            if isinstance(new_state, dict):
+                remaining = float(new_state.get("pos_qty", 0.0) or 0.0)
+                if abs(remaining) < 1e-12:
+                    payload["status"] = "closed"
+                    try:
+                        self.store.save(tp=None, sl=None, pos_qty=0.0)
+                    except Exception:
+                        logger.debug("SimBroker: no se pudo limpiar tp/sl tras cierre", exc_info=True)
+                else:
+                    payload["status"] = "reduced"
         symbol_arg = kwargs.get("symbol")
         if symbol_arg:
             payload["symbol"] = symbol_arg
@@ -253,7 +300,7 @@ class BinanceBroker:
     # Exchange info helpers
     # ------------------------------------------------------------------
     def _normalize_symbol(self, symbol: str) -> str:
-        return symbol.replace("/", "").upper()
+        return _normalize_symbol(symbol)
 
     def _load_symbol_filters(self, symbol: str) -> SymbolFilters:
         norm = self._normalize_symbol(symbol)
