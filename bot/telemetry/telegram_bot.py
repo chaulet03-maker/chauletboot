@@ -2226,8 +2226,8 @@ async def sl_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if engine is None or message is None:
         return
 
-    def reply_md(text: str):
-        return message.reply_text(text, parse_mode="Markdown")
+    async def reply_md(text: str):
+        await message.reply_text(text, parse_mode="Markdown")
 
     symbol_conf = (engine.config or {}).get("symbol", "BTC/USDT")
     symbol_norm = str(symbol_conf).replace("/", "")
