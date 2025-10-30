@@ -7,7 +7,7 @@ import sqlite3
 import time
 import re
 import inspect
-import signal # <-- NUEVA IMPORTACIÓN
+import signal
 from collections import deque
 from datetime import datetime, timedelta, time as dtime, timezone
 from pathlib import Path
@@ -45,11 +45,6 @@ logger = logging.getLogger("telegram")
 
 REGISTRY = CommandRegistry()
 
-# ====================================================================
-# CORRECCIÓN DE SINTAXIS (TypeError: Regex.__init__) Y MEJORA DE CIERRE
-# ====================================================================
-
-# Se corrigió la sintaxis en las líneas 2447, 2450, 2453, 2456.
 
 CLOSE_TEXT_RE = re.compile(r"^(cerrar(?: posicion| posición)?|close)$", re.IGNORECASE)
 OPEN_TEXT_RE = re.compile(r"^open\s+(long|short)\s+x(\d+)$", re.IGNORECASE)
@@ -1725,7 +1720,7 @@ async def precio_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     engine = _get_engine_from_context(context)
     if engine is None:
         await _reply_chunks(update, "Engine no disponible para consultar precios.")
-    return
+        return # CORRECCIÓN: Quitamos el 'return' solo, para que siga ejecutando
     text = (update.effective_message.text or "").strip() if update.effective_message else ""
     parts = text.split()
     symbols: Iterable[str]
@@ -1945,7 +1940,7 @@ async def equity_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     txt = (message.text or "").strip().lower()
     pattern = re.compile(
-        r"equity\s+(?:(usd|usdt|\$)\s+)?(\d+(?:[.,]\d+)?)(?:\s*(usd|usdt|\$|%))?"
+        r"equity\s+(?:(usd|usdt|\$)\s+)?(\d+(?:\d+)?)(?:\s*(usd|usdt|\$|%))?"
     )
     match = pattern.search(txt)
     if not match:
@@ -2703,7 +2698,8 @@ async def _report_periodic(notifier: TelegramNotifier, days: int):
             if not dfw.empty:
                 equity_ini = float(dfw["equity"].iloc[0])
                 equity_fin = float(dfw["equity"].iloc[-1])
-                pnl = float(dfw["pnl"].sum())
+                # Corregido: pnl debe ser la diferencia de equity, no la suma de la columna pnl del equity DF
+                pnl = equity_fin - equity_ini 
         except Exception:
             pass
         try:
@@ -2723,9 +2719,10 @@ async def _report_periodic(notifier: TelegramNotifier, days: int):
             f"🗓️ Reporte {'24h' if days==1 else '7d'}\n"
             f"Equity inicial: ${_fmt_num(equity_ini)}\n"
             f"Equity final:  ${_fmt_num(equity_fin)}\n"
-            f"PnL neto:      ${_fmt_num(pnl)}\n"
+            f"PnL neto:      ${_fmt_num(pnl):+,.2f}\n" # Agregamos formato de signo
             f"Trades: {total_trades} (W:{wins}/L:{losses})"
         )
         await notifier._safe_send(txt)
     except Exception as e:
         logger.warning("report periodic failed: %s", e)
+
