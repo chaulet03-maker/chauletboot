@@ -508,6 +508,57 @@ class RealExchange:
         except Exception:
             return 0.0
 
+    async def get_mark_price(self, symbol: str | None = None) -> float:
+        sym = symbol or self.symbol or "BTC/USDT"
+        client = self.ccxt or self.client
+        if client is None:
+            raise RuntimeError("CCXT client no disponible")
+
+        sym_clean = sym.replace("/", "").upper()
+
+        async def _call(name: str):
+            method = getattr(client, name, None)
+            if method is None:
+                return None
+            try:
+                return await asyncio.to_thread(method, {"symbol": sym_clean})
+            except Exception:
+                return None
+
+        for name in ("public_get_premiumindex", "fapiPublicGetPremiumIndex"):
+            result = await _call(name)
+            if not result:
+                continue
+            payloads: list[dict] = []
+            if isinstance(result, dict):
+                payloads = [result]
+            elif isinstance(result, list):
+                payloads = [r for r in result if isinstance(r, dict)]
+            for payload in payloads:
+                sym_match = payload.get("symbol") or payload.get("pair")
+                if sym_match and str(sym_match).upper() != sym_clean:
+                    continue
+                for key in ("markPrice", "markprice", "indexPrice", "indexprice"):
+                    value = payload.get(key)
+                    if value is None:
+                        continue
+                    try:
+                        return float(value)
+                    except Exception:
+                        continue
+
+        ticker = await asyncio.to_thread(client.fetch_ticker, sym)
+        for key in ("last", "close", "bid", "ask"):
+            value = ticker.get(key)
+            if value is None:
+                continue
+            try:
+                return float(value)
+            except Exception:
+                continue
+
+        raise RuntimeError(f"No pude obtener precio para {sym}")
+
     async def fetch_positions(self):
         try:
             return await self._place(self.client.fetch_positions)

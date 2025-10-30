@@ -21,7 +21,13 @@ def get_ccxt() -> ccxt.Exchange:
         "apiKey": api_key,
         "secret": api_secret,
         "enableRateLimit": True,
-        "options": {"defaultType": "future"},
+        "timeout": 20000,
+        "options": {
+            "defaultType": "future",
+            "adjustForTimeDifference": True,
+            "warnOnFetchOHLCVLimitArgument": False,
+        },
+        "recvWindow": 10000,
     })
     try:
         ex.load_markets(reload=True)
