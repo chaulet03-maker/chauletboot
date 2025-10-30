@@ -2044,8 +2044,8 @@ async def diag_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 lines.append(f"• Edad precio WS: {age:.1f}s")
                 if age > 10:
                     lines.append("⚠️ WS frío (>10s sin precio). Revisa conexión.")
-            except Exception:
-                lines.append("• Precio cache: error")
+        except Exception:
+            lines.append("• Precio cache: error")
 
         try:
             symbol = engine.config.get("symbol", "BTC/USDT") if getattr(engine, "config", None) else "BTC/USDT"
