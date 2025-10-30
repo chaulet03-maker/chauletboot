@@ -7,6 +7,7 @@ import sqlite3
 import time
 import re
 import inspect
+import signal # <-- NUEVA IMPORTACIÓN
 from collections import deque
 from datetime import datetime, timedelta, time as dtime, timezone
 from pathlib import Path
@@ -44,11 +45,15 @@ logger = logging.getLogger("telegram")
 
 REGISTRY = CommandRegistry()
 
+# ====================================================================
+# CORRECCIÓN DE SINTAXIS (TypeError: Regex.__init__) Y MEJORA DE CIERRE
+# ====================================================================
+
+# Se corrigió la sintaxis en las líneas 2447, 2450, 2453, 2456.
 
 CLOSE_TEXT_RE = re.compile(r"^(cerrar(?: posicion| posición)?|close)$", re.IGNORECASE)
 OPEN_TEXT_RE = re.compile(r"^open\s+(long|short)\s+x(\d+)$", re.IGNORECASE)
 POSITION_TEXT_RE = re.compile(r"^(posicion|posición|position)$", re.IGNORECASE)
-
 
 # === util local para formateo ===
 
@@ -940,10 +945,10 @@ def _build_rendimiento_text(engine) -> str:
         cur.execute(
             """
             SELECT COUNT(*),
-                   SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END),
-                   SUM(CASE WHEN pnl < 0 THEN 1 ELSE 0 END),
-                   COALESCE(SUM(pnl), 0),
-                   COALESCE(SUM(fee), 0)
+                    SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END),
+                    SUM(CASE WHEN pnl < 0 THEN 1 ELSE 0 END),
+                    COALESCE(SUM(pnl), 0),
+                    COALESCE(SUM(fee), 0)
             FROM trades
             WHERE ABS(pnl) > 1e-9
             """
@@ -1462,13 +1467,14 @@ async def cerrar_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         log.info(
                             "Cooldown activado por cierre manual: 10 min sin entradas nuevas."
                         )
+                    return
                 except Exception:
                     if getattr(app, "logger", None) is not None:
                         app.logger.debug(
                             "No se pudo establecer el cooldown manual tras cierre.",
                             exc_info=True,
                         )
-                return
+                    return
 
     try:
         result = await app.close_all()
@@ -1719,7 +1725,7 @@ async def precio_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     engine = _get_engine_from_context(context)
     if engine is None:
         await _reply_chunks(update, "Engine no disponible para consultar precios.")
-        return
+    return
     text = (update.effective_message.text or "").strip() if update.effective_message else ""
     parts = text.split()
     symbols: Iterable[str]
@@ -1792,7 +1798,7 @@ async def _cmd_modo_simulado(engine, reply):
     if _get_mode_from_engine(engine) == "paper":
         return await reply("✅ El bot ya se encontraba en *MODO SIMULADO*.")
     try:
-        engine.set_mode("paper", source="telegram")   # usa el método que agregaste recién
+        engine.set_mode("paper", source="telegram")  # usa el método que agregaste recién
         return await reply("✅ Modo cambiado a *SIMULADO*. El bot ahora opera en simulado.")
     except Exception as e:
         return await reply("⚠️ No pude cambiar a SIMULADO (revisá logs / configuración).")
@@ -1834,7 +1840,7 @@ async def _cmd_modo_real(engine, reply):
 
     if not authed:
         return await reply("⚠️ MODO REAL activado pero *no veo auth en CCXT*. "
-                           "Verificá API/SECRET, permisos de Futuros y `defaultType=future` en el cliente.")
+                            "Verificá API/SECRET, permisos de Futuros y `defaultType=future` en el cliente.")
 
     return await reply(f"✅ MODO REAL activado{bal_txt}")
 
@@ -1874,7 +1880,7 @@ async def killswitch_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
     close_error: Optional[str] = None
     try:
-        await engine.close_all()   # solo la del BOT
+        await engine.close_all()  # solo la del BOT
     except Exception as exc:  # pragma: no cover - defensivo
         close_error = str(exc)
     _set_killswitch(engine, True)
@@ -2043,8 +2049,8 @@ async def diag_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 lines.append(f"• Edad precio WS: {age:.1f}s")
                 if age > 10:
                     lines.append("⚠️ WS frío (>10s sin precio). Revisa conexión.")
-        except Exception:
-            lines.append("• Precio cache: error")
+            except Exception:
+                lines.append("• Precio cache: error")
 
         try:
             symbol = engine.config.get("symbol", "BTC/USDT") if getattr(engine, "config", None) else "BTC/USDT"
@@ -2370,22 +2376,22 @@ def register_commands(application: Application) -> None:
 
     application.add_handler(MessageHandler(filters.COMMAND, _slash_router))
     application.add_handler(
-        MessageHandler(filters.Regex(r"^(status|estado)$", re.IGNORECASE), _status_plaintext_handler)
+        MessageHandler(filters.Regex(r"^(status|estado)$", flags=re.IGNORECASE), _status_plaintext_handler) # CORRECCIÓN
     )
     application.add_handler(
-        MessageHandler(filters.Regex(CLOSE_TEXT_RE.pattern, re.IGNORECASE), cerrar_command)
+        MessageHandler(filters.Regex(CLOSE_TEXT_RE.pattern, flags=re.IGNORECASE), cerrar_command) # CORRECCIÓN
     )
     application.add_handler(
-        MessageHandler(filters.Regex(OPEN_TEXT_RE.pattern, re.IGNORECASE), handle_open_manual)
+        MessageHandler(filters.Regex(OPEN_TEXT_RE.pattern, flags=re.IGNORECASE), handle_open_manual) # CORRECCIÓN
     )
     application.add_handler(
-        MessageHandler(filters.Regex(POSITION_TEXT_RE.pattern, re.IGNORECASE), posicion_command)
+        MessageHandler(filters.Regex(POSITION_TEXT_RE.pattern, flags=re.IGNORECASE), posicion_command) # CORRECCIÓN
     )
     generic_filter = filters.TEXT & (~filters.COMMAND)
-    generic_filter = generic_filter & (~filters.Regex(CLOSE_TEXT_RE.pattern, re.IGNORECASE))
-    generic_filter = generic_filter & (~filters.Regex(OPEN_TEXT_RE.pattern, re.IGNORECASE))
-    generic_filter = generic_filter & (~filters.Regex(POSITION_TEXT_RE.pattern, re.IGNORECASE))
-    generic_filter = generic_filter & (~filters.Regex(r"^(status|estado)$", re.IGNORECASE))
+    generic_filter = generic_filter & (~filters.Regex(CLOSE_TEXT_RE.pattern, flags=re.IGNORECASE)) # CORRECCIÓN
+    generic_filter = generic_filter & (~filters.Regex(OPEN_TEXT_RE.pattern, flags=re.IGNORECASE)) # CORRECCIÓN
+    generic_filter = generic_filter & (~filters.Regex(POSITION_TEXT_RE.pattern, flags=re.IGNORECASE)) # CORRECCIÓN
+    generic_filter = generic_filter & (~filters.Regex(r"^(status|estado)$", flags=re.IGNORECASE)) # CORRECCIÓN
     application.add_handler(MessageHandler(generic_filter, _text_router))
     setattr(application, "_chaulet_router_registered", True)
     logger.info(
@@ -2458,7 +2464,7 @@ def _chat_id_from_env():
         return int(chat_id_env)
     except (TypeError, ValueError):
         logger.warning("Invalid TELEGRAM_CHAT_ID provided; ignoring")
-        return None
+    return None
 
 # =========================
 # Notificador PRO
@@ -2534,15 +2540,15 @@ class TelegramNotifier:
             logger.warning("telegram send failed: %s", e)
 
     async def _send_open(self, symbol: str, side: str, entry: float,
-                         sl: float, tp1: float, tp2: float, qty: float, lev: int,
-                         regime: str = "", conf: float = 0.0, reason: str = ""):
+                          sl: float, tp1: float, tp2: float, qty: float, lev: int,
+                          regime: str = "", conf: float = 0.0, reason: str = ""):
         msg = (
             f"🟢 OPEN {side.upper()}  | {symbol}\n"
             f"Precio: {_fmt_num(entry)}\n"
             f"SL: {_fmt_price_with_pct(sl, entry)}    "
             f"TP1: {_fmt_price_with_pct(tp1, entry)}    "
             f"TP2: {_fmt_price_with_pct(tp2, entry)}\n"
-            f"Qty: {_fmt_num(qty, 6)}     Lev: x{lev}\n"
+            f"Qty: {_fmt_num(qty, 6)}      Lev: x{lev}\n"
         )
         info = []
         if regime:
@@ -2556,9 +2562,9 @@ class TelegramNotifier:
         await self._safe_send(msg)
 
     async def _send_tp1(self, symbol: str, side: str, price: float, entry: float,
-                        qty_closed: float, pnl_partial: float, qty_remaining: float):
+                          qty_closed: float, pnl_partial: float, qty_remaining: float):
         msg = (
-            f"✅ TP1 HIT     | {symbol} ({side.upper()})\n"
+            f"✅ TP1 HIT      | {symbol} ({side.upper()})\n"
             f"Precio: {_fmt_price_with_pct(price, entry)}\n"
             f"Qty cerrada: {_fmt_num(qty_closed, 6)}    Qty remanente: {_fmt_num(qty_remaining, 6)}\n"
             f"PnL parcial: ${_fmt_num(pnl_partial)}"
@@ -2567,7 +2573,7 @@ class TelegramNotifier:
 
     async def _send_trailing(self, symbol: str, side: str, new_sl: float, entry: float):
         await self._safe_send(
-            f"🧷 TRAILING    | {symbol} ({side.upper()})\n"
+            f"🧷 TRAILING     | {symbol} ({side.upper()})\n"
             f"Nuevo SL: {_fmt_price_with_pct(new_sl, entry)}"
         )
 
@@ -2575,7 +2581,7 @@ class TelegramNotifier:
                           price: float, qty: float, pnl: float):
         tag = "🔴 SL" if kind == "SL" else ("✅ TP" if kind == "TP" else "🟡 CLOSE")
         msg = (
-            f"{tag}         | {symbol} ({side.upper()})\n"
+            f"{tag}             | {symbol} ({side.upper()})\n"
             f"Cierre: {_fmt_price_with_pct(price, entry)}\n"
             f"Qty: {_fmt_num(qty, 6)}    PnL: ${_fmt_num(pnl)}"
         )
@@ -2618,8 +2624,8 @@ async def start_telegram_bot(app, config):
         setattr(app, "telegram_app", application)
 
     tconf = (config_dict or {}).get("telegram", {}) if isinstance(config_dict, dict) else {}
-    inline_commands = bool(tconf.get("inline_commands", False))   # ← por defecto OFF
-    reports_in_bot = bool(tconf.get("reports_in_bot", False))     # ← por defecto OFF
+    inline_commands = bool(tconf.get("inline_commands", False))  # ← por defecto OFF
+    reports_in_bot = bool(tconf.get("reports_in_bot", False))   # ← por defecto OFF
 
     default_chat_id = _chat_id_from_env()
 
@@ -2649,9 +2655,9 @@ async def start_telegram_bot(app, config):
             j = application.job_queue
             tz = _tz()
             j.run_daily(lambda c: notifier.app.create_task(_report_periodic(notifier, days=1)),
-                        time=dtime(hour=7, minute=0, tzinfo=tz), name="daily_report")
+                         time=dtime(hour=7, minute=0, tzinfo=tz), name="daily_report")
             j.run_daily(lambda c: notifier.app.create_task(_report_periodic(notifier, days=7)),
-                        time=dtime(hour=7, minute=1, tzinfo=tz), days=(6,), name="weekly_report")
+                         time=dtime(hour=7, minute=1, tzinfo=tz), days=(6,), name="weekly_report")
             logger.info("Reportes diarios/semanales programados en telegram_bot")
             setattr(application, "_chaulet_reports_scheduled", True)
         except Exception as e:
@@ -2716,11 +2722,10 @@ async def _report_periodic(notifier: TelegramNotifier, days: int):
         txt = (
             f"🗓️ Reporte {'24h' if days==1 else '7d'}\n"
             f"Equity inicial: ${_fmt_num(equity_ini)}\n"
-            f"Equity final:   ${_fmt_num(equity_fin)}\n"
-            f"PnL neto:       ${_fmt_num(pnl)}\n"
+            f"Equity final:  ${_fmt_num(equity_fin)}\n"
+            f"PnL neto:      ${_fmt_num(pnl)}\n"
             f"Trades: {total_trades} (W:{wins}/L:{losses})"
         )
         await notifier._safe_send(txt)
     except Exception as e:
         logger.warning("report periodic failed: %s", e)
-
