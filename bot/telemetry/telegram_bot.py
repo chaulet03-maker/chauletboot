@@ -2168,8 +2168,10 @@ def register_commands(application: Application) -> None:
     application.add_handler(
         MessageHandler(
             filters.Regex(
-                r"^(posicion|posición|position|status|estado)$",
-                flags=re.IGNORECASE,
+                re.compile(
+                    r"^(posicion|posición|position|status|estado)$",
+                    re.IGNORECASE,
+                )
             ),
             _status_plaintext_handler,
         )
