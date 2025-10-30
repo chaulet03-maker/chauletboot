@@ -253,6 +253,56 @@ class Exchange:
     def _normalize_symbol(self, symbol: str) -> str:
         return symbol.replace("/", "").lower()
 
+    async def _fetch_mark_price_rest(
+        self, clients: List[Any], base_symbol: str
+    ) -> Optional[float]:
+        if not base_symbol:
+            return None
+
+        sym_clean = base_symbol.replace("/", "").upper()
+        if not sym_clean:
+            return None
+
+        request = {"symbol": sym_clean}
+        keys = ("markPrice", "markprice", "indexPrice", "indexprice")
+
+        for client in clients:
+            if client is None:
+                continue
+
+            for attr in ("public_get_premiumindex", "fapiPublicGetPremiumIndex"):
+                method = getattr(client, attr, None)
+                if method is None:
+                    continue
+
+                try:
+                    result = await asyncio.to_thread(method, request)
+                except Exception:
+                    continue
+
+                if isinstance(result, dict):
+                    payloads = [result]
+                elif isinstance(result, list):
+                    payloads = [r for r in result if isinstance(r, dict)]
+                else:
+                    continue
+
+                for payload in payloads:
+                    # si viene una lista, priorizamos el símbolo exacto
+                    sym_match = payload.get("symbol") or payload.get("pair")
+                    if sym_match and str(sym_match).upper() != sym_clean:
+                        continue
+                    for key in keys:
+                        value = payload.get(key)
+                        if value is None:
+                            continue
+                        try:
+                            return float(value)
+                        except Exception:
+                            continue
+
+        return None
+
     async def fetch_balance_usdt(self) -> float:
         # En modo PAPER devolvemos el equity del PaperStore/pos service.
         if self.is_paper():
@@ -337,70 +387,10 @@ class Exchange:
         )
 
     def _start_price_stream(self):
-        symbol = self.config.get("symbol", "BTC/USDT")
-        ws_symbol = self._normalize_symbol(symbol)
-        try:
-            from binance.websocket.um_futures.websocket_client import UMFuturesWebsocketClient  # type: ignore
-        except Exception:
-            logger.warning("WS de Binance no disponible; uso REST para precios.")
-            return
-
-        def handle(message):
-            if not isinstance(message, dict):
-                return
-
-            px = None
-
-            if "markPrice" in message:
-                try:
-                    px = float(message["markPrice"])
-                except Exception:
-                    px = None
-
-            if px is None:
-                for k in ("c", "price", "lastPrice", "lp"):
-                    v = message.get(k)
-                    if v is not None:
-                        try:
-                            px = float(v)
-                            break
-                        except Exception:
-                            continue
-
-            if px is None and "a" in message and "b" in message:
-                try:
-                    ask = float(message["a"])
-                    bid = float(message["b"])
-                    px = (ask + bid) / 2.0
-                except Exception:
-                    px = None
-
-            if px is None:
-                return
-
-            ts_ms = message.get("E") or message.get("eventTime")
-            try:
-                ts = float(ts_ms) / 1000.0 if ts_ms is not None else time.time()
-            except Exception:
-                ts = time.time()
-
-            with self._price_lock:
-                base = self.config.get("symbol", "BTC/USDT")
-                self._price_cache[base] = {"price": px, "ts": ts}
-                self._price_cache[base.replace("/", "")] = {"price": px, "ts": ts}
-                if base.endswith("/USDT"):
-                    self._price_cache[f"{base}:USDT"] = {"price": px, "ts": ts}
-
-        try:
-            self._price_stream = UMFuturesWebsocketClient(on_message=handle)
-            self._price_stream.start()
-            try:
-                self._price_stream.mark_price(symbol=ws_symbol)
-            except Exception:
-                self._price_stream.mini_ticker(symbol=ws_symbol)
-            logger.info("WS de precios iniciado para %s", ws_symbol)
-        except Exception:
-            logger.warning("No se pudo iniciar websocket de precios", exc_info=True)
+        logger.info(
+            "WS de precios deshabilitado; se utilizará REST para obtener cotizaciones."
+        )
+        with self._price_lock:
             self._price_stream = None
 
     def _stop_price_stream(self):
@@ -408,7 +398,9 @@ class Exchange:
         if not stream:
             return
         try:
-            stream.stop()
+            stop = getattr(stream, "stop", None)
+            if callable(stop):
+                stop()
         except Exception:
             pass
         self._price_stream = None
@@ -628,6 +620,15 @@ class Exchange:
                     return None
             return None
 
+        def _cache_price(value: float) -> None:
+            now_ts = time.time()
+            keys = [base_symbol, base_symbol.replace("/", "")]
+            if base_symbol.endswith("/USDT"):
+                keys.append(f"{base_symbol}:USDT")
+            with self._price_lock:
+                for key in keys:
+                    self._price_cache[key] = {"price": value, "ts": now_ts}
+
         for key in (base_symbol, base_symbol.replace('/', ''), f"{base_symbol}:USDT"):
             px = _from_cache(key)
             if px is not None:
@@ -645,6 +646,11 @@ class Exchange:
             clients.append(self.public_client)
         if self.client is not None and self.client is not self.public_client:
             clients.append(self.client)
+
+        mark_price = await self._fetch_mark_price_rest(clients, base_symbol)
+        if mark_price is not None:
+            _cache_price(mark_price)
+            return mark_price
 
         for candidate in candidates:
             for client in clients:
@@ -664,7 +670,9 @@ class Exchange:
                 )
                 if price is not None:
                     try:
-                        return float(price)
+                        value = float(price)
+                        _cache_price(value)
+                        return value
                     except Exception:
                         continue
 

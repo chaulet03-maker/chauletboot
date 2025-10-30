@@ -2135,6 +2135,18 @@ async def _text_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     )
 
 
+async def _status_plaintext_handler(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    message = update.effective_message
+    text = (message.text or "") if message else ""
+    norm = normalize(text)
+    if norm.startswith("posicion") or norm.startswith("posición") or norm.startswith("position"):
+        await posicion_command(update, context)
+        return
+    await estado_command(update, context)
+
+
 def register_commands(application: Application) -> None:
     _populate_registry()
     if not getattr(application, "_chaulet_bot_handlers_registered", False):
@@ -2149,6 +2161,12 @@ def register_commands(application: Application) -> None:
         return
 
     application.add_handler(MessageHandler(filters.COMMAND, _slash_router))
+    application.add_handler(
+        MessageHandler(
+            filters.Regex(r"^(?i)(posicion|posición|position|status|estado)$"),
+            _status_plaintext_handler,
+        )
+    )
     application.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), _text_router))
     setattr(application, "_chaulet_router_registered", True)
     logger.info(
