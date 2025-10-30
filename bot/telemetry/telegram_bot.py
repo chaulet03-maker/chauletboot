@@ -1720,7 +1720,7 @@ async def precio_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     engine = _get_engine_from_context(context)
     if engine is None:
         await _reply_chunks(update, "Engine no disponible para consultar precios.")
-        return # CORRECCIÓN: Quitamos el 'return' solo, para que siga ejecutando
+        return
     text = (update.effective_message.text or "").strip() if update.effective_message else ""
     parts = text.split()
     symbols: Iterable[str]
@@ -2725,4 +2725,3 @@ async def _report_periodic(notifier: TelegramNotifier, days: int):
         await notifier._safe_send(txt)
     except Exception as e:
         logger.warning("report periodic failed: %s", e)
-
