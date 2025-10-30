@@ -472,6 +472,11 @@ class TradingApp:
         if self._reanudar_thread is not None and self._reanudar_thread.is_alive():
             return
 
+        if self.telegram_app is not None:
+            logging.debug(
+                "Reanudar listener integrado al bot de Telegram; se omite polling paralelo.")
+            return
+
         def _on_reanudar() -> None:
             try:
                 self.pause_manager.clear_pause()
