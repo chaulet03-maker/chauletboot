@@ -4,6 +4,7 @@ import asyncio
 import os
 import threading
 import inspect
+import time
 from collections import deque
 from typing import Any, Dict, Optional, cast
 from time import monotonic, time as _now
@@ -161,6 +162,7 @@ class TradingApp:
         self.config["mode"] = "real" if effective_mode == "real" else "paper"
         self.config.setdefault("start_equity", S.start_equity)
         self.logger = logging.getLogger(__name__)
+        self.log = self.logger
 
         trading.ensure_initialized(mode=effective_mode)
         self.mode_source = mode_source or trading.LAST_MODE_CHANGE_SOURCE or "startup"
@@ -198,6 +200,7 @@ class TradingApp:
         self._eq_on_open = 0.0
         self._entry_ts = None
         self._bars_in_position = 0
+        self.manual_block_until = 0
         try:
             self.sl_equity_pct = float(
                 self.config.get(
@@ -1157,6 +1160,20 @@ class TradingApp:
                     _emit_motive(overrides_ctx, price_value=price, side_value=side_pref)
                 except Exception as _e:
                     logging.debug("No se pudo registrar motivo: %s", _e)
+                return
+
+            now = time.time()
+            if now < self.manual_block_until:
+                remaining = int(self.manual_block_until - now)
+                self.log.info(
+                    "Bloqueo manual activo %ds; no se abren nuevas posiciones.",
+                    remaining,
+                )
+                _emit_motive(
+                    {"reasons": ["bloqueo manual activo"]},
+                    price_value=price_signal,
+                    side_value=signal,
+                )
                 return
 
             symbol_name = str(self.config.get("symbol", "BTC/USDT"))
