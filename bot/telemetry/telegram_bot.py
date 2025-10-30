@@ -1694,7 +1694,11 @@ async def ajustar_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         raw_value = " ".join(args[1:])
     else:
         text = (update.effective_message.text or "") if update.effective_message else ""
-        match = re.match(r"(?i)ajustar\s+([\w.]+)\s+(.+)$", text.strip())
+        match = re.match(
+            r"ajustar\s+([\w.]+)\s+(.+)$",
+            text.strip(),
+            flags=re.IGNORECASE,
+        )
         if not match:
             await _reply_chunks(update, "Uso: ajustar [parametro] [valor]. Ej: ajustar risk.max_hold_bars 20")
             return
@@ -2163,7 +2167,10 @@ def register_commands(application: Application) -> None:
     application.add_handler(MessageHandler(filters.COMMAND, _slash_router))
     application.add_handler(
         MessageHandler(
-            filters.Regex(r"^(?i)(posicion|posición|position|status|estado)$"),
+            filters.Regex(
+                r"^(posicion|posición|position|status|estado)$",
+                flags=re.IGNORECASE,
+            ),
             _status_plaintext_handler,
         )
     )
