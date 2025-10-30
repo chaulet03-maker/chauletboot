@@ -169,6 +169,47 @@ def test_runtime_flip_preserves_live_store(tmp_path, monkeypatch):
     assert live_store_path.read_text() == live_snapshot
 
 
+def test_exchange_respects_paper_mode(tmp_path, monkeypatch):
+    from bot.exchange import Exchange
+    import trading
+
+    data_dir = tmp_path / "data"
+    monkeypatch.setenv("DATA_DIR", str(data_dir))
+    _reset_paths(monkeypatch)
+    _reset_trading_state()
+
+    class DummyStore:
+        def load(self):
+            return {
+                "equity": 1234.56,
+                "pos_qty": 0.0,
+                "avg_price": 0.0,
+                "fees": 0.0,
+                "realized_pnl": 10.0,
+            }
+
+    class DummyPosSvc:
+        def __init__(self):
+            self.store = DummyStore()
+
+        def get_status(self):
+            return {"side": "FLAT", "qty": 0.0, "equity": 1244.56, "mark": 0.0}
+
+    trading.POSITION_SERVICE = DummyPosSvc()
+
+    ex = Exchange({"symbol": "BTC/USDT"})
+
+    loop = asyncio.get_event_loop()
+    bal = loop.run_until_complete(ex.fetch_balance_usdt())
+    assert bal == pytest.approx(1244.56)
+
+    pos = loop.run_until_complete(ex.get_open_position("BTC/USDT"))
+    assert pos is None
+
+    lst = loop.run_until_complete(ex.list_open_positions())
+    assert lst == []
+
+
 def test_telegram_mode_commands_use_source(monkeypatch):
     from bot.telemetry.telegram_bot import _cmd_modo_real, _cmd_modo_simulado
 
