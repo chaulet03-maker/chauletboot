@@ -804,7 +804,8 @@ def close_now(symbol: str | None = None):
         if hedged and side in {"LONG", "SHORT"}:
             kwargs["positionSide"] = side
         result_payload = BROKER.place_order(close_side, qty, None, **kwargs)
-        close_price = _infer_fill_price(result_payload, status.get("mark"))
+        fallback_px = get_latest_price(target_symbol) or status.get("mark")
+        close_price = _infer_fill_price(result_payload, fallback_px)
         effective_qty = qty
 
     try:
@@ -983,7 +984,8 @@ def close_bot_position_market() -> dict[str, Any]:
     except Exception as exc:
         return {"status": "error", "reason": str(exc)}
 
-    close_price = _infer_fill_price(result, mark_price)
+    fallback_px = get_latest_price(symbol_conf) or mark_price
+    close_price = _infer_fill_price(result, fallback_px)
     summary = {
         "status": "closed",
         "side": side,
