@@ -46,9 +46,13 @@ logger = logging.getLogger("telegram")
 REGISTRY = CommandRegistry()
 
 
-CLOSE_TEXT_RE = re.compile(r"^(cerrar(?: posicion| posición)?|close)$", re.IGNORECASE)
-OPEN_TEXT_RE = re.compile(r"^open\s+(long|short)\s+x(\d+)$", re.IGNORECASE)
-POSITION_TEXT_RE = re.compile(r"^(posicion|posición|position)$", re.IGNORECASE)
+CLOSE_TEXT_RE_PATTERN = r"(?i)^(cerrar(?: posicion| posición)?|close)$"
+OPEN_TEXT_RE_PATTERN = r"(?i)^open\s+(long|short)\s+x(\d+)$"
+POSITION_TEXT_RE_PATTERN = r"(?i)^(posicion|posición|position)$"
+
+CLOSE_TEXT_RE = re.compile(CLOSE_TEXT_RE_PATTERN)
+OPEN_TEXT_RE = re.compile(OPEN_TEXT_RE_PATTERN)
+POSITION_TEXT_RE = re.compile(POSITION_TEXT_RE_PATTERN)
 
 # === util local para formateo ===
 
@@ -2371,22 +2375,22 @@ def register_commands(application: Application) -> None:
 
     application.add_handler(MessageHandler(filters.COMMAND, _slash_router))
     application.add_handler(
-        MessageHandler(filters.Regex(r"^(status|estado)$", flags=re.IGNORECASE), _status_plaintext_handler) # CORRECCIÓN
+        MessageHandler(filters.Regex(r"(?i)^(status|estado)$"), _status_plaintext_handler) # CORRECCIÓN
     )
     application.add_handler(
-        MessageHandler(filters.Regex(CLOSE_TEXT_RE.pattern, flags=re.IGNORECASE), cerrar_command) # CORRECCIÓN
+        MessageHandler(filters.Regex(CLOSE_TEXT_RE_PATTERN), cerrar_command) # CORRECCIÓN
     )
     application.add_handler(
-        MessageHandler(filters.Regex(OPEN_TEXT_RE.pattern, flags=re.IGNORECASE), handle_open_manual) # CORRECCIÓN
+        MessageHandler(filters.Regex(OPEN_TEXT_RE_PATTERN), handle_open_manual) # CORRECCIÓN
     )
     application.add_handler(
-        MessageHandler(filters.Regex(POSITION_TEXT_RE.pattern, flags=re.IGNORECASE), posicion_command) # CORRECCIÓN
+        MessageHandler(filters.Regex(POSITION_TEXT_RE_PATTERN), posicion_command) # CORRECCIÓN
     )
     generic_filter = filters.TEXT & (~filters.COMMAND)
-    generic_filter = generic_filter & (~filters.Regex(CLOSE_TEXT_RE.pattern, flags=re.IGNORECASE)) # CORRECCIÓN
-    generic_filter = generic_filter & (~filters.Regex(OPEN_TEXT_RE.pattern, flags=re.IGNORECASE)) # CORRECCIÓN
-    generic_filter = generic_filter & (~filters.Regex(POSITION_TEXT_RE.pattern, flags=re.IGNORECASE)) # CORRECCIÓN
-    generic_filter = generic_filter & (~filters.Regex(r"^(status|estado)$", flags=re.IGNORECASE)) # CORRECCIÓN
+    generic_filter = generic_filter & (~filters.Regex(CLOSE_TEXT_RE_PATTERN)) # CORRECCIÓN
+    generic_filter = generic_filter & (~filters.Regex(OPEN_TEXT_RE_PATTERN)) # CORRECCIÓN
+    generic_filter = generic_filter & (~filters.Regex(POSITION_TEXT_RE_PATTERN)) # CORRECCIÓN
+    generic_filter = generic_filter & (~filters.Regex(r"(?i)^(status|estado)$")) # CORRECCIÓN
     application.add_handler(MessageHandler(generic_filter, _text_router))
     setattr(application, "_chaulet_router_registered", True)
     logger.info(
