@@ -44,6 +44,39 @@ logger = logging.getLogger("telegram")
 REGISTRY = CommandRegistry()
 
 
+# --- Aliases para compatibilidad: wrappers mínimas para comandos históricos ---
+
+
+async def estado_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Alias de /estado -> diag."""
+
+    return await diag_command(update, context)
+
+
+async def posicion_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Alias de /posicion -> diag (estado/posición)."""
+
+    return await diag_command(update, context)
+
+
+async def posiciones_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Alias de /posiciones -> diag (resumen estado + posiciones)."""
+
+    return await diag_command(update, context)
+
+
+async def open_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Alias de /open -> diag (posición abierta)."""
+
+    return await diag_command(update, context)
+
+
+async def rendimiento_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Alias de /rendimiento -> equity."""
+
+    return await equity_command(update, context)
+
+
 # Valores por defecto para TP/SL expresados como % del precio de entrada.
 DEFAULT_SL_PRICE_PCT = -10.0
 DEFAULT_TP_PRICE_PCT = 10.0
