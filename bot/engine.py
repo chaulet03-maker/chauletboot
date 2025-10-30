@@ -24,6 +24,7 @@ from bot.trader import Trader
 from bot.storage import Storage
 from bot.telemetry.notifier import Notifier
 from bot.telemetry.telegram_bot import setup_telegram_bot
+from bot.health.endpoint import attach_to_application
 from brokers import ACTIVE_LIVE_CLIENT
 from bot.identity import get_bot_id, make_client_oid
 from bot.ledger import bot_position, prune_open_older_than, init as ledger_init
@@ -167,6 +168,7 @@ class TradingApp:
         self.connection_lost = False
         self.rejection_log = deque(maxlen=10)
         self.telegram_app = setup_telegram_bot(self)
+        attach_to_application(self)
         self.notifier = Notifier(application=self.telegram_app, cfg=self.config)
         self.symbols = [self.config.get('symbol', 'BTC/USDT')]
         self.price_cache = {}
