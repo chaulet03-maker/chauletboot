@@ -1901,6 +1901,9 @@ class TradingApp:
 
             summary = dict(summary_base)
 
+            # Preferir precio de cierre directo del resultado si está disponible
+            close_price = close_result.get("close_price")
+
             def _assign_float(target: Dict[str, Any], key: str, value) -> None:
                 if value in (None, ""):
                     return
@@ -1914,11 +1917,14 @@ class TradingApp:
                 _assign_float(summary, "qty", closed_snapshot.get("qty"))
                 _assign_float(summary, "entry_price", closed_snapshot.get("entry_price"))
                 _assign_float(summary, "exit_price", closed_snapshot.get("exit_price"))
+                # Si close_result trae precio directo, lo usamos como fuente de verdad (evita snapshot viejo)
+                if close_price is not None:
+                    _assign_float(summary, "exit_price", close_price)
                 _assign_float(summary, "realized_pnl", closed_snapshot.get("realized_pnl"))
                 if closed_snapshot.get("closed_at") is not None:
                     summary["closed_at"] = closed_snapshot.get("closed_at")
             else:
-                close_price = close_result.get("close_price")
+                # Ya tenemos close_price calculado arriba
                 if close_price is not None:
                     _assign_float(summary, "exit_price", close_price)
                 entry_px = summary.get("entry_price")
