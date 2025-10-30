@@ -5,9 +5,11 @@ import asyncio
 import logging
 import os
 import time
+import html
 from typing import Iterable, Optional, Tuple
 
 import requests
+from telegram.constants import ParseMode
 
 logger = logging.getLogger(__name__)
 
@@ -60,7 +62,7 @@ def _chunks(text: str, limit: int = TELEGRAM_MAX_LEN) -> Iterable[str]:
 def notify(
     msg: str,
     *,
-    parse_mode: Optional[str] = None,
+    parse_mode: Optional[str] = ParseMode.HTML,
     disable_preview: bool = True,
     timeout: Tuple[float, float] = (3.0, 7.0),
     retries: int = 3,
@@ -149,16 +151,26 @@ class Notifier:
             chat = _TELEGRAM_CHAT_ID
         return str(chat) if chat else None
 
-    async def send(self, message, *, parse_mode: str = "Markdown"):
+    @staticmethod
+    def _sanitize_html(text: str) -> str:
+        safe = html.escape(str(text), quote=False)
+        for tag in ("b", "i", "u", "s", "code", "pre"):
+            safe = safe.replace(f"&lt;{tag}&gt;", f"<{tag}>")
+            safe = safe.replace(f"&lt;/{tag}&gt;", f"</{tag}>")
+        return safe
+
+    async def send(self, message, *, disable_preview: bool = True):
         text = str(message)
+        safe = self._sanitize_html(text)
         if self.app and self.chat_id:
             try:
                 await self.app.bot.send_message(
                     chat_id=self.chat_id,
-                    text=text,
-                    parse_mode=parse_mode,
+                    text=safe,
+                    parse_mode=ParseMode.HTML,
+                    disable_web_page_preview=disable_preview,
                 )
                 return
             except Exception as exc:
-                logger.error("Error al enviar notificación por Telegram: %s", exc)
-        notify(text, parse_mode=parse_mode)
+                logger.warning("Notifier: Telegram error: %s", exc, exc_info=True)
+        notify(safe, parse_mode=ParseMode.HTML, disable_preview=disable_preview)

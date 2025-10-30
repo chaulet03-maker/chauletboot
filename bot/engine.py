@@ -730,7 +730,7 @@ class TradingApp:
                     float(position.get('contracts') or position.get('size') or 0.0),
                     position.get('symbol') or self.config.get('symbol'),
                 )
-                now_ts = pd.Timestamp.utcnow().tz_localize("UTC")
+                now_ts = pd.Timestamp.now(tz="UTC")
                 side = (position.get('side') or '').upper()
                 qty_raw = position.get('contracts') or position.get('size') or 0.0
                 qty = float(qty_raw) if qty_raw is not None else 0.0
@@ -1607,7 +1607,7 @@ class TradingApp:
                 except Exception:
                     parsed_entry_ts = None
         if parsed_entry_ts is None:
-            parsed_entry_ts = pd.Timestamp.utcnow().tz_localize("UTC")
+            parsed_entry_ts = pd.Timestamp.now(tz="UTC")
         self._entry_ts = parsed_entry_ts
         return True
 
@@ -1911,7 +1911,7 @@ class TradingApp:
                 _assign_float(summary, "exit_price", close_result.get("close_price"))
 
             try:
-                now_ts = pd.Timestamp.utcnow().tz_localize("UTC")
+                now_ts = pd.Timestamp.now(tz="UTC")
                 trade_pnl = summary.get("realized_pnl") or summary.get("pnl_balance_delta")
                 if trade_pnl is not None:
                     self._register_close_R(now_ts, float(trade_pnl))

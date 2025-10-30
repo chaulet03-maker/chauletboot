@@ -85,22 +85,20 @@ async def estado_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if app is None or message is None:
         return
 
-    symbol_cfg = app.config.get("symbol", "BTC/USDT") if getattr(app, "config", None) else "BTC/USDT"
-    symbol_clean = symbol_cfg.replace("/", "")
+    sym = app.config.get("symbol", "BTC/USDT") if getattr(app, "config", None) else "BTC/USDT"
     mode_txt = "REAL" if getattr(app, "is_live", False) else "SIMULADO"
 
     try:
-        funding = await app.exchange.fetch_current_funding_rate(symbol_cfg)
+        bal = await app.exchange.fetch_balance_usdt()
     except Exception:
-        funding = None
+        bal = 0.0
 
     try:
-        balance = await app.exchange.fetch_balance_usdt()
+        fr = await app.exchange.fetch_current_funding_rate(sym)
     except Exception:
-        balance = 0.0
+        fr = None
 
-    day_stats = None
-    week_stats = None
+    day_stats = week_stats = None
     if hasattr(app, "get_period_stats"):
         try:
             day_stats = app.get_period_stats(days=1)
@@ -112,40 +110,26 @@ async def estado_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             week_stats = None
 
     def _fmt_stats(stats):
-        if not isinstance(stats, dict):
+        if not stats:
             return "—"
-        try:
-            eq_ini = float(stats.get("equity_ini") or 0.0)
-            pnl_val = float(stats.get("pnl") or (float(stats.get("equity_fin") or 0.0) - eq_ini))
-            pct = (pnl_val / eq_ini * 100.0) if eq_ini else 0.0
-        except Exception:
-            return "—"
-        sign = "+" if pnl_val >= 0 else ""
-        return f"{sign}{pnl_val:,.2f} ({sign}{pct:.2f}%)"
+        eq0 = float(stats.get("equity_ini") or 0.0)
+        pnl = float(stats.get("pnl") or 0.0)
+        pct = (pnl / eq0 * 100.0) if eq0 else 0.0
+        sign = "+" if pnl >= 0 else ""
+        return f"{sign}{pnl:,.2f} ({sign}{pct:.2f}%)"
 
-    ccxt_txt = "AUTENTICADO"
-    try:
-        if getattr(app.exchange, "is_paper", None) and app.exchange.is_paper():
-            ccxt_txt = "PÚBLICO"
-        elif not bool(getattr(app.exchange, "is_authenticated", False)):
-            client = getattr(app.exchange, "client", None)
-            if not (client and getattr(client, "apiKey", None)):
-                ccxt_txt = "PÚBLICO"
-    except Exception:
-        ccxt_txt = "PÚBLICO"
+    text = (
+        "<b>🩺 Diagnóstico</b>\n"
+        f"• Modo: <b>{mode_txt}</b>\n"
+        f"• Símbolo: {sym.replace('/', '')}\n"
+        f"• CCXT: {'AUTENTICADO' if getattr(app, 'is_live', False) else 'PÚBLICO'}\n"
+        f"• Funding rate: {fr if fr is not None else '—'}\n"
+        f"• Saldo: {bal:,.2f}\n"
+        f"• PnL 24h: {_fmt_stats(day_stats)}\n"
+        f"• PnL 7d:  {_fmt_stats(week_stats)}"
+    )
 
-    lines = [
-        "🩺 *Diagnóstico*",
-        f"• Modo: *{mode_txt}*",
-        f"• Símbolo: {symbol_clean}",
-        f"• CCXT: {ccxt_txt}",
-        f"• Funding rate: {funding if funding is not None else '—'}",
-        f"• Saldo: {balance:,.2f}",
-        f"• PnL 24h: {_fmt_stats(day_stats)}",
-        f"• PnL 7d:  {_fmt_stats(week_stats)}",
-    ]
-
-    await message.reply_markdown("\n".join(lines))
+    await message.reply_html(text)
 
 
 async def posicion_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -163,15 +147,14 @@ async def posicion_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await message.reply_text("El BOT no tiene posición abierta.")
         return
 
-    side = str(pos.get("side") or "").upper()
+    side = str(pos.get("side", "")).upper()
     qty = float(pos.get("contracts") or pos.get("positionAmt") or pos.get("size") or 0.0)
     entry = float(pos.get("entryPrice") or pos.get("avgPrice") or 0.0)
     mark = float(pos.get("markPrice") or pos.get("mark") or entry)
-    sign = 1.0 if side == "LONG" else -1.0
-    pnl = (mark - entry) * qty * sign
+    pnl = (mark - entry) * qty * (1.0 if side == "LONG" else -1.0)
 
-    await message.reply_markdown(
-        "📌 **Posición del BOT**\n"
+    await message.reply_html(
+        "<b>📌 Posición del BOT</b>\n"
         f"• {side} {qty:.6f}\n"
         f"• Entrada: {entry:,.2f} | Mark: {mark:,.2f}\n"
         f"• PnL actual: {pnl:+,.2f}"
@@ -192,63 +175,51 @@ async def posiciones_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         managed = None
 
     try:
-        others_raw = await app.exchange.list_open_positions()
+        allpos = await app.exchange.list_open_positions()
     except Exception:
-        others_raw = []
+        allpos = []
 
     others: List[Dict[str, Any]] = []
     if managed:
-        target_symbol = str(managed.get("symbol") or symbol_cfg).replace("/", "")
-        target_qty = float(managed.get("contracts") or managed.get("positionAmt") or 0.0)
-        for pos in others_raw or []:
-            sym_raw = str(pos.get("symbol") or "").replace("/", "")
-            qty_raw = float(pos.get("contracts") or pos.get("positionAmt") or pos.get("size") or 0.0)
-            if sym_raw == target_symbol and abs(qty_raw - target_qty) <= 1e-9:
+        target_symbol = str(managed.get("symbol") or symbol_cfg)
+        target_qty = float(managed.get("contracts") or 0.0)
+        for p in allpos or []:
+            sym = str(p.get("symbol") or "")
+            qty = float(p.get("contracts") or p.get("positionAmt") or p.get("size") or 0.0)
+            if sym == target_symbol and abs(qty - target_qty) <= 1e-9:
                 continue
-            others.append(pos)
+            others.append(p)
     else:
-        others = list(others_raw or [])
+        others = list(allpos or [])
 
-    blocks: List[str] = []
+    parts: List[str] = []
     if managed:
-        side = str(managed.get("side") or "").upper()
-        qty = float(managed.get("contracts") or 0.0)
-        entry = float(managed.get("entryPrice") or 0.0)
-        mark = float(managed.get("markPrice") or entry)
-        pnl = (mark - entry) * qty * (1.0 if side == "LONG" else -1.0)
-        blocks.append(
-            "🤖 **BOT**\n"
-            f"• {managed.get('symbol', symbol_cfg)} {side} {qty:.6f}\n"
-            f"• Entrada: {entry:,.2f} | Mark: {mark:,.2f}\n"
+        s = managed
+        side = str(s.get("side", "")).upper()
+        qty = float(s.get("contracts") or 0.0)
+        ep = float(s.get("entryPrice") or 0.0)
+        mp = float(s.get("markPrice") or ep)
+        pnl = (mp - ep) * qty * (1.0 if side == "LONG" else -1.0)
+        parts.append(
+            "<b>🤖 BOT</b>\n"
+            f"• {s.get('symbol', symbol_cfg)} {side} {qty:.6f}\n"
+            f"• Entrada: {ep:,.2f} | Mark: {mp:,.2f}\n"
             f"• PnL: {pnl:+,.2f}"
         )
-    else:
-        blocks.append("🤖 **BOT**\nNo hay posiciones abiertas.")
+    for s in others:
+        side = str(s.get("side", "")).upper()
+        qty = float(s.get("contracts") or s.get("positionAmt") or s.get("size") or 0.0)
+        ep = float(s.get("entryPrice") or s.get("avgPrice") or 0.0)
+        mp = float(s.get("markPrice") or s.get("mark") or ep)
+        pnl = (mp - ep) * qty * (1.0 if side == "LONG" else -1.0)
+        parts.append(
+            "<b>👤 Manual/Otras</b>\n"
+            f"• {s.get('symbol', '')} {side} {qty:.6f}\n"
+            f"• Entrada: {ep:,.2f} | Mark: {mp:,.2f}\n"
+            f"• PnL: {pnl:+,.2f}"
+        )
 
-    if others:
-        other_lines: List[str] = []
-        for pos in others:
-            try:
-                sym = pos.get("symbol") or ""
-                side = str(pos.get("side") or "").upper()
-                qty = float(pos.get("contracts") or pos.get("positionAmt") or pos.get("size") or 0.0)
-                entry = float(pos.get("entryPrice") or pos.get("avgPrice") or 0.0)
-                mark = float(pos.get("markPrice") or pos.get("mark") or entry)
-                pnl = (mark - entry) * qty * (1.0 if side == "LONG" else -1.0)
-            except Exception:
-                continue
-            other_lines.append(
-                "👤 **Manual/Otras**\n"
-                f"• {sym} {side} {qty:.6f}\n"
-                f"• Entrada: {entry:,.2f} | Mark: {mark:,.2f}\n"
-                f"• PnL: {pnl:+,.2f}"
-            )
-        if other_lines:
-            blocks.extend(other_lines)
-    else:
-        blocks.append("👤 **Manual/Otras**\nNo hay posiciones abiertas.")
-
-    await message.reply_markdown("\n\n".join(blocks))
+    await message.reply_html("\n\n".join(parts) if parts else "No hay posiciones abiertas.")
 
 
 # Valores por defecto para TP/SL expresados como % del precio de entrada.
@@ -1364,52 +1335,34 @@ async def _handle_position_controls(engine, reply_md, text: str) -> bool:
 
     return False
 
-def _format_close_result(result: Any) -> tuple[bool, str]:
+def _format_close_result(result: Any) -> tuple[bool, str | None]:
     if not isinstance(result, dict):
-        return False, "⚠️ No se pudo cerrar la posición del BOT."
+        return False, None
 
-    status = str(result.get("status") or "").lower()
-    if status == "noop":
-        reason = result.get("reason") or "No había posición del BOT para cerrar."
-        return False, f"ℹ️ {reason}"
+    if str(result.get("status") or "").lower() != "closed":
+        return False, None
 
     summary = result.get("summary") or {}
-    try:
-        side = (summary.get("side") or "LONG").upper()
-    except Exception:
-        side = "LONG"
-    try:
-        qty = float(summary.get("qty") or summary.get("quantity") or 0.0)
-    except Exception:
-        qty = 0.0
-    try:
-        entry = float(summary.get("entry_price") or summary.get("entry") or 0.0)
-    except Exception:
-        entry = 0.0
-    try:
-        exit_price = float(summary.get("exit_price") or summary.get("exit") or 0.0)
-    except Exception:
-        exit_price = 0.0
-    pnl_source = summary.get("realized_pnl")
-    if pnl_source is None:
-        pnl_source = summary.get("pnl_balance_delta")
-    try:
-        pnl = float(pnl_source or 0.0)
-    except Exception:
-        pnl = 0.0
+    side = str(summary.get("side") or "?").upper()
+    qty = float(summary.get("qty") or summary.get("quantity") or 0.0)
+    entry_price = float(summary.get("entry_price") or summary.get("entry") or 0.0)
+    exit_price = float(summary.get("exit_price") or summary.get("exit") or 0.0)
+    pnl_val = summary.get("realized_pnl")
+    if pnl_val is None:
+        pnl_val = summary.get("pnl_balance_delta")
 
-    if status not in {"closed", "filled"} and qty <= 0:
-        reason = result.get("reason") or result.get("info") or "No pude confirmar el cierre."
-        return False, f"⚠️ {reason}"
-
-    text = (
-        "✅ Cerré la **posición del BOT**.\n"
-        f"• Lado: *{side}*\n"
+    msg = (
+        "<b>✅ Cerré la posición del BOT</b>\n"
+        f"• Lado: <b>{side}</b>\n"
         f"• Cantidad: {qty:.6f}\n"
-        f"• Precio: entrada ${_fmt_money(entry)} | salida ${_fmt_money(exit_price)}\n"
-        f"• PnL: {_fmt_sign_money(pnl)}"
+        f"• Precio: entrada {entry_price:,.2f} | salida {exit_price:,.2f}"
     )
-    return True, text
+    if pnl_val is not None:
+        try:
+            msg += f"\n• PnL: {float(pnl_val):+,.2f}"
+        except Exception:
+            pass
+    return True, msg
 
 
 async def cerrar_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1425,10 +1378,10 @@ async def cerrar_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     ok, text = _format_close_result(result)
-    if ok:
-        await message.reply_markdown(text)
+    if ok and text:
+        await message.reply_html(text)
     else:
-        await message.reply_text(text)
+        await message.reply_text("✅ Cerré la posición del BOT.")
 
 
 async def control_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1494,44 +1447,33 @@ async def sl_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await message.reply_text(f"SL predeterminado: -{pct:.2f}% del equity.")
         return
 
-    raw = " ".join(args).strip()
-    if not raw:
-        await message.reply_text("Formato inválido. Usá `sl 5` o `sl $108000`.")
-        return
-
-    normalized = raw.replace(",", ".").strip()
-    if normalized.startswith("$"):
+    raw = " ".join(args).strip().replace(",", ".")
+    if raw.startswith("$"):
         try:
-            price = float(normalized.replace("$", ""))
+            px = float(raw.replace("$", "").strip())
         except Exception:
-            await message.reply_text("Formato inválido. Usá `sl 5` o `sl $108000`.")
+            await message.reply_text("Formato inválido. Usá `sl 5` (equity %) o `sl $108000` (precio).")
             return
         try:
             pos = await app.exchange.get_open_position(app.config.get("symbol"))
         except Exception:
             pos = None
-        if not pos:
+        if pos:
+            await app.exchange.update_protections(
+                symbol=app.config.get("symbol"),
+                side=pos.get("side"),
+                qty=float(pos.get("contracts") or pos.get("positionAmt") or 0.0),
+                sl=px,
+            )
+            await message.reply_text(f"✅ SL actualizado a ${px:,.2f}")
+        else:
             await message.reply_text("No hay posición del BOT abierta.")
-            return
-        qty = float(pos.get("contracts") or pos.get("positionAmt") or 0.0)
-        side = pos.get("side") or ""
-        await app.exchange.update_protections(
-            symbol=app.config.get("symbol"),
-            side=side,
-            qty=qty,
-            sl=price,
-        )
-        await message.reply_text(f"✅ SL actualizado a ${price:,.2f}")
         return
 
-    normalized = normalized.replace("%", "")
     try:
-        pct = float(normalized)
+        pct = float(raw)
     except Exception:
-        await message.reply_text("Formato inválido. Usá `sl 5` o `sl $108000`.")
-        return
-    if pct <= 0:
-        await message.reply_text("El porcentaje debe ser positivo.")
+        await message.reply_text("Formato inválido. Usá `sl 5` (equity %) o `sl $108000` (precio).")
         return
     if hasattr(app, "set_sl_equity_pct"):
         app.set_sl_equity_pct(pct)
@@ -1547,15 +1489,12 @@ async def tp_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args or []
     if not args:
         current = float(getattr(app, "tp_equity_pct", 0.0) or 0.0)
-        if current <= 0:
-            await message.reply_text("TP automático desactivado.")
-        else:
-            await message.reply_text(f"TP automático: +{current:.2f}% del equity.")
+        msg = "TP automático desactivado." if current <= 0 else f"TP automático: +{current:.2f}% del equity."
+        await message.reply_text(msg)
         return
 
-    raw = " ".join(args).strip().replace("%", "").replace(",", ".")
     try:
-        pct = max(0.0, float(raw))
+        pct = max(0.0, float(" ".join(args).strip().replace(",", ".")))
     except Exception:
         await message.reply_text("Formato inválido. Usá `tp 10` para +10% del equity.")
         return
@@ -1563,10 +1502,9 @@ async def tp_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if hasattr(app, "set_tp_equity_pct"):
         app.set_tp_equity_pct(pct)
 
-    if pct > 0:
-        await message.reply_text(f"✅ TP automático a +{pct:.2f}% del equity.")
-    else:
-        await message.reply_text("✅ TP automático desactivado.")
+    await message.reply_text(
+        "✅ TP automático desactivado." if pct == 0 else f"✅ TP automático a +{pct:.2f}% del equity."
+    )
 
 
 async def precio_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2428,7 +2366,7 @@ async def run_telegram_bot(token: str, engine) -> Application:
     register_commands(application)
     await application.initialize()
     await application.start()
-    await application.updater.start_polling()
+    await application.updater.start_polling(drop_pending_updates=True)
     return application
 
 
@@ -2492,7 +2430,7 @@ async def start_telegram_bot(app, config):
         logger.info("No webhook to delete or failed to delete: %s", e)
     await application.start()
     logger.info("Telegram bot started")
-    await application.updater.start_polling()
+    await application.updater.start_polling(drop_pending_updates=True)
 
 # >>> MEJORA: Wrapper compatible con engine.py
 def launch_telegram_bot(app, config, engine_api=None):
