@@ -43,16 +43,21 @@ def _write_cfg(cfg: dict, path: str = CONFIG_PATH) -> None:
     cfg_path = os.path.expanduser(path)
     if not os.path.isabs(cfg_path):
         cfg_path = os.path.abspath(cfg_path)
-    with open(cfg_path, "w", encoding="utf-8") as fh:
+    # asegurar carpeta destino
+    os.makedirs(os.path.dirname(cfg_path) or ".", exist_ok=True)
+    # write-then-rename (atómico)
+    tmp = cfg_path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
         yaml.safe_dump(cfg, fh, allow_unicode=True, sort_keys=False)
+    os.replace(tmp, cfg_path)
 
 
 def get_mode() -> Mode:
     # Runtime state tiene prioridad para comandos/manuales.
-    runtime_mode = runtime_get_mode()
-    if runtime_mode == "live":
+    runtime_mode = (runtime_get_mode() or "").strip().lower()
+    if runtime_mode in {"live", "real"}:
         return "real"
-    if runtime_mode == "paper":
+    if runtime_mode in {"paper", "sim", "simulado"}:
         return "simulado"
 
     cfg = _read_cfg()
@@ -82,10 +87,13 @@ def check_keys_present(env=os.environ) -> Tuple[bool, str]:
         key = env.get(key_name)
         secret = env.get(secret_name)
         if key and secret:
-            if len(key) < 10 or len(secret) < 10:
-                return False, "Credenciales Binance parecen inválidas (muy cortas)."
-            return True, "OK"
-    return False, "Faltan credenciales Binance en el entorno (BINANCE_KEY/BINANCE_SECRET)."
+            if len(str(key)) < 10 or len(str(secret)) < 10:
+                return False, f"Credenciales {key_name}/{secret_name} parecen inválidas (muy cortas)."
+            return True, f"Usando {key_name}/{secret_name}"
+    return False, (
+        "Faltan credenciales Binance. Admitidos: "
+        "BINANCE_API_KEY/_SECRET, ..._REAL, ..._TEST, BINANCE_KEY/_SECRET."
+    )
 
 
 def safe_switch(new_mode: Mode, services) -> ModeResult:
@@ -147,5 +155,10 @@ def safe_switch(new_mode: Mode, services) -> ModeResult:
             message = f"{message}\n{warn_msg}"
         return ModeResult(True, message, new_mode)
     except Exception as exc:  # pragma: no cover - defensivo
+        # rollback config/runtime si falló el rebuild
+        try:
+            set_mode_in_yaml(current)
+        except Exception:
+            pass
         log.exception("Error al cambiar de modo: %s", exc)
         return ModeResult(False, f"Error al cambiar de modo: {exc}", None)
