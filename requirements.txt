@@ -14,3 +14,5 @@ schedule==1.2.2                        # <- NUEVO: el bot lo importa
 APScheduler==3.10.4                    # <- opcional pero recomendado; lo usa el JobQueue
 # PTB 20.7 requiere httpx ~= 0.25.2
 httpx==0.25.2
+websockets==10.4
+binance-connector==3.6.*

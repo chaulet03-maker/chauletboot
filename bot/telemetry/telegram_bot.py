@@ -3,9 +3,9 @@ import math
 import logging
 import asyncio
 import sqlite3
+import time
 import re
 import inspect
-import time
 from collections import deque
 from datetime import datetime, timedelta, time as dtime, timezone
 from pathlib import Path
@@ -1382,6 +1382,21 @@ async def cerrar_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await message.reply_html(text)
     else:
         await message.reply_text("✅ Cerré la posición del BOT.")
+
+    if ok and app is not None:
+        try:
+            app.manual_block_until = time.time() + 600
+            log = getattr(app, "log", None) or getattr(app, "logger", None)
+            if log is not None:
+                log.info(
+                    "Cooldown activado por cierre manual: 10 min sin entradas nuevas."
+                )
+        except Exception:
+            if getattr(app, "logger", None) is not None:
+                app.logger.debug(
+                    "No se pudo establecer el cooldown manual tras cierre.",
+                    exc_info=True,
+                )
 
 
 async def control_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
