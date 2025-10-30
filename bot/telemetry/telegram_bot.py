@@ -1073,1090 +1073,144 @@ def _bot_position_info(engine) -> Optional[dict[str, Any]]:
 
 
 async def _handle_position_controls(engine, reply_md, text: str) -> bool:
+    """
+    Solo maneja seteo/consulta de *defaults* de SL/TP cuando NO hay posición del BOT.
+    Si hay posición abierta, devolvemos False y dejan trabajar a sl_command/tp_command.
+    """
     if not text:
         return False
 
-    broker = getattr(trading, "BROKER", None)
-    if broker is None:
-        return False
+    text_raw = (text or "").strip()
+    lower = text_raw.lower()
 
-    cfg_engine = getattr(engine, "config", {}) or {}
-    symbol_conf_default = cfg_engine.get("symbol", "BTC/USDT")
-    symbol_norm_default = _normalized_symbol(symbol_conf_default)
-
+    # ¿Hay posición del BOT?
     position = _bot_position_info(engine)
-    lower = text.lower()
-    symbol_conf = (
-        position.get("symbol_conf")
-        if isinstance(position, dict) and position.get("symbol_conf")
-        else symbol_conf_default
-    )
-    symbol_norm = (
-        position.get("symbol")
-        if isinstance(position, dict) and position.get("symbol")
-        else symbol_norm_default
-    )
-
-    if position is None:
-        text_raw = (text or "").strip()
-        defaults = get_protection_defaults(symbol_conf)
-
-        if re.match(r"^/?sl\s*$", text_raw, re.IGNORECASE):
-            stored_kind = defaults.get("sl_last_kind")
-            if stored_kind == "pct" and defaults.get("sl_pct_equity") not in (None, ""):
-                pct_val = float(defaults["sl_pct_equity"])
-                await reply_md(f"SL predeterminado: {pct_val:+.2f}% del precio")
-            elif stored_kind == "price" and defaults.get("sl_price") not in (None, ""):
-                await reply_md(f"SL predeterminado: {_num(defaults['sl_price'])}")
-            else:
-                await reply_md("SL predeterminado: —")
-            await reply_md("Uso: `sl +5`, `sl -2`, `sl 105000`")
-            return True
-
-        m_sl_pct = re.match(r"^/?sl\s*([+\-]?)(\d+(?:\.\d+)?)%?\s*$", text_raw, re.IGNORECASE)
-        m_sl_abs = None
-        if not m_sl_pct:
-            m_sl_abs = re.match(r"^/?sl\s*\$?\s*(\d+(?:\.\d+)?)\s*$", text_raw, re.IGNORECASE)
-        if m_sl_pct or m_sl_abs:
-            if m_sl_pct:
-                sign = m_sl_pct.group(1)
-                try:
-                    pct = float(m_sl_pct.group(2))
-                except Exception:
-                    await reply_md("Formato SL: `sl +5`, `sl -2` o `sl 105000`")
-                    return True
-                pct_signed = (+pct if sign == "+" else (-pct if sign == "-" else -pct))
-                update_protection_defaults(
-                    symbol_conf,
-                    sl_last_kind="pct",
-                    sl_pct_equity=pct_signed,
-                    sl_price=None,
-                )
-                await reply_md(
-                    f"✅ SL predeterminado guardado: {pct_signed:+.2f}% del precio (se aplicará al próximo trade)."
-                )
-            else:
-                try:
-                    raw = m_sl_abs.group(1)  # type: ignore[union-attr]
-                    target = float(str(raw).replace(".", "").replace(",", "."))
-                except Exception:
-                    await reply_md("Formato SL: `sl +5`, `sl -2` o `sl 105000`")
-                    return True
-                update_protection_defaults(
-                    symbol_conf,
-                    sl_last_kind="price",
-                    sl_price=target,
-                    sl_pct_equity=None,
-                )
-                await reply_md(
-                    f"✅ SL predeterminado guardado en {_num(target)} (se aplicará al próximo trade)."
-                )
-            return True
-
-        if re.match(r"^/?tp\s*$", text_raw, re.IGNORECASE):
-            stored_kind = defaults.get("tp_last_kind")
-            if stored_kind == "pct" and defaults.get("tp_pct_equity") not in (None, ""):
-                pct_val = float(defaults["tp_pct_equity"])
-                await reply_md(f"TP predeterminado: {pct_val:+.2f}% del precio")
-            elif stored_kind == "price" and defaults.get("tp_price") not in (None, ""):
-                await reply_md(f"TP predeterminado: {_num(defaults['tp_price'])}")
-            else:
-                await reply_md("TP predeterminado: —")
-            await reply_md("Uso: `tp +5` o `tp 109000`")
-            return True
-
-        m_tp_pct = re.match(r"^/?tp\s*([+\-]?)(\d+(?:\.\d+)?)%?\s*$", text_raw, re.IGNORECASE)
-        m_tp_abs = None
-        if not m_tp_pct:
-            m_tp_abs = re.match(r"^/?tp\s*\$?\s*(\d+(?:\.\d+)?)\s*$", text_raw, re.IGNORECASE)
-        if m_tp_pct or m_tp_abs:
-            if m_tp_pct:
-                sign = m_tp_pct.group(1)
-                try:
-                    pct = float(m_tp_pct.group(2))
-                except Exception:
-                    await reply_md("Formato TP: `tp +5` o `tp 109000`")
-                    return True
-                pct_signed = (+pct if sign == "+" else (-pct if sign == "-" else +pct))
-                update_protection_defaults(
-                    symbol_conf,
-                    tp_last_kind="pct",
-                    tp_pct_equity=pct_signed,
-                    tp_price=None,
-                )
-                await reply_md(
-                    f"✅ TP predeterminado guardado: {pct_signed:+.2f}% del precio (se aplicará al próximo trade)."
-                )
-            else:
-                try:
-                    raw = m_tp_abs.group(1)  # type: ignore[union-attr]
-                    target = float(str(raw).replace(".", "").replace(",", "."))
-                except Exception:
-                    await reply_md("Formato TP: `tp +5` o `tp 109000`")
-                    return True
-                update_protection_defaults(
-                    symbol_conf,
-                    tp_last_kind="price",
-                    tp_price=target,
-                    tp_pct_equity=None,
-                )
-                await reply_md(
-                    f"✅ TP predeterminado guardado en {_num(target)} (se aplicará al próximo trade)."
-                )
-            return True
-
+    if position is not None:
+        # Con posición abierta, usar los comandos dedicados (/sl y /tp)
         return False
 
-    qty_abs = float(position.get("qty") or 0.0)
-    entry = float(position.get("entry") or 0.0)
-    side_now = position["side"]
-    exchange = getattr(engine, "exchange", None)
+    # Sin posición → permitir setear/ver DEFAULTS
+    cfg_engine = getattr(engine, "config", {}) or {}
+    symbol_conf = cfg_engine.get("symbol", "BTC/USDT")
+    defaults = get_protection_defaults(symbol_conf)
 
-    trader = getattr(engine, "trader", None)
-    try:
-        equity = float(trader.equity()) if trader is not None else 0.0
-    except Exception:
-        equity = 0.0
-
-    async def _current_mark() -> Optional[float]:
-        mark_val: Optional[float] = None
-        if exchange is not None and hasattr(exchange, "get_current_price"):
-            try:
-                mark_raw = await exchange.get_current_price(symbol_norm)
-                mark_val = float(mark_raw)
-            except Exception:
-                mark_val = None
-        if mark_val is None:
-            try:
-                mark_val = float(position.get("mark")) if position.get("mark") is not None else None
-            except Exception:
-                mark_val = None
-        return mark_val
-
-    m_sl_abs = re.search(r"\bsl\s*\$([0-9][\d.,]*)\b", lower)
-    m_sl_pct = re.search(r"\bsl\s*([+-]?)(\d+(?:\.\d+)?)\b", lower) if not m_sl_abs else None
-    if m_sl_pct or m_sl_abs:
-        if qty_abs <= 0 or entry <= 0:
-            await reply_md("No tengo datos de la posición para calcular SL.")
-            return True
-        if m_sl_pct:
-            sign = m_sl_pct.group(1)
-            try:
-                pct = float(m_sl_pct.group(2))
-            except Exception:
-                await reply_md("Formato SL: `sl +5`, `sl -2` o `sl 105000`")
-                return True
-            if equity <= 0 and trader is not None and not S.PAPER:
-                try:
-                    equity = float(trader.equity(force_refresh=True))
-                except Exception:
-                    logger.debug("No se pudo refrescar equity live para SL %%.", exc_info=True)
-            if equity <= 0:
-                if S.PAPER:
-                    await reply_md("Equity <= 0. Configuralo con `equity 1000` antes de usar SL %.")
-                else:
-                    await reply_md("No pude obtener el equity live desde Binance. Intentá nuevamente en unos segundos.")
-                return True
-            pct_signed = (+pct if sign == "+" else (-pct if sign == "-" else -pct))
-            target = _target_from_price_pct(entry, side_now, pct_signed)
+    # ----- SL -----
+    if re.match(r"^/?sl\s*$", text_raw, re.IGNORECASE):
+        stored_kind = defaults.get("sl_last_kind")
+        if stored_kind == "pct" and defaults.get("sl_pct_equity") not in (None, ""):
+            pct_val = float(defaults["sl_pct_equity"])
+            await reply_md(f"SL predeterminado: {pct_val:+.2f}% del precio")
+        elif stored_kind == "price" and defaults.get("sl_price") not in (None, ""):
+            await reply_md(f"SL predeterminado: {_num(defaults['sl_price'])}")
         else:
-            try:
-                raw = m_sl_abs.group(1)  # type: ignore[union-attr]
-                target = float(str(raw).replace(".", "").replace(",", "."))
-            except Exception:
-                await reply_md("Formato SL: `sl +5`, `sl -2` o `sl 105000`")
-                return True
-        price_pct, pnl_pct_equity = _pcts_for_target(entry, target, qty_abs, equity, side_now)
-        try:
-            broker.update_protections(symbol_norm, side_now, qty_abs, sl=target)
-            update_open_position(symbol_conf, sl=target)
-            if m_sl_pct:
-                update_protection_defaults(
-                    symbol_conf,
-                    sl_last_kind="pct",
-                    sl_pct_equity=pct_signed,
-                    sl_price=None,
-                )
-            else:
-                update_protection_defaults(
-                    symbol_conf,
-                    sl_last_kind="price",
-                    sl_price=target,
-                    sl_pct_equity=None,
-                )
-        except Exception as exc:
-            await reply_md(f"No pude actualizar SL: {exc}")
-            return True
-        mark_val = await _current_mark()
-        crossed = False
-        if mark_val is not None:
-            if side_now == "LONG" and mark_val <= target:
-                crossed = True
-            if side_now == "SHORT" and mark_val >= target:
-                crossed = True
-            if crossed:
-            def _classify_close_result(payload: Any) -> str | None:
-                if not isinstance(payload, dict):
-                    return None
-                status_val = str(payload.get("status") or "").strip().lower()
-                if status_val == "noop":
-                    return "no_position"
-                if status_val == "closed":
-                    return "filled"
-                if status_val == "error":
-                    return "failed"
-                info = str(payload.get("info") or "").strip().lower()
-                if info and "sin posición" in info:
-                    return "no_position"
-                try:
-                    ok_val = payload.get("ok")
-                    if ok_val is False:
-                        return "failed"
-                except Exception:
-                    pass
-                executed = 0.0
-                for key in (
-                    "executedQty",
-                    "executed_qty",
-                    "filled",
-                    "fills_qty",
-                    "cumQty",
-                    "cumqty",
-                ):
-                    if key not in payload:
-                        continue
-                    try:
-                        executed = max(executed, abs(float(payload.get(key) or 0.0)))
-                    except Exception:
-                        continue
-                if executed > 0:
-                    return "filled"
-                status = str(payload.get("status") or "").strip().upper()
-                if status in {"FILLED", "PARTIALLY_FILLED"}:
-                    return "filled"
-                return None
-
-            close_result: Any = None
-            try:
-                close_result = trading.close_bot_position_market()
-            except Exception as exc:
-                logger.debug("No se pudo cerrar posición tras cruzar SL: %s", exc)
-
-            classification = _classify_close_result(close_result)
-            if classification == "filled":
-                await reply_md(f"✅ SL alcanzado. Posición cerrada (SL: ${target:,.2f}).")
-            elif classification == "no_position":
-                await reply_md("SL cruzado, pero no hay posición abierta para cerrar.")
-            else:
-                await reply_md(
-                    f"SL cruzado (mark {_num(mark_val)}). Intentá cerrar manualmente."
-                )
-            return True
-        await reply_md(
-            f"✅ SL actualizado a ${target:,.2f} "
-            f"({price_pct:+.2f}% precio | PnL {pnl_pct_equity:+.2f}%)"
-        )
+            await reply_md("SL predeterminado: —")
+        await reply_md("Uso: `sl +5`, `sl -2`, `sl 105000`")
         return True
 
-    m_tp_abs = re.search(r"\btp\s*\$([0-9][\d.,]*)\b", lower)
-    m_tp_pct = re.search(r"\btp\s*([+-]?)(\d+(?:\.\d+)?)\b", lower) if not m_tp_abs else None
-    if m_tp_pct or m_tp_abs:
-        if qty_abs <= 0 or entry <= 0:
-            await reply_md("No tengo datos de la posición para calcular TP.")
-            return True
-        if m_tp_pct:
-            sign = m_tp_pct.group(1)
-            try:
-                pct = float(m_tp_pct.group(2))
-            except Exception:
-                await reply_md("Formato TP: `tp +5` o `tp 109000`")
-                return True
-            if equity <= 0:
-                await reply_md("Equity <= 0. Configuralo con `equity 1000` antes de usar TP %.")
-                return True
-            pct_signed = (+pct if sign == "+" else (-pct if sign == "-" else +pct))
-            target = _target_from_price_pct(entry, side_now, pct_signed)
+    m_sl_pct = re.match(r"^/?sl\s*([+\-]?)(\d+(?:\.\d+)?)%?\s*$", text_raw, re.IGNORECASE)
+    m_sl_abs = None if m_sl_pct else re.match(r"^/?sl\s*\$?\s*(\d+(?:\.\d+)?)\s*$", text_raw, re.IGNORECASE)
+    if m_sl_pct:
+        sign = m_sl_pct.group(1)
+        pct = float(m_sl_pct.group(2))
+        pct_signed = (+pct if sign == "+" else (-pct if sign == "-" else -pct))
+        update_protection_defaults(symbol_conf, sl_last_kind="pct", sl_pct_equity=pct_signed, sl_price=None)
+        await reply_md(f"✅ SL predeterminado guardado: {pct_signed:+.2f}% del precio.")
+        return True
+    if m_sl_abs:
+        raw = m_sl_abs.group(1)
+        target = float(str(raw).replace(".", "").replace(",", "."))
+        update_protection_defaults(symbol_conf, sl_last_kind="price", sl_price=target, sl_pct_equity=None)
+        await reply_md(f"✅ SL predeterminado guardado en {_num(target)}.")
+        return True
+
+    # ----- TP -----
+    if re.match(r"^/?tp\s*$", text_raw, re.IGNORECASE):
+        stored_kind = defaults.get("tp_last_kind")
+        if stored_kind == "pct" and defaults.get("tp_pct_equity") not in (None, ""):
+            pct_val = float(defaults["tp_pct_equity"])
+            await reply_md(f"TP predeterminado: {pct_val:+.2f}% del precio")
+        elif stored_kind == "price" and defaults.get("tp_price") not in (None, ""):
+            await reply_md(f"TP predeterminado: {_num(defaults['tp_price'])}")
         else:
-            try:
-                raw = m_tp_abs.group(1)  # type: ignore[union-attr]
-                target = float(str(raw).replace(".", "").replace(",", "."))
-            except Exception:
-                await reply_md("Formato TP: `tp +5` o `tp 109000`")
-                return True
-        price_pct, pnl_pct_equity = _pcts_for_target(entry, target, qty_abs, equity, side_now)
-        try:
-            broker.update_protections(symbol_norm, side_now, qty_abs, tp=target)
-            update_open_position(symbol_conf, tp=target)
-            if m_tp_pct:
-                update_protection_defaults(
-                    symbol_conf,
-                    tp_last_kind="pct",
-                    tp_pct_equity=pct_signed,
-                    tp_price=None,
-                )
-            else:
-                update_protection_defaults(
-                    symbol_conf,
-                    tp_last_kind="price",
-                    tp_price=target,
-                    tp_pct_equity=None,
-                )
-        except Exception as exc:
-            await reply_md(f"No pude actualizar TP: {exc}")
-            return True
-        mark_val = await _current_mark()
-        reached = False
-        if mark_val is not None:
-            if side_now == "LONG" and mark_val >= target:
-                reached = True
-            if side_now == "SHORT" and mark_val <= target:
-                reached = True
-        if reached:
-            try:
-                result = trading.close_bot_position_market()
-            except Exception as exc:
-                logger.debug("tp_command: cierre tras TP falló: %s", exc)
-                result = {"status": "error"}
-            status_val = (
-                str(result.get("status")) if isinstance(result, dict) else ""
-            ).strip().lower()
-            if status_val == "closed":
-                await reply_md(f"✅ TP alcanzado. Posición cerrada (TP: ${target:,.2f}).")
-            elif status_val == "noop":
-                await reply_md("TP cruzado, pero no hay posición abierta para cerrar.")
-            else:
-                await reply_md(
-                    f"TP cruzado (mark {_num(mark_val)}). Intentá cerrar manualmente."
-                )
-            return True
-        await reply_md(
-            f"✅ TP actualizado a ${target:,.2f} "
-            f"({price_pct:+.2f}% precio | PnL {pnl_pct_equity:+.2f}%)"
-        )
+            await reply_md("TP predeterminado: —")
+        await reply_md("Uso: `tp +5` o `tp 109000`")
+        return True
+
+    m_tp_pct = re.match(r"^/?tp\s*([+\-]?)(\d+(?:\.\d+)?)%?\s*$", text_raw, re.IGNORECASE)
+    m_tp_abs = None if m_tp_pct else re.match(r"^/?tp\s*\$?\s*(\d+(?:\.\d+)?)\s*$", text_raw, re.IGNORECASE)
+    if m_tp_pct:
+        sign = m_tp_pct.group(1)
+        pct = float(m_tp_pct.group(2))
+        pct_signed = (+pct if sign == "+" else (-pct if sign == "-" else +pct))
+        update_protection_defaults(symbol_conf, tp_last_kind="pct", tp_pct_equity=pct_signed, tp_price=None)
+        await reply_md(f"✅ TP predeterminado guardado: {pct_signed:+.2f}% del precio.")
+        return True
+    if m_tp_abs:
+        raw = m_tp_abs.group(1)
+        target = float(str(raw).replace(".", "").replace(",", "."))
+        update_protection_defaults(symbol_conf, tp_last_kind="price", tp_price=target, tp_pct_equity=None)
+        await reply_md(f"✅ TP predeterminado guardado en {_num(target)}.")
         return True
 
     return False
 
-
-def _position_status_message(engine) -> str:
-    symbol_default = _default_symbol(engine)
-    try:
-        st = trading.POSITION_SERVICE.get_status() if trading.POSITION_SERVICE else None
-    except Exception as exc:
-        logger.debug("posicion/status error: %s", exc)
-        st = None
-    if not st or (st.get("side", "FLAT").upper() == "FLAT"):
-        return f"Estado Actual: Sin posición\n----------------\nSímbolo: {symbol_default}"
-    side = (st.get("side") or "").upper()
-    symbol = st.get("symbol", symbol_default)
-    entry_price = float(st.get("entry_price", 0.0) or 0.0)
-    pnl = float(st.get("pnl", 0.0) or 0.0)
-    return (
-        "Estado Actual: Posición Abierta\n"
-        "----------------\n"
-        f"Símbolo: {symbol}\n"
-        f"Lado: {side}\n"
-        f"Precio de Entrada: ${entry_price:.2f}\n"
-        f"PNL Actual: ${pnl:+.2f}\n"
-    )
-
-
-async def posicion_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    message = update.effective_message
-    if message is None:
-        return
-
-    engine = _get_engine_from_context(context)
-    if engine is None:
-        await message.reply_text("No pude acceder al engine para consultar la posición.")
-        return
-
-    # Forzar upgrade a real para coherencia con /posiciones
-    exchange = getattr(engine, "exchange", None)
-    if exchange is not None and hasattr(exchange, "upgrade_to_real_if_needed"):
-        try:
-            await exchange.upgrade_to_real_if_needed()
-        except Exception as exc:
-            logger.debug("upgrade_to_real_if_needed desde /posicion falló: %s", exc)
-
-    # Mostrar SOLO la posición del BOT (store local)
-    try:
-        st = trading.POSITION_SERVICE.get_status() if trading.POSITION_SERVICE else None
-    except Exception:
-        st = None
-    side_flat = (not st) or (str(st.get("side","FLAT")).upper() == "FLAT")
-
-    # Si en LIVE el store está flat, consultamos la posición LIVE del exchange
-    if side_flat and _is_engine_live(engine):
-        symbol_conf = (engine.config or {}).get("symbol", "BTC/USDT")
-        exchange = getattr(engine, "exchange", None)
-        live_pos = None
-        if exchange is not None and hasattr(exchange, "get_open_position"):
-            try:
-                live_pos = await exchange.get_open_position(symbol_conf)
-            except Exception as exc:
-                logger.debug("get_open_position falló: %s", exc, exc_info=True)
-
-        if live_pos:
-            # Formateamos con el mismo builder para unificar salida
-            size = float(
-                live_pos.get("contracts")
-                or live_pos.get("positionAmt")
-                or live_pos.get("size")
-                or 0.0
-            )
-            side = "LONG" if size > 0 else "SHORT"
-            qty_signed = _signed_qty(abs(size), side)
-            entry = float(live_pos.get("entryPrice") or live_pos.get("entry") or 0.0)
-            mark  = float(live_pos.get("markPrice")  or live_pos.get("mark")  or entry)
-            sym   = live_pos.get("symbol") or symbol_conf
-            reply_text = _build_bot_position_message(
-                engine=engine, symbol=sym, qty=qty_signed, avg=entry, mark_val=mark
-            )
-            return await message.reply_text(reply_text, parse_mode="Markdown")
-
-    if side_flat:
-        reply_text = "📍 Posición del BOT: *SIN POSICIÓN*"
-    else:
-        q = float(st.get("qty") or st.get("size") or 0.0)
-        side = (st.get("side") or "").upper()
-        entry = float(st.get("entry_price") or 0.0)
-        mark = float(st.get("mark") or 0.0)
-        sym = st.get("symbol") or (engine.config or {}).get("symbol", "?")
-        qty_signed = _signed_qty(q, side)
-        reply_text = _build_bot_position_message(
-            engine=engine,
-            symbol=sym,
-            qty=qty_signed,
-            avg=entry,
-            mark_val=mark,
-        )
-    await message.reply_text(reply_text, parse_mode="Markdown")
-
-
-async def posiciones_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Lista todas las posiciones abiertas; la del bot va en **negrita**."""
-    message = update.effective_message
-    if message is None:
-        return
-
-    engine = _get_engine_from_context(context)
-    if engine is None:
-        await message.reply_text("No pude acceder al engine para consultar posiciones.")
-        return
-
-    symbol_bot = (getattr(engine, "config", {}) or {}).get("symbol", "BTC/USDT")
-    exchange = getattr(engine, "exchange", None)
-    if exchange is None:
-        await message.reply_text("Exchange no disponible.")
-        return
-
-    # 1) Forzar upgrade a real
-    try:
-        if hasattr(exchange, "upgrade_to_real_if_needed"):
-            await exchange.upgrade_to_real_if_needed()
-    except Exception as exc:
-        logger.debug("upgrade_to_real_if_needed desde /posiciones falló: %s", exc)
-    # 2) Traer TODAS las posiciones del exchange (usuario + bot)
-    try:
-        live_positions = await exchange.list_open_positions()
-    except Exception as exc:  # pragma: no cover - robustez
-        await message.reply_text(f"No pude leer posiciones: {exc}")
-        return
-
-    blocks: list[str] = []
-    # Si el exchange no reporta, usar respaldo del BOT
-    if not live_positions:
-        try:
-            st = trading.POSITION_SERVICE.get_status() if trading.POSITION_SERVICE else None
-        except Exception:
-            st = None
-        if st and (st.get("side", "FLAT").upper() != "FLAT"):
-            q = float(st.get("qty") or st.get("size") or 0.0)
-            side = (st.get("side") or "").upper()
-            entry = float(st.get("entry_price") or 0.0)
-            mark = float(st.get("mark") or 0.0)
-            sym = st.get("symbol") or symbol_bot
-            qty_signed = _signed_qty(q, side)
-            blocks.append(
-                _build_bot_position_message(
-                    engine=engine,
-                    symbol=sym,
-                    qty=qty_signed,
-                    avg=entry,
-                    mark_val=mark,
-                )
-            )
-            await message.reply_text("\n".join(blocks), parse_mode="Markdown")
-            return
-        await message.reply_text("No hay posiciones abiertas.")
-        return
-
-    # Hay posiciones en el exchange → mostrarlas con el mismo formato
-    for pos in live_positions:
-        symbol = pos.get("symbol") or pos.get("symbolName") or symbol_bot
-        side = (pos.get("side") or "").upper()
-        size = float(pos.get("contracts") or pos.get("positionAmt") or pos.get("size") or 0.0)
-        entry = float(pos.get("entryPrice") or pos.get("avgEntryPrice") or pos.get("entry") or 0.0)
-        mark = float(pos.get("markPrice") or pos.get("mark") or 0.0)
-        upnl = float(pos.get("unrealizedPnl") or pos.get("unrealized_pnl") or 0.0)
-        is_bot_symbol = str(symbol).upper() == str(symbol_bot).upper()
-        mode_txt = "real" if not S.PAPER else "simulado"
-        qty_signed = _signed_qty(size, side)
-        if is_bot_symbol:
-            blocks.append(
-                _build_bot_position_message(
-                    engine=engine,
-                    symbol=symbol,
-                    qty=qty_signed,
-                    avg=entry,
-                    mark_val=mark,
-                )
-            )
-        else:
-            blocks.append(
-                _format_position_block(
-                    symbol=symbol,
-                    side=side,
-                    qty=size,
-                    entry=entry,
-                    mark=mark,
-                    pnl=upnl,
-                    mode_txt=mode_txt,
-                    opened_at=None,
-                    is_bot=False,
-                )
-            )
-    await message.reply_text("\n\n".join(blocks), parse_mode="Markdown")
-
-
-def _sym(s):
-    return (s or "BTCUSDT").replace("/", "").upper()
-
-
-async def _cmd_open(engine, reply, raw_txt):
-    t = (raw_txt or "").strip().lower()
-    m = re.search(r"\bopen\s+(long|short)\s+x\s*(\d+)\b", t)
-    if not m:
-        return await reply("Formato: open long x5  |  open short x10")
-
-    side_txt = m.group(1).upper()   # LONG/SHORT
-    lev      = int(m.group(2))
-    cfg      = getattr(engine, "config", {}) or {}
-    symbol_conf = cfg.get("symbol", "BTC/USDT")
-    symbol   = _sym(symbol_conf)
-    side     = "BUY" if side_txt=="LONG" else "SELL"
-
-    exchange = getattr(engine, "exchange", None)
-    broker = getattr(engine, "broker", None)
-    trader = getattr(engine, "trader", None)
-    if exchange is None or broker is None:
-        return await reply("No pude obtener acceso a exchange/broker para abrir.")
-
-    # precio actual
-    try:
-        px = await exchange.get_current_price(symbol)
-    except Exception:
-        px = None
-    if not px:
-        return await reply("No pude obtener precio actual del símbolo.")
-
-    # equity para sizing (como pediste: el que seteás con 'equity', en ambos modos)
-    try:
-        eq = float(trader.equity()) if trader is not None else 0.0
-    except Exception:
-        eq = 0.0
-
-    if eq <= 0 and trader is not None:
-        try:
-            refreshed = await trader.get_balance(exchange)
-            if refreshed is not None:
-                eq = float(refreshed)
-        except Exception:
-            logger.debug("open_command: no se pudo refrescar equity desde el exchange", exc_info=True)
-
-    if eq <= 0:
-        return await reply(f"Equity = ${eq:,.2f}")
-
-    fraction = float(_get_equity_fraction(engine))
-    if not (0.0 < fraction <= 1.0):
-        fraction = 1.0
-    effective_equity = eq * fraction
-    if effective_equity <= 0:
-        return await reply("Equity % = 0. Ajustalo con: equity 50")
-
-    qty = (effective_equity * lev) / float(px)
-    try:
-        round_qty_fn = getattr(exchange, "round_qty", None)
-        if callable(round_qty_fn):
-            maybe_qty = round_qty_fn(symbol, qty)
-            qty = await maybe_qty if inspect.isawaitable(maybe_qty) else maybe_qty
-    except Exception:
-        pass
-    if qty <= 0:
-        return await reply("Cantidad final <= 0 (minQty/minNotional). Subí equity o bajá leverage.")
-
-    try:
-        res = await broker.place_market_order(symbol=symbol, side=side, quantity=qty, leverage=lev)
-    except Exception as e:
-        return await reply(f"Fallo al abrir: {e}")
-
-    entry_price = float(
-        res.get("price") if isinstance(res, dict) and res.get("price") is not None else px
-    )
-
-    try:
-        # Enganchá TP/SL de tu estrategia (si tenés método)
-        strategy = getattr(engine, "strategy", None)
-        attach = getattr(strategy, "attach_tp_sl", None)
-        if callable(attach):
-            maybe_coro = attach(symbol=symbol, side_txt=side_txt, entry_price=entry_price)
-            if inspect.isawaitable(maybe_coro):
-                await maybe_coro
-    except Exception:
-        pass
-
-    # ======= TP / SL (intento 1: que la estrategia los devuelva) =======
-    tp = sl = None
-    try:
-        strategy = getattr(engine, "strategy", None)
-        attach = getattr(strategy, "attach_tp_sl", None)
-        if callable(attach):
-            out = attach(symbol=symbol, side_txt=side_txt, entry_price=entry_price, return_levels=True)
-            out = await out if inspect.isawaitable(out) else out
-            if isinstance(out, dict):
-                tp = out.get("tp") or out.get("tp_price") or out.get("take_profit")
-                sl = out.get("sl") or out.get("sl_price") or out.get("stop_loss")
-    except Exception:
-        pass
-
-    # ======= TP / SL (fallback por config si no hay niveles de la estrategia) =======
-    from bot.settings_utils import read_config_raw
-    from config import S
-
-    raw_cfg = read_config_raw()
-    strategy_cfg = raw_cfg.get("strategy", {}) if isinstance(raw_cfg, dict) else {}
-    tp_pct = _first_float(
-        getattr(S, "tp_pct", None),
-        raw_cfg.get("tp_pct") if isinstance(raw_cfg, dict) else None,
-        strategy_cfg.get("tp_pct") if isinstance(strategy_cfg, dict) else None,
-        default=None,
-    )
-    sl_pct = _first_float(
-        getattr(S, "sl_pct", None),
-        raw_cfg.get("sl_pct") if isinstance(raw_cfg, dict) else None,
-        strategy_cfg.get("sl_pct") if isinstance(strategy_cfg, dict) else None,
-        default=None,
-    )
-    if (tp is None or sl is None) and tp_pct is not None and sl_pct is not None:
-        tp_pct_f = float(tp_pct)
-        sl_pct_f = float(sl_pct)
-        if side_txt == "LONG":
-            tp = tp or (entry_price * (1 + tp_pct_f))
-            sl = sl or (entry_price * (1 - sl_pct_f))
-        else:
-            tp = tp or (entry_price * (1 - tp_pct_f))
-            sl = sl or (entry_price * (1 + sl_pct_f))
-
-    defaults = get_protection_defaults(symbol_conf)
-    persist_sl_default = False
-    persist_tp_default = False
-
-    sl_kind = str(defaults.get("sl_last_kind") or "").lower()
-    if sl_kind not in {"pct", "price"}:
-        defaults["sl_last_kind"] = "pct"
-        sl_kind = "pct"
-        persist_sl_default = True
-
-    tp_kind = str(defaults.get("tp_last_kind") or "").lower()
-    if tp_kind not in {"pct", "price"}:
-        defaults["tp_last_kind"] = "pct"
-        tp_kind = "pct"
-        persist_tp_default = True
-
-    cfg_strategy = cfg.get("strategy") if isinstance(cfg, dict) else None
-
-    sl_pct_price_cfg: Optional[float]
-    if sl_kind == "pct":
-        sl_pct_price_cfg = _normalize_percent_value(defaults.get("sl_pct_equity"))
-        if sl_pct_price_cfg is None:
-            fallback_sl_candidates: list[Any] = []
-            if isinstance(cfg, dict):
-                fallback_sl_candidates.extend(
-                    [
-                        cfg.get("sl_pct_equity"),
-                        cfg.get("sl_eq_pct"),
-                        cfg.get("stop_eq_pnl_pct"),
-                    ]
-                )
-                if isinstance(cfg_strategy, dict):
-                    fallback_sl_candidates.extend(
-                        [
-                            cfg_strategy.get("sl_pct_equity"),
-                            cfg_strategy.get("sl_eq_pct"),
-                            cfg_strategy.get("stop_eq_pnl_pct"),
-                        ]
-                    )
-            if isinstance(raw_cfg, dict):
-                fallback_sl_candidates.extend(
-                    [
-                        raw_cfg.get("sl_pct_equity"),
-                        raw_cfg.get("sl_eq_pct"),
-                        raw_cfg.get("stop_eq_pnl_pct"),
-                    ]
-                )
-                raw_strategy_cfg = raw_cfg.get("strategy")
-                if isinstance(raw_strategy_cfg, dict):
-                    fallback_sl_candidates.extend(
-                        [
-                            raw_strategy_cfg.get("sl_pct_equity"),
-                            raw_strategy_cfg.get("sl_eq_pct"),
-                            raw_strategy_cfg.get("stop_eq_pnl_pct"),
-                        ]
-            )
-            sl_pct_price_cfg = None
-            for cand in fallback_sl_candidates:
-                sl_pct_price_cfg = _normalize_percent_value(cand, prefer_sign=-1)
-                if sl_pct_price_cfg is not None:
-                    break
-            if sl_pct_price_cfg is None:
-                sl_pct_price_cfg = DEFAULT_SL_PRICE_PCT
-            defaults["sl_pct_equity"] = sl_pct_price_cfg
-            persist_sl_default = True
-        else:
-            defaults["sl_pct_equity"] = sl_pct_price_cfg
-    else:
-        sl_pct_price_cfg = None
-
-    tp_pct_price_cfg: Optional[float]
-    if tp_kind == "pct":
-        tp_pct_price_cfg = _normalize_percent_value(defaults.get("tp_pct_equity"))
-        if tp_pct_price_cfg is None:
-            fallback_tp_candidates: list[Any] = []
-            lev_keys: list[Any] = [str(int(lev))]
-            lev_int = int(lev)
-            if lev_int not in lev_keys:
-                lev_keys.append(lev_int)
-            for source in (cfg, raw_cfg):
-                if isinstance(source, dict):
-                    mapping = source.get("tp_eq_pct_by_leverage")
-                    if isinstance(mapping, dict):
-                        for key in lev_keys:
-                            if key in mapping:
-                                fallback_tp_candidates.append(mapping[key])
-                                break
-            for cand in (
-                cfg.get("target_eq_pnl_pct") if isinstance(cfg, dict) else None,
-                raw_cfg.get("target_eq_pnl_pct") if isinstance(raw_cfg, dict) else None,
-                strategy_cfg.get("target_eq_pnl_pct") if isinstance(strategy_cfg, dict) else None,
-            ):
-                fallback_tp_candidates.append(cand)
-            tp_pct_price_cfg = None
-            for cand in fallback_tp_candidates:
-                tp_pct_price_cfg = _normalize_percent_value(cand, prefer_sign=1)
-                if tp_pct_price_cfg is not None:
-                    break
-            if tp_pct_price_cfg is None:
-                tp_pct_price_cfg = DEFAULT_TP_PRICE_PCT
-            defaults["tp_pct_equity"] = tp_pct_price_cfg
-            persist_tp_default = True
-        else:
-            defaults["tp_pct_equity"] = tp_pct_price_cfg
-    else:
-        tp_pct_price_cfg = None
-
-    qty_abs = abs(float(qty))
-    if sl is None and qty_abs > 0:
-        if defaults.get("sl_last_kind") == "pct" and defaults.get("sl_pct_equity") not in (None, ""):
-            try:
-                pct_val = float(defaults.get("sl_pct_equity"))
-                sl = _target_from_price_pct(entry_price, side_txt, pct_val)
-            except Exception:
-                logger.debug("open_command: no se pudo aplicar SL % por defecto", exc_info=True)
-        elif defaults.get("sl_last_kind") == "price" and defaults.get("sl_price") not in (None, ""):
-            try:
-                sl = float(defaults.get("sl_price"))
-            except Exception:
-                logger.debug("open_command: SL precio por defecto inválido", exc_info=True)
-    if sl is None and entry_price > 0:
-        sl = _target_from_price_pct(entry_price, side_txt, DEFAULT_SL_PRICE_PCT)
-
-    if tp is None and qty_abs > 0:
-        if defaults.get("tp_last_kind") == "pct" and defaults.get("tp_pct_equity") not in (None, ""):
-            try:
-                pct_val = float(defaults.get("tp_pct_equity"))
-                tp = _target_from_price_pct(entry_price, side_txt, pct_val)
-            except Exception:
-                logger.debug("open_command: no se pudo aplicar TP % por defecto", exc_info=True)
-        elif defaults.get("tp_last_kind") == "price" and defaults.get("tp_price") not in (None, ""):
-            try:
-                tp = float(defaults.get("tp_price"))
-            except Exception:
-                logger.debug("open_command: TP precio por defecto inválido", exc_info=True)
-    if tp is None and entry_price > 0:
-        tp = _target_from_price_pct(entry_price, side_txt, DEFAULT_TP_PRICE_PCT)
-
-    tp_price = float(tp) if tp is not None else None
-    sl_price = float(sl) if sl is not None else None
-
-    backend_broker = getattr(trading, "BROKER", None)
-    changes: dict[str, float] = {}
-    if tp_price is not None:
-        changes["tp"] = tp_price
-    if sl_price is not None:
-        changes["sl"] = sl_price
-    if backend_broker is not None and qty_abs > 0 and changes:
-        try:
-            backend_broker.update_protections(symbol, side_txt, qty_abs, tp=tp_price, sl=sl_price)
-        except Exception:
-            logger.debug("open_command: no se pudo fijar protecciones por defecto", exc_info=True)
-    if changes:
-        try:
-            update_open_position(symbol_conf, **changes)
-        except Exception:
-            logger.debug("open_command: no se pudo persistir protecciones en state_store", exc_info=True)
-
-    if persist_sl_default:
-        try:
-            if defaults.get("sl_last_kind") == "pct":
-                update_protection_defaults(
-                    symbol_conf,
-                    sl_last_kind="pct",
-                    sl_pct_equity=defaults.get("sl_pct_equity"),
-                    sl_price=None,
-                )
-            elif defaults.get("sl_last_kind") == "price":
-                update_protection_defaults(
-                    symbol_conf,
-                    sl_last_kind="price",
-                    sl_price=defaults.get("sl_price"),
-                    sl_pct_equity=None,
-                )
-        except Exception:
-            logger.debug("open_command: no se pudo guardar SL predeterminado", exc_info=True)
-
-    if persist_tp_default:
-        try:
-            if defaults.get("tp_last_kind") == "pct":
-                update_protection_defaults(
-                    symbol_conf,
-                    tp_last_kind="pct",
-                    tp_pct_equity=defaults.get("tp_pct_equity"),
-                    tp_price=None,
-                )
-            elif defaults.get("tp_last_kind") == "price":
-                update_protection_defaults(
-                    symbol_conf,
-                    tp_last_kind="price",
-                    tp_price=defaults.get("tp_price"),
-                    tp_pct_equity=None,
-                )
-        except Exception:
-            logger.debug("open_command: no se pudo guardar TP predeterminado", exc_info=True)
-
-    # ======= Mensaje final claro =======
-    margin = float(effective_equity)
-    notional = float(qty) * float(entry_price)
-    latency_ms = 0
-
-    return await reply(
-        open_msg(
-            symbol,
-            "long" if side_txt == "LONG" else "short",
-            margin,
-            lev,
-            notional,
-            float(entry_price),
-            tp_price,
-            None,
-            sl_price,
-            "MARKET",
-            latency_ms,
-        )
-    )
-
-
-async def open_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    message = update.effective_message
-    if message is None:
-        return
-
-    engine = _get_engine_from_context(context)
-    if engine is None:
-        await message.reply_text("No pude acceder al engine para abrir la operación.")
-        return
-
-    reply_md = lambda txt: message.reply_text(txt, parse_mode="Markdown")
-    await _cmd_open(engine, reply_md, message.text or "")
-
-
-async def _cmd_estado(engine, reply):
-    cfg = getattr(engine, "config", {}) or {}
-    symbol = (cfg.get("symbol") or "BTCUSDT").replace("/", "").upper()
-    mode = _get_mode_from_engine(engine)      # 'live' | 'paper'
-    exchange = getattr(engine, "exchange", None)
-    trader = getattr(engine, "trader", None)
-
-    # EQUITY correcto según modo
-    if mode == "live":
-        # 1) Usar SIEMPRE el Exchange del engine (ya autenticado y con defaultType=future)
-        equity = 0.0
-        if exchange is not None and hasattr(exchange, "fetch_balance_usdt"):
-            try:
-                equity = await exchange.fetch_balance_usdt()
-            except Exception:
-                logger.debug("fetch_balance_usdt falló (exchange).", exc_info=True)
-
-        # 2) Fallback adicional por si el cliente del exchange no trajo nada
-        if equity <= 0.0:
-            try:
-                equity = await asyncio.to_thread(fetch_live_equity_usdm)
-            except Exception:
-                logger.debug("fetch_live_equity_usdm fallback falló.", exc_info=True)
-                equity = 0.0
-        return await reply(
-            "Modo: REAL\n"
-            f"Símbolo: {symbol}\n"
-            f"saldo: {equity:,.2f}"
-        )
-
-    try:
-        equity = float(trader.equity()) if trader else 0.0  # el que seteás con 'equity'
-    except Exception:
-        equity = 0.0
-
-    # Mark para PnL no realizado
-    async def _mark(sym):
-        try:
-            if not exchange:
-                return None
-            px = await exchange.get_current_price(sym)
-            return float(px)
-        except Exception:
-            return None
-
-    # PnL del BOT (no del exchange)
-    pnl = await pnl_summary_bot(mode=("live" if mode=="live" else "paper"), mark_provider=_mark)
-    d, w = pnl["daily"], pnl["weekly"]
-
-    return await reply(
-        f"Modo: *{'REAL' if mode=='live' else 'SIMULADO'}*\n"
-        f"Símbolo: {symbol}\n"
-        f"saldo: {equity:,.2f}\n"
-        f"PnL Diario: {d['total']:+.2f} (R={d['realized']:+.2f} | U={d['unrealized']:+.2f})\n"
-        f"PnL Semanal: {w['total']:+.2f} (R={w['realized']:+.2f} | U={w['unrealized']:+.2f})"
-    )
-
-async def estado_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    message = update.effective_message
-    if message is None:
-        return
-
-    engine = _get_engine_from_context(context)
-    if engine is None:
-        await message.reply_text("No pude acceder al engine para consultar el estado.")
-        return
-
-    reply_md = lambda txt: message.reply_text(txt, parse_mode="Markdown")
-    await _cmd_estado(engine, reply_md)
-
-
-async def rendimiento_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Calcula y envía las estadísticas de rendimiento desde la base de datos."""
-    chat = update.effective_chat if update else None
-    if chat is None:
-        return
-
-    application = getattr(context, "application", None)
-    engine = application.bot_data.get("engine") if application else None
-    if engine is None:
-        await chat.send_message("No pude acceder al motor (engine).")
-        return
-
-    db_path = (
-        getattr(engine, "db_path", None)
-        or getattr(engine, "metrics_db_path", None)
-        or os.getenv("PERF_DB_PATH")
-        or "data/perf.db"
-    )
-    path = Path(db_path)
-    if not path.exists():
-        await chat.send_message("No encuentro la base de rendimiento (data/perf.db).")
-        return
-
-    try:
-        with sqlite3.connect(str(path)) as conn:
-            cursor = conn.cursor()
-            cursor.execute(
-                "SELECT COUNT(*), SUM(pnl), SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END) FROM trades"
-            )
-            total_trades, total_pnl, wins = cursor.fetchone()
-
-        if not total_trades:
-            reply_text = "Aún no hay operaciones completadas en el historial."
-        else:
-            total_pnl = total_pnl or 0
-            wins = wins or 0
-            losses = total_trades - wins
-            winrate = (wins / total_trades) * 100 if total_trades > 0 else 0
-
-            reply_text = (
-                "**Rendimiento Histórico (Base de Datos)**\n"
-                "----------------------------------\n"
-                f"📈 **Trades Totales:** {total_trades}\n"
-                f"✅ **Ganadas:** {wins}\n"
-                f"❌ **Perdidas:** {losses}\n"
-                f"🎯 **Winrate:** {winrate:.2f}%\n"
-                f"💰 **PNL Neto Total:** {total_pnl:+.2f} USD"
-            )
-    except Exception as exc:
-        reply_text = f"Error al leer la base de datos de rendimiento: {exc}"
-
-    await chat.send_message(reply_text, parse_mode="Markdown")
-
-
 async def cerrar_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    def _classify(payload: Any) -> str:
+        if not isinstance(payload, dict):
+            return ""
+        s = str(payload.get("status") or "").strip().lower()
+        if s in {"closed", "filled"}:
+            return "closed"
+        if s in {"noop"}:
+            return "noop"
+        info = str(payload.get("info") or "").lower()
+        if "sin posición" in info or "no position" in info:
+            return "noop"
+        try:
+            exq = float(payload.get("executedQty") or payload.get("filled") or payload.get("cumQty") or 0)
+            if exq > 0:
+                return "closed"
+        except Exception:
+            pass
+        return s
+
+    async def _ok(msg: str):
+        await _reply_chunks(update, msg)
+
     engine = _get_engine_from_context(context)
     if engine is None:
-        await _reply_chunks(update, "Engine no disponible para cerrar posiciones.")
+        await _ok("Engine no disponible para cerrar posiciones.")
         return
+
+    # 1) intento oficial del engine
+    result = None
     try:
         result = await engine.close_all()
-        if isinstance(result, dict):
-            status = str(result.get("status", "")).lower()
-            if status == "closed":
-                summary = result.get("summary") or {}
-                lines = ["✅ Cerré la **posición del BOT**."]
-                side_txt = summary.get("side")
-                if side_txt:
-                    lines.append(f"• Lado: *{str(side_txt).upper()}*")
-                qty_val = summary.get("qty")
-                if qty_val not in (None, ""):
-                    lines.append(f"• Cantidad: {_num(qty_val, 6)}")
-                entry_val = summary.get("entry_price")
-                exit_val = summary.get("exit_price")
-                if entry_val not in (None, "") or exit_val not in (None, ""):
-                    entry_txt = _num(entry_val) if entry_val not in (None, "") else "—"
-                    exit_txt = _num(exit_val) if exit_val not in (None, "") else "—"
-                    lines.append(f"• Precio: entrada {entry_txt} | salida {exit_txt}")
-                pnl_val = summary.get("realized_pnl")
-                if pnl_val not in (None, ""):
-                    lines.append(f"• PnL: {_num(pnl_val)}")
-                lev_val = summary.get("leverage")
-                if lev_val not in (None, ""):
-                    lines.append(f"• Leverage: x{_num(lev_val, 2)}")
-                await _reply_chunks(update, "\n".join(lines))
-            elif status == "noop":
-                reason = result.get("reason") or "No había **posición del BOT** para cerrar."
-                await _reply_chunks(update, f"⚠️ {reason}")
-            else:
-                await _reply_chunks(update, "⚠️ No pude confirmar el cierre de la **posición del BOT**.")
-        elif result:
-            await _reply_chunks(update, "✅ Cerré la **posición del BOT**.")
-        else:
-            await _reply_chunks(update, "⚠️ No había **posición del BOT** para cerrar.")
     except Exception as exc:
-        await _reply_chunks(update, f"No pude cerrar la **posición del BOT**: {exc}")
+        result = {"status": "error", "info": str(exc)}
+
+    status = _classify(result) if result is not None else ""
+    if status == "closed":
+        await _ok("✅ Cerré la **posición del BOT**.")
+        return
+    if status == "noop":
+        await _ok("⚠️ No había **posición del BOT** para cerrar.")
+        return
+
+    # 2) fallback directo al broker/trading
+    try:
+        fb = trading.close_bot_position_market()
+    except Exception as exc:
+        await _ok(f"⚠️ Intenté cerrar, pero falló: {exc}")
+        return
+
+    status_fb = _classify(fb)
+    if status_fb == "closed":
+        await _ok("✅ Cerré la **posición del BOT**.")
+    elif status_fb == "noop":
+        await _ok("⚠️ No había **posición del BOT** para cerrar.")
+    else:
+        await _ok("⚠️ No pude confirmar el cierre. Revisá logs o intentá de nuevo.")
 
 
 async def control_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2635,12 +1689,43 @@ async def _cmd_modo_simulado(engine, reply):
 
 async def _cmd_modo_real(engine, reply):
     if _get_mode_from_engine(engine) == "live":
-        return await reply("✅ El bot ya se encontraba en *MODO REAL*.")
+        return await reply("✅ El bot ya está en *MODO REAL*.")
+
     try:
-        engine.set_mode("live")    # usa el método que agregaste recién
-        return await reply("✅ Modo cambiado a *REAL*. El bot ahora opera en real.")
+        engine.set_mode("live")
     except Exception as e:
-        return await reply("⚠️ No pude cambiar a REAL (revisá logs / configuración de modo).")
+        return await reply(f"⚠️ No pude cambiar a REAL: {e}")
+
+    ex = getattr(engine, "exchange", None)
+    if ex and hasattr(ex, "upgrade_to_real_if_needed"):
+        try:
+            await ex.upgrade_to_real_if_needed()
+        except Exception as e:
+            return await reply(f"⚠️ No pude autenticar el exchange: {e}")
+
+    # Verificaciones
+    authed = False
+    try:
+        authed = bool(getattr(ex, "is_authenticated", False))
+        client = getattr(ex, "client", None)
+        if client and getattr(client, "apiKey", None):
+            authed = True
+    except Exception:
+        pass
+
+    bal_txt = ""
+    try:
+        if ex and hasattr(ex, "fetch_balance_usdt"):
+            bal = await ex.fetch_balance_usdt()
+            bal_txt = f" | saldo USDT: {bal:,.2f}"
+    except Exception:
+        bal_txt = " | saldo: N/D"
+
+    if not authed:
+        return await reply("⚠️ MODO REAL activado pero *no veo auth en CCXT*. "
+                           "Verificá API/SECRET, permisos de Futuros y `defaultType=future` en el cliente.")
+
+    return await reply(f"✅ MODO REAL activado{bal_txt}")
 
 
 async def modo_simulado_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2935,13 +2020,13 @@ def _populate_registry() -> None:
     REGISTRY.register(
         "open",
         open_command,
-        aliases=["open", "abrir"],
+        aliases=["abrir"],
         help_text="Abre una operación manual. Ej: open long x5",
     )
     REGISTRY.register(
         "diag",
         diag_command,
-        aliases=["diagnostico", "status", "health"],
+        aliases=["diagnostico", "health"],
         help_text="Muestra un diagnóstico rápido (modo, CCXT, precio, funding, equity).",
     )
     REGISTRY.register(
@@ -3367,8 +2452,6 @@ async def run_telegram_bot(token: str, engine) -> Application:
         pass
 
     register_commands(application)
-    application.add_handler(CommandHandler(["cerrar", "close"], cerrar_command))
-
     await application.initialize()
     await application.start()
     await application.updater.start_polling()
