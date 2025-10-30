@@ -97,6 +97,13 @@ def _quantize_amount(
     return qty
 
 
+def _runtime_mode_value() -> str:
+    try:
+        return (runtime_get_mode() or "paper").lower()
+    except Exception:
+        return "paper"
+
+
 class _EngineBrokerAdapter:
     def __init__(self, app: "TradingApp"):
         self.app = app
@@ -143,8 +150,10 @@ class _EngineBrokerAdapter:
 class TradingApp:
     def __init__(self, cfg):
         self.config = cfg
-        self.config.setdefault("trading_mode", S.trading_mode)
-        self.config.setdefault("mode", "paper" if S.PAPER else "real")
+        runtime_mode = _runtime_mode_value()
+        default_trading_mode = "real" if runtime_mode in {"real", "live"} else "simulado"
+        self.config.setdefault("trading_mode", default_trading_mode)
+        self.config.setdefault("mode", "real" if runtime_mode in {"real", "live"} else "paper")
         self.config.setdefault("start_equity", S.start_equity)
         self.logger = logging.getLogger(__name__)
 
@@ -1101,14 +1110,15 @@ class TradingApp:
 
             leverage = self.strategy.dynamic_leverage(last_candle)
             symbol_conf = str(self.config.get('symbol', 'BTC/USDT'))
-            if S.PAPER:
-                self.logger.info(
-                    "PAPER: leverage lógico=%s (no se setea en Binance)", leverage
-                )
-            else:
+            runtime_mode = _runtime_mode_value()
+            if runtime_mode in {"real", "live"}:
                 await self.exchange.set_leverage(
                     leverage,
                     symbol_conf,
+                )
+            else:
+                self.logger.info(
+                    "SIMULADO: leverage lógico=%s (no se setea en Binance)", leverage
                 )
 
             entry_price = await self.exchange.get_current_price(symbol_conf)
@@ -1294,7 +1304,8 @@ class TradingApp:
 
             # 4) Ahora sí: anunciar la apertura (usá tu formato nuevo si ya lo tenés)
             base = str(self.config.get("symbol", "BTC/USDT")).split("/")[0]
-            mode_txt = "real" if not S.PAPER else "simulado"
+            runtime_mode = _runtime_mode_value()
+            mode_txt = "real" if runtime_mode in {"real", "live"} else "simulado"
             await self.notifier.send(
                 "🚀 operacion "
                 + f"{base} Abierta: {signal} ({mode_txt})\n"
@@ -1588,8 +1599,11 @@ class TradingApp:
 
         symbol = status.get("symbol", self.config.get("symbol", "BTC/USDT"))
         qty = float(status.get("qty") or status.get("size") or 0.0)
+        runtime_mode = _runtime_mode_value()
+        is_live_runtime = runtime_mode in {"real", "live"}
+
         # Precarga de posición: SOLO en SIM. En REAL validar con exchange primero.
-        if S.PAPER:
+        if not is_live_runtime:
             position = {
                 "symbol": symbol,
                 "side": side,
