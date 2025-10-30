@@ -103,6 +103,28 @@ class Exchange:
         """
         Devuelve una sola posición (la del símbolo configurado), o None si no hay.
         """
+        # En modo PAPER nunca interrogamos posiciones “live”.
+        if self.is_paper():
+            try:
+                import trading
+
+                svc = getattr(trading, "POSITION_SERVICE", None)
+                if svc is None:
+                    return None
+                st = svc.get_status() or {}
+                side = str(st.get("side", "FLAT")).upper()
+                qty = float(st.get("qty") or st.get("pos_qty") or 0.0)
+                if side == "FLAT" or qty == 0.0:
+                    return None
+                return {
+                    "symbol": symbol or self.config.get("symbol", "BTC/USDT"),
+                    "side": side,
+                    "contracts": float(abs(qty)),
+                    "entryPrice": float(st.get("entry_price") or st.get("avg_price") or 0.0),
+                    "markPrice": float(st.get("mark") or st.get("entry_price") or 0.0),
+                }
+            except Exception:
+                return None
         sym = symbol or self.config.get("symbol", "BTC/USDT")
         target = sym.replace("/", "").upper()
         ccxt_client = getattr(self, "client", None)
@@ -142,6 +164,12 @@ class Exchange:
         """
         Devuelve todas las posiciones abiertas del account (formato unificado).
         """
+        # En modo PAPER no listamos posiciones de la cuenta real.
+        if self.is_paper():
+            # Si más adelante querés listar “otras” posiciones simuladas, se podría
+            # extender para leerlas de un store múltiple. Hoy el bot sólo gestiona 1.
+            return []
+
         out: List[Dict[str, Any]] = []
         ccxt_client = getattr(self, "client", None)
         # 1) CCXT en futures
@@ -226,6 +254,33 @@ class Exchange:
         return symbol.replace("/", "").lower()
 
     async def fetch_balance_usdt(self) -> float:
+        # En modo PAPER devolvemos el equity del PaperStore/pos service.
+        if self.is_paper():
+            try:
+                import trading
+
+                svc = getattr(trading, "POSITION_SERVICE", None)
+                if svc is not None:
+                    st = svc.get_status() or {}
+                    eq = st.get("equity")
+                    if eq is not None:
+                        return float(eq)
+                # Fallback: intentar leer el store activo si existe
+                store = None
+                try:
+                    store = getattr(svc, "store", None)
+                except Exception:
+                    store = None
+                if store is not None:
+                    s = store.load() or {}
+                    base = float(s.get("equity") or 0.0)
+                    realized = float(s.get("realized_pnl") or 0.0)
+                    fees = float(s.get("fees") or 0.0)
+                    # mark podría venir nulo; no sumamos no-realizado para saldo
+                    return float(base + realized - fees)
+            except Exception:
+                pass
+
         # 1) CCXT en Futuros USD-M
         try:
             bal = await asyncio.to_thread(self.client.fetch_balance, {"type": "future"})
