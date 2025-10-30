@@ -31,22 +31,56 @@ def _caps_from_any(caps_in: Any) -> Caps:
         )
     return Caps()
 
+
+def _norm_symbol(sym: str) -> str:
+    """Normaliza símbolo para comparaciones: mayúsculas y sin '/'."""
+    if not isinstance(sym, str):
+        return ""
+    return sym.replace("/", "").upper().strip()
+
+
 def _norm_side(side: str) -> Side:
     s = (side or "").strip().lower()
-    return s if s in ("long", "short") else "long"
+    if s in ("long", "buy"):
+        return "long"
+    if s in ("short", "sell"):
+        return "short"
+    return "invalid"
 
 def _positions_total_count(all_positions: Dict[str, List[dict]]) -> int:
-    return sum(len(v) for v in (all_positions or {}).values())
+    total = 0
+    for v in (all_positions or {}).values():
+        if isinstance(v, list):
+            total += len(v)
+    return total
 
 def _price(sym: str, price_by_symbol: Dict[str, float]) -> Optional[float]:
+    if not isinstance(sym, str):
+        return None
     p = price_by_symbol.get(sym)
+    if p is None:
+        p = price_by_symbol.get(sym.upper())
+    if p is None:
+        p = price_by_symbol.get(_norm_symbol(sym))
+    if p is None and sym.endswith("USDT") and "/" not in sym:
+        alt = sym[:-4] + "/USDT"
+        p = price_by_symbol.get(alt)
     try:
         return float(p) if p is not None else None
     except Exception:
         return None
 
+
 def _cluster_of(sym: str, clusters: Optional[Dict[str, str]]) -> str:
-    return (clusters or {}).get(sym, "UNCLUSTERED")
+    if not clusters:
+        return "UNCLUSTERED"
+    key_norm = _norm_symbol(sym)
+    return (
+        clusters.get(sym)
+        or clusters.get(key_norm)
+        or clusters.get(sym.upper())
+        or "UNCLUSTERED"
+    )
 
 # --- reglas por símbolo -----------------------------------------------
 
@@ -57,6 +91,8 @@ def can_open(symbol: str, side: str, all_positions: Dict[str, List[dict]], limit
     - No-hedge en el mismo símbolo
     """
     side = _norm_side(side)
+    if side == "invalid":
+        return False, "REJECT_INVALID_SIDE"
     total = _positions_total_count(all_positions)
     per_sym = len((all_positions or {}).get(symbol, []))
 
@@ -66,9 +102,9 @@ def can_open(symbol: str, side: str, all_positions: Dict[str, List[dict]], limit
         return False, "REJECT_MAX_PER_SYMBOL"
 
     if limits.no_hedge:
-        for lot in (all_positions or {}).get(symbol, []):
+        for lot in (all_positions or {}).get(symbol, []) or []:
             lot_side = _norm_side(lot.get("side", ""))
-            if lot_side != side:
+            if lot_side == "invalid" or lot_side != side:
                 return False, "REJECT_NO_HEDGE"
 
     return True, "OK"
@@ -98,6 +134,14 @@ def portfolio_caps_ok(
     for sym, lots in (positions or {}).items():
         p = _price(sym, price_by_symbol)
         if p is None or p <= 0:
+            try:
+                has_qty = any(
+                    abs(float((L or {}).get("qty", 0.0))) > 0.0 for L in (lots or [])
+                )
+            except Exception:
+                has_qty = False
+            if has_qty:
+                return False, f"REJECT_MISSING_PRICE:{_norm_symbol(sym)}"
             continue
         for L in (lots or []):
             try:
@@ -130,6 +174,8 @@ def portfolio_caps_ok(
             cluster = _cluster_of(sym, caps.clusters)
             for L in (lots or []):
                 side = _norm_side(L.get("side", ""))
+                if side == "invalid":
+                    return False, "REJECT_INVALID_SIDE"
                 try:
                     qty = abs(float(L.get("qty", 0.0)))
                 except Exception:
