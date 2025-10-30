@@ -7,6 +7,14 @@ from config import S
 import trading
 from bot.paper_store import get_equity as paper_get_equity, set_equity as paper_set_equity
 from position_service import fetch_live_equity_usdm
+from bot.runtime_state import get_mode as runtime_get_mode
+
+
+def _runtime_is_paper() -> bool:
+    try:
+        return (runtime_get_mode() or "paper").lower() not in {"real", "live"}
+    except Exception:
+        return getattr(S, "PAPER", True)
 
 
 class Trader:
@@ -14,7 +22,7 @@ class Trader:
         self.config = cfg
         trading.ensure_initialized()
         default_balance = float(self.config.get('balance', S.start_equity))
-        if S.PAPER:
+        if _runtime_is_paper():
             try:
                 default_balance = float(paper_get_equity())
             except Exception:
@@ -24,19 +32,19 @@ class Trader:
                     pass
         self._balance = default_balance
         self._open_position: Optional[Dict[str, Any]] = None
-        self._last_mode = "paper" if S.PAPER else "real"
+        self._last_mode = "paper" if _runtime_is_paper() else "real"
 
     def reset_caches(self):
         """Limpiar caches de balance/posición al cambiar de modo."""
         base = float(self.config.get('balance', S.start_equity))
-        if S.PAPER:
+        if _runtime_is_paper():
             try:
                 base = float(paper_get_equity())
             except Exception:
                 pass
         self._balance = base
         self._open_position = None
-        self._last_mode = "paper" if S.PAPER else "real"
+        self._last_mode = "paper" if _runtime_is_paper() else "real"
 
     def set_paper_equity(self, value: float) -> None:
         try:
@@ -44,7 +52,7 @@ class Trader:
         except Exception:
             raise ValueError("Equity inválido") from None
 
-        if S.PAPER:
+        if _runtime_is_paper():
             try:
                 paper_set_equity(val)
             except Exception:
@@ -52,14 +60,14 @@ class Trader:
         self._balance = val
 
     def _ensure_mode_consistency(self):
-        curr = "paper" if S.PAPER else "real"
+        curr = "paper" if _runtime_is_paper() else "real"
         if curr != getattr(self, "_last_mode", curr):
             self.reset_caches()
 
     async def get_balance(self, exchange=None) -> float:
         """Devuelve el balance actual de la cuenta."""
         self._ensure_mode_consistency()
-        if S.PAPER:
+        if _runtime_is_paper():
             try:
                 self._balance = float(self.equity())
                 return self._balance
@@ -107,7 +115,7 @@ class Trader:
             except Exception:
                 logging.debug("No se pudo obtener equity desde PositionService.", exc_info=True)
 
-        if S.PAPER and equity is None:
+        if _runtime_is_paper() and equity is None:
             try:
                 equity = float(paper_get_equity())
             except Exception:
@@ -130,7 +138,7 @@ class Trader:
             return self._open_position
 
         # 1) PAPER: leer del PositionService (persistente)
-        if S.PAPER and trading.POSITION_SERVICE is not None:
+        if _runtime_is_paper() and trading.POSITION_SERVICE is not None:
             try:
                 st = trading.POSITION_SERVICE.get_status()
                 side = (st.get("side") or "FLAT").upper()
