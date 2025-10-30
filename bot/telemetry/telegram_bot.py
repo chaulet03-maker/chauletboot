@@ -2112,7 +2112,7 @@ def _populate_registry() -> None:
     REGISTRY.register(
         "tp",
         tp_command,
-        aliases=["takeprofit", "tp%"],
+        aliases=["takeprofit"],
         help_text="Cierra la posición si supera un % objetivo. Ej: `tp 10`.",
     )
     REGISTRY.register(
@@ -2244,7 +2244,7 @@ def register_commands(application: Application) -> None:
         application.add_handler(CommandHandler(["posiciones", "positions"], posiciones_command))
         application.add_handler(CommandHandler(["cerrar", "close"], cerrar_command))
         application.add_handler(CommandHandler(["sl", "stop", "stoploss"], sl_command))
-        application.add_handler(CommandHandler(["tp", "takeprofit", "tp%"], tp_command))
+        application.add_handler(CommandHandler(["tp", "takeprofit"], tp_command))
         setattr(application, "_chaulet_bot_handlers_registered", True)
     if getattr(application, "_chaulet_router_registered", False):
         return

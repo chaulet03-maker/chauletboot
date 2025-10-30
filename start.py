@@ -4,6 +4,8 @@ import sys
 import logging
 from dotenv import load_dotenv
 
+load_dotenv()
+
 # Asegurar import relativo al proyecto
 ROOT = os.path.dirname(os.path.abspath(__file__))
 if ROOT not in sys.path:
@@ -21,7 +23,6 @@ def _resolve_mode(cfg):
 
 
 def main():
-    load_dotenv(os.path.join(ROOT, ".env"))
     cfg = load_raw_config()
 
     # Normalizamos modo y telegram acá (una sola fuente de verdad)
