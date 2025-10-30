@@ -11,6 +11,7 @@ from binance_client import client_factory
 from position_service import PositionService
 from paper_store import PaperStore
 from state_store import on_close_filled, on_open_filled
+from bot.runtime_state import get_mode as runtime_get_mode
 
 logger = logging.getLogger(__name__)
 
@@ -84,10 +85,11 @@ def _build_public_ccxt() -> Optional[Any]:
         from config import S
 
         use_testnet = os.getenv("BINANCE_UMFUTURES_TESTNET", "false").lower() == "true"
-        if (S.PAPER or use_testnet) and hasattr(exchange, "set_sandbox_mode"):
+        runtime_mode = runtime_get_mode()
+        if ((runtime_mode == "paper") or use_testnet) and hasattr(exchange, "set_sandbox_mode"):
             exchange.set_sandbox_mode(True)
 
-        if not S.PAPER:
+        if runtime_mode != "paper":
             exchange.apiKey = S.binance_api_key
             exchange.secret = S.binance_api_secret
         return exchange

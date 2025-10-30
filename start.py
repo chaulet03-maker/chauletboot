@@ -2,6 +2,7 @@
 import os
 import sys
 import logging
+import atexit
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -23,6 +24,29 @@ def _resolve_mode(cfg):
 
 
 def main():
+    # --- SINGLE INSTANCE LOCK ---
+    import os, sys
+    LOCK_PATH = "/tmp/chauletbot.lock"
+    if os.path.exists(LOCK_PATH):
+        try:
+            with open(LOCK_PATH, "r") as f:
+                pid = int(f.read().strip() or "0")
+            if pid and pid != os.getpid():
+                print(f"[LOCK] Ya hay un bot ejecutándose (PID={pid}). Cerralo antes de iniciar otro.")
+                sys.exit(1)
+        except Exception:
+            pass
+    with open(LOCK_PATH, "w") as f:
+        f.write(str(os.getpid()))
+
+    @atexit.register
+    def _cleanup_lock():
+        try:
+            if os.path.exists(LOCK_PATH):
+                os.remove(LOCK_PATH)
+        except Exception:
+            pass
+
     cfg = load_raw_config()
 
     # Normalizamos modo y telegram acá (una sola fuente de verdad)
