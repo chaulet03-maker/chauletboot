@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
+from pathlib import Path
 from typing import Any, Mapping, Optional
 
 from bot.mode_manager import Mode, ModeResult, get_mode
@@ -12,6 +13,7 @@ from position_service import PositionService
 from paper_store import PaperStore
 from state_store import on_close_filled, on_open_filled
 from bot.runtime_state import get_mode as runtime_get_mode
+from paths import get_data_dir, get_live_store_path, get_paper_store_path
 
 logger = logging.getLogger(__name__)
 
@@ -19,6 +21,9 @@ BROKER: Any | None = None
 POSITION_SERVICE: PositionService | None = None
 PUBLIC_CCXT_CLIENT: Optional[Any] = None
 ACTIVE_MODE: Mode = "simulado"
+ACTIVE_DATA_DIR: Optional[Path] = None  # type: ignore[name-defined]
+ACTIVE_STORE_PATH: Optional[Path] = None  # type: ignore[name-defined]
+LAST_MODE_CHANGE_SOURCE: str = "startup"
 _INITIALIZED: bool = False
 
 
@@ -128,23 +133,26 @@ def _sync_settings_mode(mode: Mode) -> None:
 
 
 def rebuild(mode: Mode) -> None:
-    global BROKER, POSITION_SERVICE, PUBLIC_CCXT_CLIENT, ACTIVE_MODE, _INITIALIZED
+    global BROKER, POSITION_SERVICE, PUBLIC_CCXT_CLIENT, ACTIVE_MODE, _INITIALIZED, ACTIVE_DATA_DIR, ACTIVE_STORE_PATH
     ACTIVE_MODE = mode
     _sync_settings_mode(mode)
     PUBLIC_CCXT_CLIENT = _build_public_ccxt()
     BROKER = build_broker(S, client_factory)
-    bot_store = ACTIVE_PAPER_STORE
+
+    ACTIVE_DATA_DIR = get_data_dir()
+    bot_store = ACTIVE_PAPER_STORE or PaperStore(path=get_paper_store_path(), start_equity=S.start_equity)
     if mode != "simulado":
-        try:
-            os.makedirs("data", exist_ok=True)
-        except Exception:
-            pass
-        live_store_path = os.path.join(os.getcwd(), "data", "live_bot_position.json")
+        live_store_path = get_live_store_path()
         bot_store = PaperStore(path=live_store_path, start_equity=S.start_equity)
 
     shared_store = getattr(BROKER, "store", None)
     if shared_store is not None:
         bot_store = shared_store
+
+    try:
+        ACTIVE_STORE_PATH = Path(bot_store.path).resolve()
+    except Exception:
+        ACTIVE_STORE_PATH = None
 
     POSITION_SERVICE = PositionService(
         paper_store=bot_store,
@@ -152,7 +160,12 @@ def rebuild(mode: Mode) -> None:
         ccxt_client=PUBLIC_CCXT_CLIENT,
         symbol=S.symbol if hasattr(S, "symbol") else "BTC/USDT",
     )
-    logger.info("Trading stack reconstruido para modo %s", mode.upper())
+    logger.info(
+        "Trading stack reconstruido para modo %s (data_dir=%s, store=%s)",
+        mode.upper(),
+        ACTIVE_DATA_DIR,
+        ACTIVE_STORE_PATH,
+    )
     _INITIALIZED = True
 
 
@@ -179,8 +192,15 @@ def position_status() -> dict[str, Any]:
         return {"side": "FLAT"}
 
 
-def switch_mode(new_mode: Mode) -> ModeResult:
+def set_trading_mode(new_mode: Mode, *, source: str = "unknown") -> ModeResult:
     from bot.mode_manager import safe_switch
+
+    normalized_source = str(source or "unknown")
+    logger.info(
+        "Cambio de modo solicitado: %s (source=%s)",
+        new_mode,
+        normalized_source,
+    )
 
     class _Services:
         @staticmethod
@@ -191,7 +211,27 @@ def switch_mode(new_mode: Mode) -> ModeResult:
         def rebuild(mode: Mode) -> None:
             rebuild(mode)
 
-    return safe_switch(new_mode, _Services)
+    result = safe_switch(new_mode, _Services)
+    if result.ok:
+        global LAST_MODE_CHANGE_SOURCE
+        LAST_MODE_CHANGE_SOURCE = normalized_source
+        logger.info(
+            "Modo activo: %s (source=%s)",
+            result.mode or new_mode,
+            normalized_source,
+        )
+    else:
+        logger.warning(
+            "No se pudo cambiar a %s (source=%s): %s",
+            new_mode,
+            normalized_source,
+            result.msg,
+        )
+    return result
+
+
+def switch_mode(new_mode: Mode) -> ModeResult:
+    return set_trading_mode(new_mode, source="legacy")
 
 
 def place_order_safe(side: str, qty: float, price: float | None = None, **kwargs):

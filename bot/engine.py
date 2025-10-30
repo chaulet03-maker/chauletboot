@@ -42,6 +42,7 @@ from risk_guards import (
 )
 from reanudar_listener import listen_reanudar
 from bot.runtime_state import get_mode as runtime_get_mode
+from paths import get_data_dir
 
 
 def _compute_order_qty_from_equity(
@@ -148,16 +149,25 @@ class _EngineBrokerAdapter:
 
 
 class TradingApp:
-    def __init__(self, cfg):
+    def __init__(self, cfg, mode_source: str | None = None):
         self.config = cfg
         runtime_mode = _runtime_mode_value()
         default_trading_mode = "real" if runtime_mode in {"real", "live"} else "simulado"
-        self.config.setdefault("trading_mode", default_trading_mode)
-        self.config.setdefault("mode", "real" if runtime_mode in {"real", "live"} else "paper")
+        resolved_mode = str(self.config.get("trading_mode", default_trading_mode)).lower()
+        if resolved_mode not in {"real", "live"}:
+            resolved_mode = "simulado"
+        effective_mode = "real" if resolved_mode in {"real", "live"} else "simulado"
+        self.config["trading_mode"] = "real" if effective_mode == "real" else "simulado"
+        self.config["mode"] = "real" if effective_mode == "real" else "paper"
         self.config.setdefault("start_equity", S.start_equity)
         self.logger = logging.getLogger(__name__)
 
-        trading.ensure_initialized()
+        trading.ensure_initialized(mode=effective_mode)
+        self.mode_source = mode_source or trading.LAST_MODE_CHANGE_SOURCE or "startup"
+        self.data_dir = trading.ACTIVE_DATA_DIR or get_data_dir()
+        self.store_path = trading.ACTIVE_STORE_PATH
+        self.mode = "live" if effective_mode == "real" else "paper"
+        self.last_signal_ts = None
 
         self.broker = _EngineBrokerAdapter(self)
 
@@ -258,7 +268,7 @@ class TradingApp:
     def is_paper(self) -> bool:
         return not self.is_live
 
-    def set_mode(self, mode: str) -> str:
+    def set_mode(self, mode: str, *, source: str = "engine") -> str:
         """
         Cambia modo del bot sin tocar propiedades de solo-lectura.
         Acepta: 'live'|'real'|'paper'|'simulado'|'sim'.
@@ -323,12 +333,18 @@ class TradingApp:
         # Sincronizar stack de trading principal (usa ModeResult para logs)
         desired_trading_mode = "real" if target == "live" else "simulado"
         try:
-            result = trading.switch_mode(desired_trading_mode)
+            result = trading.set_trading_mode(desired_trading_mode, source=source)
             if hasattr(result, "ok") and not result.ok:
-                self.logger.warning("switch_mode devolvió error: %s", getattr(result, "msg", ""))
+                self.logger.warning("set_trading_mode devolvió error: %s", getattr(result, "msg", ""))
+            if hasattr(result, "ok") and result.ok:
+                self.mode_source = getattr(trading, "LAST_MODE_CHANGE_SOURCE", source)
+                self.store_path = trading.ACTIVE_STORE_PATH
+                self.data_dir = trading.ACTIVE_DATA_DIR or self.data_dir
         except Exception:
             self.logger.warning(
-                "No se pudo sincronizar trading.switch_mode(%s)", desired_trading_mode, exc_info=True
+                "No se pudo sincronizar trading.set_trading_mode(%s)",
+                desired_trading_mode,
+                exc_info=True,
             )
 
         return current if current == target else target
@@ -535,6 +551,10 @@ class TradingApp:
                 self.connection_lost = False
 
             logging.info("Iniciando ciclo de análisis de mercado...")
+            try:
+                self.last_signal_ts = pd.Timestamp.now(tz="UTC")
+            except Exception:
+                self.last_signal_ts = None
 
             try:
                 from risk_guards import check_shock_pause_and_pause_if_needed

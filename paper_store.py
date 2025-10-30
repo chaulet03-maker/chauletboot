@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import time
 from pathlib import Path
 from threading import RLock
 from typing import Any, Dict
+
+from paths import get_data_dir, get_paper_store_path
 
 log = logging.getLogger(__name__)
 
@@ -31,15 +32,13 @@ class PaperStore:
         self.start_equity = float(start_equity)
         self.lock = RLock()
 
-        data_dir = Path(os.getenv("DATA_DIR", "/app/data")).expanduser()
-        if not data_dir.is_absolute():
-            data_dir = (Path("/app") / data_dir).resolve()
-        data_dir.mkdir(parents=True, exist_ok=True)
-
-        env_path = os.getenv("PAPER_STORE_PATH")
-        candidate = Path(env_path) if env_path else Path(path) if path is not None else data_dir / "paper_state.json"
-        if not candidate.is_absolute():
-            candidate = (data_dir / candidate).resolve()
+        data_dir = get_data_dir()
+        if path is None:
+            candidate = get_paper_store_path()
+        else:
+            candidate = Path(path).expanduser()
+            if not candidate.is_absolute():
+                candidate = (data_dir / candidate).resolve()
 
         self.path = candidate
         self.path.parent.mkdir(parents=True, exist_ok=True)

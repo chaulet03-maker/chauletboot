@@ -2,7 +2,9 @@ import json
 import os
 import time
 
-PATH = "data/runtime/paper_state.json"
+from paths import get_runtime_path
+
+PATH = str(get_runtime_path("paper_state.json"))
 
 
 def _ensure():

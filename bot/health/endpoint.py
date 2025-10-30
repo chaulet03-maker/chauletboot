@@ -1,8 +1,11 @@
-from typing import Optional
-from telegram import Update
-from telegram.ext import CommandHandler, ContextTypes
 import math
 import logging
+from typing import Optional
+
+from telegram import Update
+from telegram.ext import CommandHandler, ContextTypes
+
+from paths import get_data_dir
 
 log = logging.getLogger(__name__)
 
@@ -50,8 +53,15 @@ async def _cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     try:
+        import trading
+
         symbol = app.config.get("symbol", "BTC/USDT")
         mode_txt = "REAL" if app.is_live else "SIMULADO"
+        mode_source = getattr(app, "mode_source", None) or getattr(trading, "LAST_MODE_CHANGE_SOURCE", "n/d")
+        data_dir = getattr(app, "data_dir", None) or get_data_dir()
+        store_path = getattr(app, "store_path", None) or getattr(trading, "ACTIVE_STORE_PATH", None)
+        store_display = str(store_path) if store_path else "n/d"
+
         # Equity actual
         equity = await app.trader.get_balance(app.exchange)
         # Precio actual
@@ -59,11 +69,7 @@ async def _cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Posición (si hay)
         open_txt = "FLAT"
         entry = mark = None
-        try:
-            import trading
-            st = trading.POSITION_SERVICE.get_status() if trading.POSITION_SERVICE else None
-        except Exception:
-            st = None
+        st = trading.POSITION_SERVICE.get_status() if trading.POSITION_SERVICE else None
         if st:
             side = str(st.get("side", "FLAT")).upper()
             q = float(st.get("qty") or st.get("size") or 0.0)
@@ -72,17 +78,41 @@ async def _cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 entry = float(st.get("entry_price") or 0.0)
                 mark = float(st.get("mark") or 0.0)
 
+        last_signal_ts = getattr(app, "last_signal_ts", None)
+        if last_signal_ts is not None:
+            try:
+                last_signal_fmt = last_signal_ts.isoformat() if hasattr(last_signal_ts, "isoformat") else str(last_signal_ts)
+            except Exception:
+                last_signal_fmt = str(last_signal_ts)
+        else:
+            last_signal_fmt = "n/d"
+
         # Funding (si engine lo guardó)
         fr_bps = app.config.get("_funding_rate_bps_now")
         fr_line = f"\nFunding ahora: {fr_bps:.2f} bps" if fr_bps is not None else ""
 
+        ccxt_client = getattr(trading, "PUBLIC_CCXT_CLIENT", None)
+        ccxt_authenticated = False
+        if ccxt_client is not None:
+            try:
+                ccxt_authenticated = bool(getattr(ccxt_client, "apiKey", None))
+            except Exception:
+                ccxt_authenticated = False
+        price_source = getattr(app.exchange, "get_price_source", lambda: "desconocido")()
+
         msg = (
             f"📊 *Status del Bot*\n"
             f"Modo: {mode_txt}\n"
+            f"Fuente modo: {mode_source}\n"
+            f"Data dir: {data_dir}\n"
+            f"Store: {store_display}\n"
+            f"CCXT: {'AUTENTICADO' if ccxt_authenticated else 'PÚBLICO'}\n"
+            f"Precio via: {price_source}\n"
             f"Símbolo: {symbol}\n"
             f"Precio: {_fmt_usd(price)}\n"
             f"Equity: {_fmt_usd(equity)}\n"
-            f"Posición: {open_txt}"
+            f"Posición: {open_txt}\n"
+            f"Último ciclo: {last_signal_fmt}"
         )
         if entry is not None:
             msg += f"\nEntry: {_fmt_usd(entry)} | Mark: {_fmt_usd(mark)}"

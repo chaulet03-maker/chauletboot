@@ -4,8 +4,9 @@ import json
 import os
 from typing import Any, Dict, Optional
 
-STATE_PATH = "data/runtime/state.json"
-os.makedirs(os.path.dirname(STATE_PATH), exist_ok=True)
+from paths import get_runtime_path
+
+STATE_PATH = str(get_runtime_path("state.json"))
 
 
 def _load_state() -> Dict[str, Any]:

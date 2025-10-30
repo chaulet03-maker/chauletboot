@@ -4,6 +4,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import List, Dict, Any, Optional
 import logging, os, json
+
+from paths import get_data_dir
 log = logging.getLogger(__name__)
 
 try:
@@ -83,7 +85,7 @@ class MotivesBuffer:
         return list(self._buf)[-n:]
 
 # persistimos por si hay 2 procesos (opcional)
-PERSIST_FILE = os.path.join(os.getenv("DATA_DIR","/app/data"), "motives.jsonl")
+PERSIST_FILE = os.path.join(str(get_data_dir()), "motives.jsonl")
 MOTIVES = MotivesBuffer(persist_path=PERSIST_FILE)
 
 def compute_codes(ctx: Dict[str, Any]) -> List[str]:
