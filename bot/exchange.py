@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import math
 import os
 import threading
 import time
@@ -11,6 +12,7 @@ from ccxt.base.errors import ExchangeError, NetworkError
 from bot.exchanges.binance_filters import build_filters
 from bot.exchange_client import ensure_position_mode, get_ccxt, reset_ccxt_client
 from bot.runtime_state import get_mode as runtime_get_mode
+from bot.price_ws import PriceStream
 
 
 logger = logging.getLogger(__name__)
@@ -76,6 +78,72 @@ class Exchange:
         self._price_lock = threading.Lock()
         self._price_stream = None
         self._start_price_stream()
+
+    def _cache_price(
+        self,
+        symbol: Optional[str],
+        price: float,
+        ts: Optional[float] = None,
+    ) -> None:
+        try:
+            value = float(price)
+        except (TypeError, ValueError):
+            return
+        if not math.isfinite(value) or value <= 0:
+            return
+
+        base_symbol = symbol or self.config.get("symbol", "BTC/USDT")
+        if not isinstance(base_symbol, str):
+            base_symbol = str(base_symbol)
+
+        now_ts = float(ts) if ts is not None else time.time()
+        keys = {base_symbol}
+
+        try:
+            cfg_symbol = str(self.config.get("symbol", base_symbol))
+            keys.add(cfg_symbol)
+        except Exception:
+            pass
+
+        for key in list(keys):
+            if not key:
+                continue
+            no_slash = key.replace("/", "")
+            keys.add(no_slash)
+            if key.endswith("/USDT"):
+                keys.add(f"{key}:USDT")
+            if no_slash.endswith("USDT"):
+                keys.add(f"{no_slash}:USDT")
+
+        with self._price_lock:
+            for key in keys:
+                if not key:
+                    continue
+                self._price_cache[key] = {"price": value, "ts": now_ts}
+
+    def _on_price_stream_tick(
+        self, symbol: str, price: float, event_ts: Optional[float] = None
+    ) -> None:
+        self._cache_price(symbol, price, event_ts)
+
+    def _get_cached_price(
+        self, key: str, *, max_age: float = 2.0
+    ) -> Optional[float]:
+        with self._price_lock:
+            cached = self._price_cache.get(key)
+        if not cached:
+            return None
+        try:
+            ts = float(cached.get("ts", 0.0))
+        except Exception:
+            return None
+        age = max(0.0, time.time() - ts)
+        if age > max_age:
+            return None
+        try:
+            return float(cached.get("price", 0.0))
+        except (TypeError, ValueError):
+            return None
 
     def _is_paper_runtime(self) -> bool:
         """
@@ -387,11 +455,81 @@ class Exchange:
         )
 
     def _start_price_stream(self):
-        logger.info(
-            "WS de precios deshabilitado; se utilizará REST para obtener cotizaciones."
+        self._stop_price_stream()
+
+        cfg: Mapping[str, Any]
+        if isinstance(self.config, Mapping):
+            cfg = self.config
+        else:
+            cfg = {}
+
+        price_ws_cfg = cfg.get("price_ws", {}) if isinstance(cfg, Mapping) else {}
+        enabled = False
+        if isinstance(price_ws_cfg, Mapping):
+            enabled = bool(price_ws_cfg.get("enabled", True))
+        elif isinstance(price_ws_cfg, bool):
+            enabled = price_ws_cfg
+            price_ws_cfg = {}
+        elif price_ws_cfg:
+            enabled = bool(price_ws_cfg)
+            price_ws_cfg = {}
+        else:
+            price_ws_cfg = {}
+
+        runtime_mode = (runtime_get_mode() or "paper").lower()
+        if not enabled:
+            logger.info(
+                "WS de precios deshabilitado por configuración; se utilizará REST para obtener cotizaciones."
+            )
+            return
+        if runtime_mode not in {"real", "live"}:
+            logger.info(
+                "WS de precios sólo disponible en modo REAL. Runtime=%s; se utilizará REST.",
+                runtime_mode,
+            )
+            return
+
+        symbol = str(cfg.get("symbol", "BTC/USDT")) if cfg else "BTC/USDT"
+        base_url = str(price_ws_cfg.get("url") or price_ws_cfg.get("base_url") or "")
+        stream_name = str(price_ws_cfg.get("stream") or "mark").lower()
+        interval = str(price_ws_cfg.get("interval") or "1s")
+
+        use_testnet = (
+            os.getenv("BINANCE_UMFUTURES_TESTNET", "false").lower() == "true"
         )
-        with self._price_lock:
-            self._price_stream = None
+        if not base_url:
+            base_url = (
+                "wss://stream.binancefuture.com/ws"
+                if use_testnet
+                else "wss://fstream.binance.com/ws"
+            )
+
+        try:
+            stream = PriceStream(
+                symbol=symbol,
+                callback=self._on_price_stream_tick,
+                base_url=base_url,
+                stream=stream_name,
+                interval=interval,
+            )
+        except Exception:
+            logger.exception("No se pudo configurar el WS de precios. Se usará REST.")
+            return
+
+        if use_testnet:
+            logger.info("Iniciando WS de precios (testnet) para %s", symbol)
+        else:
+            logger.info("Iniciando WS de precios (live) para %s", symbol)
+
+        try:
+            stream.start()
+        except Exception:
+            logger.exception(
+                "Fallo al iniciar el WS de precios; se continuará con REST."
+            )
+            return
+
+        self._price_stream = stream
 
     def _stop_price_stream(self):
         stream = getattr(self, "_price_stream", None)
@@ -607,30 +745,8 @@ class Exchange:
 
         base_symbol = symbol or self.config.get('symbol', 'BTC/USDT')
 
-        def _from_cache(key: str) -> Optional[float]:
-            with self._price_lock:
-                cached = self._price_cache.get(key)
-            if not cached:
-                return None
-            age = max(0.0, time.time() - float(cached.get("ts", 0.0)))
-            if age <= 2.0:
-                try:
-                    return float(cached.get("price", 0.0))
-                except Exception:
-                    return None
-            return None
-
-        def _cache_price(value: float) -> None:
-            now_ts = time.time()
-            keys = [base_symbol, base_symbol.replace("/", "")]
-            if base_symbol.endswith("/USDT"):
-                keys.append(f"{base_symbol}:USDT")
-            with self._price_lock:
-                for key in keys:
-                    self._price_cache[key] = {"price": value, "ts": now_ts}
-
         for key in (base_symbol, base_symbol.replace('/', ''), f"{base_symbol}:USDT"):
-            px = _from_cache(key)
+            px = self._get_cached_price(key)
             if px is not None:
                 return px
 
@@ -649,7 +765,7 @@ class Exchange:
 
         mark_price = await self._fetch_mark_price_rest(clients, base_symbol)
         if mark_price is not None:
-            _cache_price(mark_price)
+            self._cache_price(base_symbol, mark_price)
             return mark_price
 
         for candidate in candidates:
@@ -671,7 +787,7 @@ class Exchange:
                 if price is not None:
                     try:
                         value = float(price)
-                        _cache_price(value)
+                        self._cache_price(base_symbol, value)
                         return value
                     except Exception:
                         continue
