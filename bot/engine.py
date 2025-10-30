@@ -6,7 +6,12 @@ import threading
 import inspect
 from collections import deque
 from typing import Any, Dict, Optional, cast
-from time import time as _now
+from time import monotonic, time as _now
+
+try:
+    from zoneinfo import ZoneInfo
+except Exception:  # pragma: no cover - fallback when zoneinfo is unavailable
+    ZoneInfo = None  # type: ignore[assignment]
 import pandas as pd
 import schedule
 from telegram.ext import ContextTypes
@@ -110,12 +115,6 @@ class _EngineBrokerAdapter:
         mode = "live" if self.app.is_live else "paper"
         side_u = str(side).upper()
 
-        if self.app.is_live:
-            try:
-                await self.app.exchange.set_leverage(leverage, sym)
-            except Exception:
-                self.app.logger.debug("No se pudo establecer leverage", exc_info=True)
-
         bot_id = get_bot_id()
         client_oid = make_client_oid(bot_id, sym_clean, mode)
 
@@ -178,7 +177,7 @@ class TradingApp:
         self._entry_ts = None
         self._bars_in_position = 0
         self._entry_locks: Dict[tuple[str, str, int], float] = {}
-        self._entry_lock_gc_last = 0.0
+        self._entry_lock_gc_last = monotonic()
         try:
             ttl_cfg = cfg.get("entry_lock_ttl_seconds", 12 * 60 * 60)
             self._entry_lock_ttl_s = max(int(float(ttl_cfg)), 60)
@@ -186,8 +185,25 @@ class TradingApp:
             self._entry_lock_ttl_s = 12 * 60 * 60
         self._shock_guard_last_trade_id: Optional[Any] = None
 
-        schedule.every().day.at("07:00", "America/Argentina/Buenos_Aires").do(self._generate_daily_report)
-        schedule.every().sunday.at("07:01", "America/Argentina/Buenos_Aires").do(self._generate_weekly_report)
+        buenos_aires_tz = None
+        if ZoneInfo is not None:
+            try:
+                buenos_aires_tz = ZoneInfo("America/Argentina/Buenos_Aires")
+            except Exception:  # pragma: no cover - defensive
+                buenos_aires_tz = None
+
+        def _schedule_at(job, time_str: str, callback):
+            try:
+                if buenos_aires_tz is not None:
+                    job = job.at(time_str, timezone=buenos_aires_tz)
+                else:
+                    job = job.at(time_str)
+            except TypeError:
+                job = job.at(time_str)
+            job.do(callback)
+
+        _schedule_at(schedule.every().day, "07:00", self._generate_daily_report)
+        _schedule_at(schedule.every().sunday, "07:01", self._generate_weekly_report)
         schedule.every(30).minutes.do(self._prune_old_orders)
         logging.info("Componentes y tareas de reporte inicializados.")
 
@@ -399,7 +415,7 @@ class TradingApp:
             return
         if (now - self._entry_lock_gc_last) < 60.0:
             return
-        cutoff = now - ttl
+        cutoff = now - float(ttl)
         stale = [key for key, ts in self._entry_locks.items() if ts < cutoff]
         for key in stale:
             self._entry_locks.pop(key, None)
@@ -449,7 +465,7 @@ class TradingApp:
                 self.logger.debug("entry_lock storage error: %s", exc)
 
         key = (str(symbol).upper(), str(side).upper(), int(anchor_epoch))
-        now = _now()
+        now = monotonic()
         self._cleanup_entry_locks(now, ttl)
         if key in self._entry_locks:
             return False
@@ -670,7 +686,9 @@ class TradingApp:
                 last_price = None
                 try:
                     now_ts = pd.Timestamp.utcnow().tz_localize("UTC")
-                    last_price = await self.exchange.get_current_price(self.config.get('symbol'))
+                    last_price = await self.exchange.get_current_price(
+                        self.config.get('symbol', 'BTC/USDT')
+                    )
                     side = (position.get('side') or '').upper()
                     qty_raw = position.get('contracts') or position.get('size') or 0.0
                     qty = float(qty_raw) if qty_raw is not None else 0.0
@@ -1045,6 +1063,7 @@ class TradingApp:
             eq_on_open = eq_now
 
             leverage = self.strategy.dynamic_leverage(last_candle)
+            symbol_conf = str(self.config.get('symbol', 'BTC/USDT'))
             if S.PAPER:
                 self.logger.info(
                     "PAPER: leverage lógico=%s (no se setea en Binance)", leverage
@@ -1052,19 +1071,81 @@ class TradingApp:
             else:
                 await self.exchange.set_leverage(
                     leverage,
-                    self.config.get('symbol', 'BTC/USDT'),
+                    symbol_conf,
                 )
 
-            entry_price = await self.exchange.get_current_price()
+            entry_price = await self.exchange.get_current_price(symbol_conf)
             if entry_price is None:
                 logging.warning("No se pudo obtener el precio de entrada actual.")
                 _emit_motive({"reasons": ["exchange_error: precio de entrada no disponible"]}, side_value=signal)
                 return
             entry_price = float(entry_price)
-            raw_qty = _compute_order_qty_from_equity(eq_on_open, entry_price, leverage)
-            filters = await self.exchange.get_symbol_filters(
-                self.config.get("symbol", "BTC/USDT")
+            try:
+                risk_pct = float(self.config.get("risk_pct", 0.02))
+            except Exception:
+                risk_pct = 0.02
+            if risk_pct <= 0:
+                risk_pct = 0.02
+            raw_qty = _compute_order_qty_from_equity(
+                eq_on_open,
+                entry_price,
+                leverage,
+                risk_pct,
             )
+
+            raw_filters = await self.exchange.get_symbol_filters(symbol_conf)
+
+            def _coerce_float(value: Any) -> float:
+                try:
+                    if value in (None, ""):
+                        return 0.0
+                    return float(value)
+                except Exception:
+                    return 0.0
+
+            def _flatten_symbol_filters(raw: Any) -> Dict[str, float]:
+                collected: Dict[str, Any] = {}
+                if isinstance(raw, dict):
+                    collected = dict(raw)
+                elif isinstance(raw, (list, tuple, set)):
+                    for item in raw:
+                        if not isinstance(item, dict):
+                            continue
+                        for key in (
+                            "stepSize",
+                            "step_size",
+                            "minQty",
+                            "min_qty",
+                            "minNotional",
+                            "min_notional",
+                        ):
+                            if key in item and item[key] not in (None, ""):
+                                collected.setdefault(key, item[key])
+                        filter_type = str(
+                            item.get("filterType") or item.get("filter_type") or ""
+                        ).upper()
+                        if filter_type in {"LOT_SIZE", "MARKET_LOT_SIZE"}:
+                            for key in ("stepSize", "step_size", "minQty", "min_qty"):
+                                if item.get(key) not in (None, ""):
+                                    collected.setdefault(key, item.get(key))
+                        if filter_type == "MIN_NOTIONAL":
+                            for key in ("minNotional", "min_notional"):
+                                if item.get(key) not in (None, ""):
+                                    collected.setdefault(key, item.get(key))
+
+                return {
+                    "stepSize": _coerce_float(
+                        collected.get("stepSize") or collected.get("step_size")
+                    ),
+                    "minQty": _coerce_float(
+                        collected.get("minQty") or collected.get("min_qty")
+                    ),
+                    "minNotional": _coerce_float(
+                        collected.get("minNotional") or collected.get("min_notional")
+                    ),
+                }
+
+            filters = _flatten_symbol_filters(raw_filters)
             qty = _quantize_amount(filters, raw_qty, entry_price)
             if qty <= 0:
                 reason = (
@@ -1080,9 +1161,25 @@ class TradingApp:
                     logging.debug("No se pudo notificar fallo de qty=0", exc_info=True)
                 return
 
-            sl_price = self.strategy.calculate_sl(entry_price, last_candle, signal, eq_on_open)
+            def _finite_or_none(value: Any) -> Optional[float]:
+                if value in (None, ""):
+                    return None
+                try:
+                    val = float(value)
+                except Exception:
+                    return None
+                return val if math.isfinite(val) else None
+
+            sl_price = _finite_or_none(
+                self.strategy.calculate_sl(entry_price, last_candle, signal, eq_on_open)
+            )
+            if sl_price is None:
+                _emit_motive({"reasons": ["SL inválido"]}, side_value=signal)
+                return
             side = signal
-            tp_price = self.strategy.calculate_tp(entry_price, qty, eq_on_open, side, leverage)
+            tp_price = _finite_or_none(
+                self.strategy.calculate_tp(entry_price, qty, eq_on_open, side, leverage)
+            )
 
             order_result = await self.exchange.create_order(signal, qty, sl_price, tp_price)
 
@@ -1136,7 +1233,7 @@ class TradingApp:
                 + f"{base} Abierta: {signal} ({mode_txt})\n"
                 + f"Apalancamiento: x{leverage:.1f}\n"
                 + f"precio: ${entry_price:.2f}\n"
-                + f"tp : ${tp_price:.2f}\n"
+                + f"tp : {f'${tp_price:.2f}' if tp_price is not None else 'N/A'}\n"
                 + f"sl:  ${sl_price:.2f}"
             )
             self._risk_usd_trade = abs(entry_price - sl_price) * qty
@@ -1147,8 +1244,6 @@ class TradingApp:
             if symbol:
                 for s in ("LONG", "SHORT"):
                     FREEZER.clear(symbol, cast(Side, s))
-            return
-
             _emit_motive({}, side_value=signal)
             return
 
@@ -1685,6 +1780,14 @@ class TradingApp:
 
             if close_result.get("close_price") is not None and "exit_price" not in summary:
                 _assign_float(summary, "exit_price", close_result.get("close_price"))
+
+            try:
+                now_ts = pd.Timestamp.utcnow().tz_localize("UTC")
+                trade_pnl = summary.get("realized_pnl") or summary.get("pnl_balance_delta")
+                if trade_pnl is not None:
+                    self._register_close_R(now_ts, float(trade_pnl))
+            except Exception:
+                pass
 
             return {"status": "closed", "summary": summary, "order": close_result.get("order")}
         except Exception as exc:

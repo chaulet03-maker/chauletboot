@@ -6,7 +6,7 @@ import time
 from typing import Any, Dict, List, Mapping, Optional
 
 import ccxt
-from ccxt.base.errors import ExchangeError
+from ccxt.base.errors import ExchangeError, NetworkError
 
 from config import S
 from bot.exchanges.binance_filters import build_filters
@@ -28,6 +28,8 @@ def create_order_smart(symbol: str, side: str, qty: float, *, price=None, **extr
     params = dict(extra_params or {})
     try:
         return ex.create_order(symbol, order_type, side_up, qty, price, params)
+    except NetworkError as e:
+        raise RuntimeError("Faltan credenciales (ccxt) o sin conectividad") from e
     except ExchangeError as e:
         message = str(e)
         if ("-4061" in message) or ("position side does not match" in message.lower()):
