@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import logging
+import math
 import os
+import time
 from pathlib import Path
-from typing import Any, Mapping, Optional
+from typing import Any, Dict, Mapping, Optional
 
 from bot.mode_manager import Mode, ModeResult, get_mode
 from config import RAW_CONFIG, S
@@ -25,6 +27,418 @@ ACTIVE_DATA_DIR: Optional[Path] = None  # type: ignore[name-defined]
 ACTIVE_STORE_PATH: Optional[Path] = None  # type: ignore[name-defined]
 LAST_MODE_CHANGE_SOURCE: str = "startup"
 _INITIALIZED: bool = False
+
+_SYMBOL_RULE_CACHE: dict[tuple[int, str], dict[str, float]] = {}
+
+
+def _normalize_symbol(symbol: str | None) -> str:
+    if not symbol:
+        return ""
+    value = str(symbol).replace("/", "")
+    return value.upper()
+
+
+def get_live_client() -> Optional[Any]:
+    broker = BROKER
+    client = getattr(broker, "client", None) if broker is not None else None
+    if client is None:
+        client = ACTIVE_LIVE_CLIENT
+    return client
+
+
+def _extract_symbol_rules(client: Any, symbol: str) -> dict[str, float]:
+    if client is None:
+        raise RuntimeError("No hay cliente LIVE disponible para obtener filtros.")
+    norm = _normalize_symbol(symbol)
+    if not norm:
+        raise ValueError("Símbolo inválido para obtener reglas")
+    cache_key = (id(client), norm)
+    cached = _SYMBOL_RULE_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    price_precision = 2
+    qty_precision = 3
+    step_size = 0.0
+    min_qty = 0.0
+    min_notional = 0.0
+
+    try:
+        info = client.futures_exchange_info()
+    except Exception:
+        info = None
+
+    symbols = []
+    if isinstance(info, dict):
+        symbols = info.get("symbols") or []
+    if not isinstance(symbols, list):
+        symbols = []
+
+    for entry in symbols:
+        if not isinstance(entry, dict):
+            continue
+        entry_symbol = str(entry.get("symbol") or "").upper()
+        if entry_symbol != norm:
+            continue
+        try:
+            price_precision = int(entry.get("pricePrecision", price_precision))
+        except Exception:
+            pass
+        qty_prec = entry.get("quantityPrecision")
+        if qty_prec is None:
+            qty_prec = entry.get("qtyPrecision")
+        try:
+            if qty_prec is not None:
+                qty_precision = int(qty_prec)
+        except Exception:
+            pass
+        filters = entry.get("filters") or []
+        if isinstance(filters, list):
+            for raw_filter in filters:
+                if not isinstance(raw_filter, dict):
+                    continue
+                ftype = str(raw_filter.get("filterType") or "").upper()
+                if ftype in {"LOT_SIZE", "MARKET_LOT_SIZE"}:
+                    step_val = raw_filter.get("stepSize")
+                    min_qty_val = raw_filter.get("minQty")
+                    try:
+                        if step_val is not None:
+                            step_size = float(step_val)
+                    except Exception:
+                        pass
+                    try:
+                        if min_qty_val is not None:
+                            min_qty = float(min_qty_val)
+                    except Exception:
+                        pass
+                if ftype in {"MIN_NOTIONAL", "NOTIONAL"}:
+                    try:
+                        candidate = raw_filter.get("notional") or raw_filter.get("minNotional")
+                        if candidate is not None:
+                            min_notional = float(candidate)
+                    except Exception:
+                        pass
+        break
+
+    rules = {
+        "price_precision": int(price_precision),
+        "qty_precision": int(qty_precision),
+        "step_size": float(step_size or 0.0),
+        "min_qty": float(min_qty or 0.0),
+        "min_notional": float(min_notional or 0.0),
+    }
+    _SYMBOL_RULE_CACHE[cache_key] = rules
+    return rules
+
+
+def get_symbol_rules(symbol: str) -> dict[str, float]:
+    client = get_live_client()
+    if client is None:
+        raise RuntimeError("No hay cliente LIVE disponible")
+    return _extract_symbol_rules(client, symbol)
+
+
+def _quantize_qty(raw_qty: float, rules: Mapping[str, float]) -> float:
+    try:
+        qty = float(raw_qty)
+    except Exception:
+        return 0.0
+    if qty <= 0:
+        return 0.0
+    step = float(rules.get("step_size") or 0.0)
+    precision = int(rules.get("qty_precision") or 0)
+    if step > 0:
+        qty = math.floor((qty / step) + 1e-9) * step
+    if precision >= 0:
+        qty = round(qty, precision)
+    return qty
+
+
+def _fetch_live_position(client: Any, symbol_norm: str) -> Optional[Dict[str, Any]]:
+    payload = None
+    if hasattr(client, "futures_position_information"):
+        try:
+            payload = client.futures_position_information(symbol=symbol_norm)
+        except Exception:
+            payload = None
+    if payload is None:
+        if hasattr(client, "fapiPrivate_get_positionrisk"):
+            try:
+                payload = client.fapiPrivate_get_positionrisk({"symbol": symbol_norm})
+            except Exception:
+                payload = None
+        elif hasattr(client, "fapiPrivateGetPositionRisk"):
+            try:
+                payload = client.fapiPrivateGetPositionRisk({"symbol": symbol_norm})
+            except Exception:
+                payload = None
+
+    entries: list[Dict[str, Any]] = []
+    if isinstance(payload, list):
+        entries = [entry for entry in payload if isinstance(entry, dict)]
+    elif isinstance(payload, dict):
+        entries = [payload]
+
+    for entry in entries:
+        entry_symbol = str(entry.get("symbol") or entry.get("symbolName") or "").upper()
+        if entry_symbol != symbol_norm:
+            continue
+        try:
+            amount = float(
+                entry.get("positionAmt")
+                or entry.get("position_amt")
+                or entry.get("amount")
+                or entry.get("qty")
+                or 0.0
+            )
+        except Exception:
+            amount = 0.0
+        if abs(amount) <= 0.0:
+            continue
+        side = "LONG" if amount > 0 else "SHORT"
+        try:
+            entry_price = float(entry.get("entryPrice") or entry.get("avgPrice") or 0.0)
+        except Exception:
+            entry_price = 0.0
+        try:
+            mark_price = float(entry.get("markPrice") or entry.get("mark_price") or entry_price)
+        except Exception:
+            mark_price = entry_price
+        try:
+            leverage = float(entry.get("leverage") or 1.0)
+        except Exception:
+            leverage = 1.0
+        return {
+            "side": side,
+            "qty": abs(amount),
+            "entry_price": entry_price,
+            "mark_price": mark_price,
+            "leverage": leverage,
+            "raw": entry,
+        }
+    return None
+
+
+def fetch_live_position(symbol: str) -> Optional[Dict[str, Any]]:
+    client = get_live_client()
+    if client is None:
+        return None
+    return _fetch_live_position(client, _normalize_symbol(symbol))
+
+
+def fetch_futures_usdt_balance() -> Optional[float]:
+    client = get_live_client()
+    if client is None:
+        return None
+    try:
+        balances = client.futures_account_balance()
+    except Exception:
+        balances = None
+    if isinstance(balances, list):
+        for entry in balances:
+            if not isinstance(entry, dict):
+                continue
+            asset = str(entry.get("asset") or "").upper()
+            if asset != "USDT":
+                continue
+            for key in ("balance", "crossWalletBalance", "walletBalance", "availableBalance"):
+                if entry.get(key) not in (None, ""):
+                    try:
+                        return float(entry[key])
+                    except Exception:
+                        continue
+    return None
+
+
+def get_latest_price(symbol: str) -> Optional[float]:
+    symbol_norm = _normalize_symbol(symbol)
+    ccxt_symbol = symbol if "/" in symbol else f"{symbol[:-4]}/USDT" if symbol.upper().endswith("USDT") else symbol
+    if PUBLIC_CCXT_CLIENT is not None and hasattr(PUBLIC_CCXT_CLIENT, "fetch_ticker"):
+        try:
+            ticker = PUBLIC_CCXT_CLIENT.fetch_ticker(ccxt_symbol)
+            for key in ("last", "mark", "close"):
+                if ticker.get(key) not in (None, ""):
+                    return float(ticker[key])
+            info = ticker.get("info") if isinstance(ticker, dict) else {}
+            if isinstance(info, dict):
+                candidate = info.get("markPrice") or info.get("price")
+                if candidate not in (None, ""):
+                    return float(candidate)
+        except Exception:
+            pass
+    client = get_live_client()
+    if client is not None:
+        try:
+            data = client.futures_mark_price(symbol=symbol_norm)
+            price = data.get("markPrice") if isinstance(data, dict) else None
+            if price not in (None, ""):
+                return float(price)
+        except Exception:
+            pass
+        try:
+            ticker = client.futures_symbol_ticker(symbol=symbol_norm)
+            if isinstance(ticker, dict):
+                for key in ("price", "lastPrice", "markPrice"):
+                    value = ticker.get(key)
+                    if value not in (None, ""):
+                        return float(value)
+        except Exception:
+            pass
+    return None
+
+
+def close_position_hard(
+    exchange: Any,
+    symbol: str,
+    side_pos: str,
+    pos_qty: float,
+    price_precision: Optional[int] = None,
+    qty_precision: Optional[int] = None,
+) -> Dict[str, Any]:
+    norm_symbol = _normalize_symbol(symbol)
+    if exchange is None:
+        return {"ok": False, "msg": "No hay exchange configurado"}
+    if abs(float(pos_qty or 0.0)) < 1e-12:
+        return {"ok": True, "msg": "No hay posición para cerrar."}
+
+    rules = _extract_symbol_rules(exchange, norm_symbol)
+    if qty_precision is None:
+        qty_precision = int(rules.get("qty_precision") or 0)
+    if price_precision is None:
+        price_precision = int(rules.get("price_precision") or 2)
+
+    raw_qty = abs(float(pos_qty or 0.0))
+    qty = _quantize_qty(raw_qty, rules)
+    if qty <= 0:
+        return {"ok": False, "msg": "Qty redondeada a 0; revisar lotes/qty_precision."}
+
+    close_side = "BUY" if str(side_pos).upper() == "SHORT" else "SELL"
+    client_oid = f"bot-close-{int(time.time())}"
+    try:
+        order = exchange.futures_create_order(
+            symbol=norm_symbol,
+            side=close_side,
+            type="MARKET",
+            quantity=qty,
+            reduceOnly=True,
+            newClientOrderId=client_oid,
+        )
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+    attempts: list[Dict[str, Any]] = []
+    residual_error: Optional[str] = None
+
+    try:
+        remaining = _fetch_live_position(exchange, norm_symbol)
+    except Exception:
+        remaining = None
+
+    tolerance = max(float(rules.get("step_size") or 0.0), float(rules.get("min_qty") or 0.0))
+    if tolerance <= 0:
+        tolerance = 1e-12
+
+    if remaining is not None:
+        rem_side = str(remaining.get("side") or "").upper()
+        rem_qty = _quantize_qty(float(remaining.get("qty") or 0.0), rules)
+        if rem_side == str(side_pos).upper() and rem_qty > tolerance:
+            try:
+                attempts.append(
+                    exchange.futures_create_order(
+                        symbol=norm_symbol,
+                        side=close_side,
+                        type="MARKET",
+                        quantity=rem_qty,
+                        reduceOnly=True,
+                        newClientOrderId=f"{client_oid}-r",
+                    )
+                )
+                remaining = _fetch_live_position(exchange, norm_symbol)
+            except Exception as exc:  # pragma: no cover - dependiente del exchange
+                residual_error = str(exc)
+
+    summary: Dict[str, Any] = {
+        "ok": True,
+        "symbol": norm_symbol,
+        "side": close_side,
+        "qty": float(qty),
+        "order": order,
+        "msg": f"Enviada orden MARKET {close_side} reduceOnly qty={qty}",
+    }
+    price = _infer_fill_price(order, None)
+    if price is not None:
+        summary["price"] = round(float(price), price_precision)
+    if attempts:
+        summary["extra_orders"] = attempts
+    if residual_error:
+        summary["residual_error"] = residual_error
+    if remaining and float(remaining.get("qty") or 0.0) > tolerance:
+        summary["residual_qty"] = float(remaining.get("qty") or 0.0)
+        summary["residual_side"] = str(remaining.get("side") or "")
+    return summary
+
+
+def bootstrap_real_state(
+    exchange: Optional[Any] = None,
+    store: Optional[Any] = None,
+    symbol: Optional[str] = None,
+) -> None:
+    runtime_mode = (runtime_get_mode() or "paper").lower()
+    if runtime_mode not in {"real", "live"}:
+        return
+
+    client = exchange or get_live_client()
+    if client is None:
+        logger.debug("bootstrap_real_state: no hay cliente live disponible")
+        return
+
+    target_symbol = symbol or getattr(S, "symbol", None) or "BTC/USDT"
+    rules = _extract_symbol_rules(client, target_symbol)
+    live = _fetch_live_position(client, _normalize_symbol(target_symbol))
+
+    active_store = store
+    if active_store is None and POSITION_SERVICE is not None:
+        active_store = getattr(POSITION_SERVICE, "store", None)
+
+    if live:
+        side_live = str(live.get("side") or "LONG").upper()
+        qty_live = float(live.get("qty") or 0.0)
+        signed_qty = _quantize_qty(qty_live, rules)
+        if side_live == "SHORT":
+            signed_qty = -signed_qty
+        avg_price = float(live.get("entry_price") or 0.0)
+        lev = float(live.get("leverage") or 1.0)
+
+        if active_store is not None:
+            try:
+                active_store.save(pos_qty=float(signed_qty), avg_price=avg_price)
+            except Exception:
+                logger.debug("bootstrap_real_state: no se pudo actualizar el store", exc_info=True)
+
+        try:
+            on_open_filled(
+                target_symbol,
+                side_live,
+                abs(float(signed_qty)),
+                avg_price,
+                lev,
+                mode="live",
+            )
+        except Exception:
+            logger.debug("bootstrap_real_state: no se pudo persistir posición live", exc_info=True)
+
+        logger.info(
+            "Sincronizado estado REAL con exchange: qty=%.6f, avg=%.2f",
+            abs(float(signed_qty)),
+            avg_price,
+        )
+    else:
+        if active_store is not None:
+            try:
+                active_store.save(pos_qty=0.0, avg_price=0.0)
+            except Exception:
+                logger.debug("bootstrap_real_state: no se pudo limpiar el store", exc_info=True)
+        logger.info("Sincronizado estado REAL con exchange: sin posición abierta.")
 
 
 def _config_uses_hedge(raw_config: Mapping[str, Any] | None) -> bool:
@@ -160,6 +574,11 @@ def rebuild(mode: Mode) -> None:
         ccxt_client=PUBLIC_CCXT_CLIENT,
         symbol=S.symbol if hasattr(S, "symbol") else "BTC/USDT",
     )
+    if mode != "simulado":
+        try:
+            bootstrap_real_state(symbol=getattr(POSITION_SERVICE, "symbol", None))
+        except Exception:
+            logger.debug("bootstrap_real_state falló durante rebuild", exc_info=True)
     logger.info(
         "Trading stack reconstruido para modo %s (data_dir=%s, store=%s)",
         mode.upper(),
@@ -336,45 +755,61 @@ def close_now(symbol: str | None = None):
 
     status = POSITION_SERVICE.get_status() or {}
     side = (status.get("side") or "FLAT").upper()
-    if side == "FLAT":
-        return {"status": "noop", "msg": "Sin posición para cerrar"}
+    target_symbol = symbol or status.get("symbol") or getattr(S, "symbol", None) or "BTC/USDT"
+    runtime_mode = (runtime_get_mode() or "paper").lower()
+    live_client = get_live_client() if runtime_mode in {"real", "live"} else None
 
     qty = float(status.get("qty") or status.get("pos_qty") or 0.0)
-    if qty <= 0:
-        return {"status": "noop", "msg": "Qty=0"}
+    used_live = False
+    live_summary: Optional[Dict[str, Any]] = None
+
+    if live_client is not None:
+        live_info = _fetch_live_position(live_client, _normalize_symbol(target_symbol))
+        if live_info:
+            side = str(live_info.get("side") or side).upper()
+            qty = float(live_info.get("qty") or 0.0)
+            if qty <= 0:
+                return {"status": "noop", "msg": "No hay posición live"}
+            used_live = True
+        else:
+            return {"status": "noop", "msg": "No hay posición abierta en el exchange"}
+
+    if side == "FLAT" or qty <= 0:
+        return {"status": "noop", "msg": "Sin posición para cerrar"}
 
     close_side = "SELL" if side == "LONG" else "BUY"
-    target_symbol = symbol or status.get("symbol")
-    hedged = _config_uses_hedge(RAW_CONFIG)
-    # Siempre cerrar con reduceOnly; en hedge además explicitar el lado actual
-    kwargs = dict(order_type="market", symbol=target_symbol, reduce_only=True)
-    if hedged and side in {"LONG", "SHORT"}:
-        kwargs["positionSide"] = side
 
-    # Sincronizar con posición viva si hay cliente activo (importante en REAL)
-    if ACTIVE_LIVE_CLIENT is not None:
-        try:
-            sym_id = (target_symbol or "BTC/USDT").replace("/", "")
-            live = ACTIVE_LIVE_CLIENT.futures_position_information(symbol=sym_id)
-            live_amt = 0.0
-            for p in live or []:
-                if str(p.get("symbol") or "").upper() == sym_id.upper():
-                    live_amt = float(p.get("positionAmt") or 0.0)
-                    break
-            live_qty = abs(live_amt)
-            if live_qty <= 0.0:
-                return {"status": "noop", "msg": "No live position"}
-            if qty > live_qty + 1e-12:
-                qty = live_qty
-        except Exception:
-            # si falla el fetch, seguimos con qty local (mejor que no cerrar nada)
-            pass
+    if used_live and live_client is not None:
+        rules = _extract_symbol_rules(live_client, target_symbol)
+        live_summary = close_position_hard(
+            live_client,
+            target_symbol,
+            side,
+            qty,
+            price_precision=int(rules.get("price_precision") or 2),
+            qty_precision=int(rules.get("qty_precision") or 0),
+        )
+        if not live_summary.get("ok"):
+            return {
+                "status": "error",
+                "msg": live_summary.get("error") or live_summary.get("msg") or "No se pudo cerrar posición",
+                "details": live_summary,
+            }
+        result_payload = live_summary.get("order")
+        close_price = live_summary.get("price")
+        effective_qty = float(live_summary.get("qty") or qty)
+    else:
+        hedged = _config_uses_hedge(RAW_CONFIG)
+        kwargs = dict(order_type="market", symbol=target_symbol, reduce_only=True)
+        if hedged and side in {"LONG", "SHORT"}:
+            kwargs["positionSide"] = side
+        result_payload = BROKER.place_order(close_side, qty, None, **kwargs)
+        close_price = _infer_fill_price(result_payload, status.get("mark"))
+        effective_qty = qty
 
-    result = BROKER.place_order(close_side, qty, None, **kwargs)
-    close_price = _infer_fill_price(result, status.get("mark"))
     try:
         if POSITION_SERVICE is not None and getattr(POSITION_SERVICE, "store", None):
-            if isinstance(result, dict) and result.get("sim"):
+            if not used_live and isinstance(result_payload, dict) and result_payload.get("sim"):
                 try:
                     POSITION_SERVICE.refresh()
                 except Exception:
@@ -382,28 +817,29 @@ def close_now(symbol: str | None = None):
             else:
                 bot_side = "SHORT" if side == "LONG" else "LONG"
                 if close_price is not None:
-                    POSITION_SERVICE.apply_fill(bot_side, float(qty), float(close_price))
-        fee_paid = _extract_order_fee(result)
+                    POSITION_SERVICE.apply_fill(bot_side, float(effective_qty), float(close_price))
+        fee_paid = _extract_order_fee(result_payload)
         if close_price is not None:
             try:
-                target = target_symbol or symbol or getattr(S, "symbol", None) or "BTC/USDT"
-                on_close_filled(str(target), float(close_price), fee=fee_paid)
+                on_close_filled(str(target_symbol), float(close_price), fee=fee_paid)
             except Exception:
                 logger.debug("No se pudo persistir cierre en state_store.", exc_info=True)
     except Exception:
-        if isinstance(result, dict) and result.get("sim"):
+        if not used_live and isinstance(result_payload, dict) and result_payload.get("sim"):
             logger.warning("PAPER: no se pudo reflejar cierre en store.", exc_info=True)
         else:
             logger.debug("No se pudo reflejar cierre en store.", exc_info=True)
     summary: dict[str, Any] = {
         "status": "ok",
-        "order": result,
+        "order": result_payload,
         "symbol": target_symbol,
         "side": side,
-        "qty": float(qty),
+        "qty": float(effective_qty),
     }
     if close_price is not None:
         summary["close_price"] = float(close_price)
+    if live_summary is not None:
+        summary["details"] = live_summary
     return summary
 
 

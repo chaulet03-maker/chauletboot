@@ -2,6 +2,7 @@ import os
 import math
 import logging
 import asyncio
+import math
 import sqlite3
 import time
 import re
@@ -20,7 +21,7 @@ from telegram.request import HTTPXRequest
 
 from logging_setup import LOG_DIR, LOG_FILE
 from time_fmt import fmt_ar
-from config import S
+from config import S, MANUAL_OPEN_RISK_PCT
 from bot.motives import MOTIVES
 from bot.mode_manager import get_mode
 from bot.identity import get_bot_id
@@ -44,6 +45,11 @@ logger = logging.getLogger("telegram")
 REGISTRY = CommandRegistry()
 
 
+CLOSE_TEXT_RE = re.compile(r"^(cerrar(?: posicion| posición)?|close)$", re.IGNORECASE)
+OPEN_TEXT_RE = re.compile(r"^open\s+(long|short)\s+x(\d+)$", re.IGNORECASE)
+POSITION_TEXT_RE = re.compile(r"^(posicion|posición|position)$", re.IGNORECASE)
+
+
 # === util local para formateo ===
 
 
@@ -62,11 +68,28 @@ def _fmt_sign_money(v: float) -> str:
 
 
 async def open_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    return await diag_command(update, context)
+    message = update.effective_message
+    if message is None:
+        return
+    await message.reply_text(
+        "Uso manual: `open long x10` o `open short x5`."
+        " El bot calculará el tamaño usando MANUAL_OPEN_RISK_PCT.",
+        parse_mode="Markdown",
+    )
 
 
 async def rendimiento_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return await equity_command(update, context)
+
+
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.effective_message
+    if message is None:
+        return
+    await message.reply_text(
+        "Hola! Escribí *ayuda* para ver los comandos disponibles.",
+        parse_mode="Markdown",
+    )
 
 
 def _get_app_from_context(context: ContextTypes.DEFAULT_TYPE):
@@ -1371,6 +1394,82 @@ async def cerrar_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if app is None or message is None:
         return
 
+    symbol = app.config.get("symbol", "BTC/USDT") if getattr(app, "config", None) else "BTC/USDT"
+    if getattr(app, "is_live", False):
+        try:
+            pos = await app.exchange.get_open_position(symbol)
+        except Exception:
+            pos = None
+        if pos:
+            side_pos = str(pos.get("side") or pos.get("positionSide") or "").upper()
+            try:
+                qty_val = float(
+                    pos.get("contracts")
+                    or pos.get("positionAmt")
+                    or pos.get("size")
+                    or pos.get("qty")
+                    or 0.0
+                )
+            except Exception:
+                qty_val = 0.0
+            qty_val = abs(qty_val)
+            if side_pos in {"LONG", "SHORT"} and qty_val > 0:
+                client = trading.get_live_client()
+                if client is None:
+                    await message.reply_text("No hay cliente LIVE disponible para cerrar la posición.")
+                    return
+                try:
+                    rules = await asyncio.to_thread(trading.get_symbol_rules, symbol)
+                except Exception as exc:
+                    await message.reply_text(f"Error al obtener filtros del símbolo: {exc}")
+                    return
+                try:
+                    result = await asyncio.to_thread(
+                        trading.close_position_hard,
+                        client,
+                        symbol,
+                        side_pos,
+                        qty_val if side_pos == "LONG" else -qty_val,
+                        int(rules.get("price_precision") or 2),
+                        int(rules.get("qty_precision") or 0),
+                    )
+                except Exception as exc:
+                    await message.reply_text(f"Error al cerrar: {exc}")
+                    return
+                if not result.get("ok"):
+                    await message.reply_text(
+                        f"Error al cerrar: {result.get('error') or result.get('msg')}"
+                    )
+                    return
+                await asyncio.to_thread(trading.bootstrap_real_state)
+                qty_closed = float(result.get("qty") or qty_val)
+                price_val = result.get("price")
+                close_msg = (
+                    "<b>✅ Cerré la posición del BOT</b>\n"
+                    f"• Lado: <b>{side_pos}</b>\n"
+                    f"• Cantidad: {qty_closed:.6f}"
+                )
+                if price_val not in (None, ""):
+                    try:
+                        close_msg += f"\n• Precio de cierre: {float(price_val):,.2f}"
+                    except Exception:
+                        pass
+                await message.reply_html(close_msg)
+                try:
+                    app.manual_block_until = time.time() + 600
+                    log = getattr(app, "log", None) or getattr(app, "logger", None)
+                    if log is not None:
+                        log.info(
+                            "Cooldown activado por cierre manual: 10 min sin entradas nuevas."
+                        )
+                except Exception:
+                    if getattr(app, "logger", None) is not None:
+                        app.logger.debug(
+                            "No se pudo establecer el cooldown manual tras cierre.",
+                            exc_info=True,
+                        )
+                return
+
     try:
         result = await app.close_all()
     except Exception as exc:
@@ -1398,6 +1497,100 @@ async def cerrar_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     exc_info=True,
                 )
 
+
+async def handle_open_manual(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.effective_message
+    if message is None:
+        return
+    text = (message.text or "").strip()
+    match = OPEN_TEXT_RE.match(text)
+    if not match:
+        return
+
+    app = _get_app_from_context(context)
+    if app is None:
+        return
+    if not getattr(app, "is_live", False):
+        await message.reply_text("Abrir manual está disponible sólo en modo REAL.")
+        return
+
+    side_txt = match.group(1).upper()
+    leverage = int(match.group(2))
+    if leverage < 1 or leverage > 125:
+        await message.reply_text("Apalancamiento inválido. Elegí un valor entre 1 y 125.")
+        return
+
+    symbol = app.config.get("symbol", "BTC/USDT") if getattr(app, "config", None) else "BTC/USDT"
+    client = trading.get_live_client()
+    if client is None:
+        await message.reply_text("No hay cliente LIVE disponible para abrir la posición.")
+        return
+
+    symbol_clean = symbol.replace("/", "")
+
+    def _set_leverage():
+        return client.futures_change_leverage(symbol=symbol_clean, leverage=leverage)
+
+    try:
+        await asyncio.to_thread(_set_leverage)
+    except Exception as exc:
+        await message.reply_text(f"Error al setear leverage x{leverage}: {exc}")
+        return
+
+    balance = await asyncio.to_thread(trading.fetch_futures_usdt_balance)
+    if balance is None or balance <= 0:
+        await message.reply_text("No pude obtener el balance de futuros USDT.")
+        return
+
+    price = await asyncio.to_thread(trading.get_latest_price, symbol)
+    if price is None or price <= 0:
+        await message.reply_text("No pude obtener el precio actual del símbolo.")
+        return
+
+    risk_pct = float(MANUAL_OPEN_RISK_PCT or 0.5)
+    notional = balance * (risk_pct / 100.0) * leverage
+    qty_raw = notional / price if price else 0.0
+
+    try:
+        rules = await asyncio.to_thread(trading.get_symbol_rules, symbol)
+    except Exception as exc:
+        await message.reply_text(f"Error al obtener filtros del símbolo: {exc}")
+        return
+
+    step = float(rules.get("step_size") or 0.0)
+    qty_precision = int(rules.get("qty_precision") or 0)
+    if step > 0:
+        qty = math.floor((qty_raw / step) + 1e-9) * step
+    else:
+        qty = qty_raw
+    qty = round(qty, qty_precision)
+    if qty <= 0:
+        await message.reply_text("Qty resultó 0. Ajusta MANUAL_OPEN_RISK_PCT o el leverage.")
+        return
+
+    side_order = "BUY" if side_txt == "LONG" else "SELL"
+
+    try:
+        result = await asyncio.to_thread(
+            trading.place_order_safe,
+            side_order,
+            qty,
+            None,
+            symbol=symbol,
+            leverage=leverage,
+        )
+    except Exception as exc:
+        await message.reply_text(f"Error al abrir: {exc}")
+        return
+
+    price_fill = trading._infer_fill_price(result, price)
+    text_reply = f"✅ Abierta {side_txt} x{leverage} qty={qty:.6f} a mercado."
+    if price_fill:
+        try:
+            text_reply += f" Precio≈{float(price_fill):,.2f}"
+        except Exception:
+            pass
+    await message.reply_text(text_reply)
 
 async def control_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Toma control de la posición REAL actual: fuerza modo REAL y sincroniza desde el exchange."""
@@ -2157,18 +2350,14 @@ async def _text_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 async def _status_plaintext_handler(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
-    message = update.effective_message
-    text = (message.text or "") if message else ""
-    norm = normalize(text)
-    if norm.startswith("posicion") or norm.startswith("posición") or norm.startswith("position"):
-        await posicion_command(update, context)
-        return
     await estado_command(update, context)
 
 
 def register_commands(application: Application) -> None:
     _populate_registry()
     if not getattr(application, "_chaulet_bot_handlers_registered", False):
+        application.add_handler(CommandHandler("start", start_command))
+        application.add_handler(CommandHandler(["ayuda", "help"], ayuda_command))
         application.add_handler(CommandHandler(["estado", "status", "diagnostico"], estado_command))
         application.add_handler(CommandHandler(["posicion", "position"], posicion_command))
         application.add_handler(CommandHandler(["posiciones", "positions"], posiciones_command))
@@ -2181,17 +2370,23 @@ def register_commands(application: Application) -> None:
 
     application.add_handler(MessageHandler(filters.COMMAND, _slash_router))
     application.add_handler(
-        MessageHandler(
-            filters.Regex(
-                re.compile(
-                    r"^(posicion|posición|position|status|estado)$",
-                    re.IGNORECASE,
-                )
-            ),
-            _status_plaintext_handler,
-        )
+        MessageHandler(filters.Regex(r"^(status|estado)$", re.IGNORECASE), _status_plaintext_handler)
     )
-    application.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), _text_router))
+    application.add_handler(
+        MessageHandler(filters.Regex(CLOSE_TEXT_RE.pattern, re.IGNORECASE), cerrar_command)
+    )
+    application.add_handler(
+        MessageHandler(filters.Regex(OPEN_TEXT_RE.pattern, re.IGNORECASE), handle_open_manual)
+    )
+    application.add_handler(
+        MessageHandler(filters.Regex(POSITION_TEXT_RE.pattern, re.IGNORECASE), posicion_command)
+    )
+    generic_filter = filters.TEXT & (~filters.COMMAND)
+    generic_filter = generic_filter & (~filters.Regex(CLOSE_TEXT_RE.pattern, re.IGNORECASE))
+    generic_filter = generic_filter & (~filters.Regex(OPEN_TEXT_RE.pattern, re.IGNORECASE))
+    generic_filter = generic_filter & (~filters.Regex(POSITION_TEXT_RE.pattern, re.IGNORECASE))
+    generic_filter = generic_filter & (~filters.Regex(r"^(status|estado)$", re.IGNORECASE))
+    application.add_handler(MessageHandler(generic_filter, _text_router))
     setattr(application, "_chaulet_router_registered", True)
     logger.info(
         "Router central de comandos registrado (%d comandos).",

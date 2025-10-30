@@ -122,6 +122,19 @@ RAW_CONFIG: Dict[str, Any] = load_raw_config()
 S: Settings = load_settings()
 
 
+def _manual_open_risk_pct() -> float:
+    try:
+        raw = _nested_get(RAW_CONFIG, "manual", "open_risk_pct")
+        if raw is None:
+            return 0.5
+        return float(raw)
+    except Exception:
+        return 0.5
+
+
+MANUAL_OPEN_RISK_PCT: float = _manual_open_risk_pct()
+
+
 def get_telegram_token(default: Optional[str] = None) -> Optional[str]:
     env = os.getenv("TELEGRAM_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN")
     if env:
@@ -150,4 +163,5 @@ __all__ = [
     "load_settings",
     "get_telegram_token",
     "get_telegram_chat_id",
+    "MANUAL_OPEN_RISK_PCT",
 ]
