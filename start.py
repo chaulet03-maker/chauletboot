@@ -1,4 +1,5 @@
 # start.py (reemplazar completo)
+import argparse
 import os
 import sys
 import logging
@@ -15,15 +16,11 @@ if ROOT not in sys.path:
 from logging_setup import setup_logging
 from config import load_raw_config, get_telegram_token, get_telegram_chat_id
 from bot.engine import TradingApp
+from bot.mode_manager import ensure_startup_mode
+from paths import get_data_dir
 
 
-def _resolve_mode(cfg):
-    raw = (os.getenv("MODE")
-           or str(cfg.get("trading_mode") or cfg.get("mode") or "paper")).lower()
-    return "real" if raw in {"real", "live"} else "paper"
-
-
-def main():
+def main(argv: list[str] | None = None):
     # --- SINGLE INSTANCE LOCK ---
     import os, sys
     LOCK_PATH = "/tmp/chauletbot.lock"
@@ -47,18 +44,38 @@ def main():
         except Exception:
             pass
 
+    parser = argparse.ArgumentParser(description="Inicia el bot de trading")
+    parser.add_argument(
+        "--mode",
+        dest="mode",
+        help="Forzar modo de ejecución (real/live/paper/simulado)",
+    )
+    args = parser.parse_args(argv)
+
     cfg = load_raw_config()
 
-    # Normalizamos modo y telegram acá (una sola fuente de verdad)
-    cfg["mode"] = _resolve_mode(cfg)
-    cfg["trading_mode"] = cfg["mode"]
+    env_mode = os.getenv("TRADING_MODE") or os.getenv("MODE")
+    effective_mode, mode_source, persisted = ensure_startup_mode(
+        cfg,
+        cli_mode=args.mode,
+        env_mode=env_mode,
+        persist=True,
+    )
+
+    # Normalizamos telegram acá (una sola fuente de verdad)
     cfg["telegram_token"] = get_telegram_token(cfg.get("telegram_token"))
     cfg["telegram_chat_id"] = get_telegram_chat_id(cfg.get("telegram_chat_id"))
 
     setup_logging()
-    logging.info("Iniciando bot en modo: %s", cfg["mode"])
+    logging.info(
+        "Iniciando bot en modo: %s (fuente=%s, persistido=%s)",
+        "REAL" if effective_mode == "real" else "SIMULADO",
+        mode_source,
+        persisted,
+    )
+    logging.info("DATA_DIR=%s", get_data_dir())
 
-    app = TradingApp(cfg)
+    app = TradingApp(cfg, mode_source=mode_source)
     app.run()
 
 

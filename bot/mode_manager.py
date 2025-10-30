@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 import os
 from dataclasses import dataclass
-from typing import Literal, Tuple
+from typing import Any, Literal, Optional, Tuple
 
 import yaml
 
@@ -23,10 +23,11 @@ class ModeResult:
     mode: Mode | None = None
 
 
-def _read_cfg(path: str = CONFIG_PATH) -> dict:
-    if not path:
+def _read_cfg(path: Optional[str] = None) -> dict:
+    target = path or CONFIG_PATH
+    if not target:
         return {}
-    cfg_path = os.path.expanduser(path)
+    cfg_path = os.path.expanduser(target)
     if not os.path.isabs(cfg_path):
         cfg_path = os.path.abspath(cfg_path)
     if not os.path.exists(cfg_path):
@@ -39,8 +40,9 @@ def _read_cfg(path: str = CONFIG_PATH) -> dict:
     return data
 
 
-def _write_cfg(cfg: dict, path: str = CONFIG_PATH) -> None:
-    cfg_path = os.path.expanduser(path)
+def _write_cfg(cfg: dict, path: Optional[str] = None) -> None:
+    target = path or CONFIG_PATH
+    cfg_path = os.path.expanduser(target)
     if not os.path.isabs(cfg_path):
         cfg_path = os.path.abspath(cfg_path)
     # asegurar carpeta destino
@@ -94,6 +96,58 @@ def check_keys_present(env=os.environ) -> Tuple[bool, str]:
         "Faltan credenciales Binance. Admitidos: "
         "BINANCE_API_KEY/_SECRET, ..._REAL, ..._TEST, BINANCE_KEY/_SECRET."
     )
+
+
+def normalize_mode(raw: Any) -> Optional[Mode]:
+    if raw is None:
+        return None
+    value = str(raw).strip().lower()
+    if value in {"real", "live"}:
+        return "real"
+    if value in {"sim", "simulado", "paper", "test", "demo"}:
+        return "simulado"
+    return None
+
+
+def determine_startup_mode(
+    cfg: Optional[dict],
+    *,
+    cli_mode: Optional[str] = None,
+    env_mode: Optional[str] = None,
+) -> Tuple[Mode, str]:
+    config = cfg or {}
+    for source, candidate in (
+        ("cli", cli_mode),
+        ("env", env_mode),
+        ("config", config.get("trading_mode")),
+        ("config_mode", config.get("mode")),
+    ):
+        normalized = normalize_mode(candidate)
+        if normalized is not None:
+            return normalized, source
+    return "simulado", "default"
+
+
+def ensure_startup_mode(
+    cfg: dict,
+    *,
+    cli_mode: Optional[str] = None,
+    env_mode: Optional[str] = None,
+    persist: bool = True,
+) -> Tuple[Mode, str, bool]:
+    mode, source = determine_startup_mode(cfg, cli_mode=cli_mode, env_mode=env_mode)
+    current_cfg_mode = normalize_mode(cfg.get("trading_mode")) or "simulado"
+    changed = mode != current_cfg_mode
+
+    cfg["trading_mode"] = "real" if mode == "real" else "simulado"
+    cfg["mode"] = "real" if mode == "real" else "paper"
+
+    if persist and changed:
+        set_mode_in_yaml(mode)
+    else:
+        runtime_set_mode("live" if mode == "real" else "paper")
+
+    return mode, source, changed
 
 
 def safe_switch(new_mode: Mode, services) -> ModeResult:

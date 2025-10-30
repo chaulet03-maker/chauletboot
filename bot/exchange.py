@@ -358,6 +358,9 @@ class Exchange:
             pass
         self._price_stream = None
 
+    def get_price_source(self) -> str:
+        return "websocket" if getattr(self, "_price_stream", None) else "rest"
+
     def _determine_hedge_mode(self) -> bool:
         cfg: Mapping[str, Any] = (
             self.config if isinstance(self.config, Mapping) else {}

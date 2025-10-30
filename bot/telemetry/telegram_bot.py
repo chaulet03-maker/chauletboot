@@ -1392,7 +1392,7 @@ async def control_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if engine is None or message is None:
         return
 
-    result = trading.switch_mode("real")
+    result = trading.set_trading_mode("real", source="telegram/control")
     if not result.ok:
         await message.reply_text(f"❌ No pude activar modo REAL: {result.msg}", parse_mode="Markdown")
         return
@@ -1584,7 +1584,7 @@ async def _cmd_modo_simulado(engine, reply):
     if _get_mode_from_engine(engine) == "paper":
         return await reply("✅ El bot ya se encontraba en *MODO SIMULADO*.")
     try:
-        engine.set_mode("paper")   # usa el método que agregaste recién
+        engine.set_mode("paper", source="telegram")   # usa el método que agregaste recién
         return await reply("✅ Modo cambiado a *SIMULADO*. El bot ahora opera en simulado.")
     except Exception as e:
         return await reply("⚠️ No pude cambiar a SIMULADO (revisá logs / configuración).")
@@ -1595,7 +1595,7 @@ async def _cmd_modo_real(engine, reply):
         return await reply("✅ El bot ya está en *MODO REAL*.")
 
     try:
-        engine.set_mode("live")
+        engine.set_mode("live", source="telegram")
     except Exception as e:
         return await reply(f"⚠️ No pude cambiar a REAL: {e}")
 

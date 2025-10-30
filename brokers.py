@@ -4,10 +4,10 @@ import logging
 import os
 import time
 from threading import Lock
-from pathlib import Path
 from typing import Any, Callable, Optional
 
 from paper_store import PaperStore
+from paths import get_data_dir, get_paper_store_path
 from state_store import update_open_position
 
 from bot.runtime_state import get_mode as runtime_get_mode
@@ -42,20 +42,8 @@ def _normalize_symbol(symbol: str) -> str:
         value = value[: -len(":USDT")]
     return value.upper()
 
-_RAW_DATA_DIR = Path(os.getenv("DATA_DIR", "/app/data")).expanduser()
-if not _RAW_DATA_DIR.is_absolute():
-    _RAW_DATA_DIR = (Path("/app") / _RAW_DATA_DIR).resolve()
-_RAW_DATA_DIR.mkdir(parents=True, exist_ok=True)
-
-_raw_store_path = os.getenv("PAPER_STORE_PATH")
-if _raw_store_path:
-    candidate = Path(_raw_store_path)
-    if not candidate.is_absolute():
-        candidate = (_RAW_DATA_DIR / candidate).resolve()
-else:
-    candidate = (_RAW_DATA_DIR / "paper_state.json").resolve()
-
-PAPER_STORE_PATH = candidate
+_RAW_DATA_DIR = get_data_dir()
+PAPER_STORE_PATH = get_paper_store_path()
 
 ACTIVE_PAPER_STORE: PaperStore | None = None
 ACTIVE_LIVE_CLIENT: Any | None = None
