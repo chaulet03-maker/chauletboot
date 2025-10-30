@@ -107,7 +107,7 @@ class SimBroker:
                 updates["avg_price"] = float(price)
             else:
                 updates["avg_price"] = avg_price
-            updates["realized_pnl"] = state.get("realized_pnl", 0.0) + realized
+            updates["realized_pnl"] = float(state.get("realized_pnl", 0.0) or 0.0) + float(realized)
 
         if fee > 0:
             updates["fees"] = state.get("fees", 0.0) + fee
@@ -162,14 +162,6 @@ class SimBroker:
 
         oid = f"sim-{int(time.time() * 1000)}"
         new_state = self._apply_fill(side_u, qty, float(fill_price))
-        try:
-            # Persistimos el estado actualizado antes de responder al caller.
-            if isinstance(new_state, dict):
-                self.store.save(**new_state)
-            else:
-                self.store.save()
-        except Exception:
-            logger.warning("PAPER: no se pudo persistir el fill en store", exc_info=True)
         avg_price = float(new_state.get("avg_price", fill_price)) if isinstance(new_state, dict) else float(fill_price)
         logger.info("PAPER ORDER %s %.6f @ %.2f → FILLED [%s]", side_u, qty, float(fill_price), oid)
         payload: dict[str, Any] = {
@@ -185,6 +177,7 @@ class SimBroker:
         }
         payload["clientOrderId"] = client_oid
         payload["newClientOrderId"] = client_oid
+        payload["symbol"] = symbol_val
         if reduce_only:
             payload["reduceOnly"] = True
             if isinstance(new_state, dict):
@@ -197,9 +190,6 @@ class SimBroker:
                         logger.debug("SimBroker: no se pudo limpiar tp/sl tras cierre", exc_info=True)
                 else:
                     payload["status"] = "reduced"
-        symbol_arg = kwargs.get("symbol")
-        if symbol_arg:
-            payload["symbol"] = symbol_arg
         if "sl" in kwargs:
             payload["sl"] = kwargs["sl"]
         if "tp" in kwargs:
@@ -439,7 +429,7 @@ class BinanceBroker:
         return classification in {"ratelimit", "network"}
 
     def _register_reject(self) -> None:
-        now = time.time()
+        now = time.monotonic()
         if now - self._reject_window_ts > 60:
             self._reject_window_ts = now
             self._reject_count = 0
@@ -664,7 +654,7 @@ class BinanceBroker:
                 mode,
                 bot_id,
                 symbol_ledger,
-                side_u,
+                normalized_side,
                 client_oid,
                 order_id,
                 leverage,
@@ -693,7 +683,7 @@ class BinanceBroker:
                     mode,
                     bot_id,
                     symbol_ledger,
-                    side_u,
+                    normalized_side,
                     client_oid,
                     order_id,
                     f_qty,
@@ -778,8 +768,10 @@ def build_broker(settings, client_factory: Callable[..., Any]):
         fee_rate = float(os.getenv("PAPER_FEE_RATE", "0") or 0.0)
         return SimBroker(ACTIVE_PAPER_STORE, fee_rate=fee_rate)
 
-    assert settings.binance_api_key, "Falta BINANCE_API_KEY (modo real)."
-    assert settings.binance_api_secret, "Falta BINANCE_API_SECRET (modo real)."
+    if not settings.binance_api_key:
+        raise RuntimeError("Falta BINANCE_API_KEY (modo real).")
+    if not settings.binance_api_secret:
+        raise RuntimeError("Falta BINANCE_API_SECRET (modo real).")
     # Siempre recrear el cliente al cambiar a REAL para evitar credenciales viejas
     ACTIVE_LIVE_CLIENT = None
     client = client_factory(api_key=settings.binance_api_key, secret=settings.binance_api_secret)
