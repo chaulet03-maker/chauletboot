@@ -15,14 +15,25 @@ from bot.exchange_client import ensure_position_mode, get_ccxt, reset_ccxt_clien
 
 logger = logging.getLogger(__name__)
 
-def create_order_smart(symbol: str, side: str, qty: float, *, price=None, **extra_params):
+def create_order_smart(
+    symbol: str,
+    side: str,
+    qty: float,
+    *,
+    price=None,
+    client=None,
+    **extra_params,
+):
     """
     Crea orden MARKET/limit de forma tolerante al modo:
     - Intenta SIN positionSide (ONE-WAY compatible).
     - Si Binance devuelve -4061 / mismatch => reintenta con positionSide=LONG/SHORT.
     """
 
-    ex = get_ccxt()
+    try:
+        ex = client or get_ccxt()
+    except Exception as exc:
+        raise RuntimeError("Faltan credenciales o CCXT no disponible") from exc
     side_up = str(side).upper()
     order_type = "market" if price is None else "limit"
     params = dict(extra_params or {})
@@ -226,36 +237,65 @@ class Exchange:
         symbol = self.config.get("symbol", "BTC/USDT")
         ws_symbol = self._normalize_symbol(symbol)
         try:
-            from binance.websocket.um_futures.websocket_client import (  # type: ignore
-                UMFuturesWebsocketClient,
-            )
+            from binance.websocket.um_futures.websocket_client import UMFuturesWebsocketClient  # type: ignore
         except Exception:
-            logger.debug("UMFuturesWebsocketClient no disponible, fallback REST")
+            logger.warning("WS de Binance no disponible; uso REST para precios.")
             return
 
         def handle(message):
             if not isinstance(message, dict):
                 return
-            price = (
-                message.get("p")
-                or message.get("price")
-                or message.get("markPrice")
-                or message.get("c")
-            )
-            if price is None:
+
+            px = None
+
+            if "markPrice" in message:
+                try:
+                    px = float(message["markPrice"])
+                except Exception:
+                    px = None
+
+            if px is None:
+                for k in ("c", "price", "lastPrice", "lp"):
+                    v = message.get(k)
+                    if v is not None:
+                        try:
+                            px = float(v)
+                            break
+                        except Exception:
+                            continue
+
+            if px is None and "a" in message and "b" in message:
+                try:
+                    ask = float(message["a"])
+                    bid = float(message["b"])
+                    px = (ask + bid) / 2.0
+                except Exception:
+                    px = None
+
+            if px is None:
                 return
+
+            ts_ms = message.get("E") or message.get("eventTime")
             try:
-                px = float(price)
+                ts = float(ts_ms) / 1000.0 if ts_ms is not None else time.time()
             except Exception:
-                return
-            ts = float(message.get("E") or message.get("eventTime") or time.time()) / 1000.0
+                ts = time.time()
+
             with self._price_lock:
-                self._price_cache[symbol] = {"price": px, "ts": ts}
+                base = self.config.get("symbol", "BTC/USDT")
+                self._price_cache[base] = {"price": px, "ts": ts}
+                self._price_cache[base.replace("/", "")] = {"price": px, "ts": ts}
+                if base.endswith("/USDT"):
+                    self._price_cache[f"{base}:USDT"] = {"price": px, "ts": ts}
 
         try:
             self._price_stream = UMFuturesWebsocketClient(on_message=handle)
             self._price_stream.start()
-            self._price_stream.book_ticker(symbol=ws_symbol)
+            try:
+                self._price_stream.mark_price(symbol=ws_symbol)
+            except Exception:
+                self._price_stream.mini_ticker(symbol=ws_symbol)
+            logger.info("WS de precios iniciado para %s", ws_symbol)
         except Exception:
             logger.warning("No se pudo iniciar websocket de precios", exc_info=True)
             self._price_stream = None
@@ -446,10 +486,10 @@ class Exchange:
         try:
             return await asyncio.to_thread(self.client.fetch_ohlcv, sym, timeframe=timeframe, limit=limit)
         except Exception:
-            if sym.endswith('/USDT') and ':USDT' not in sym:
-                fut_symbol = f"{sym}:USDT"
-                logger.debug("Fallo al obtener klines para %s, probando %s", sym, fut_symbol)
-                return await asyncio.to_thread(self.client.fetch_ohlcv, fut_symbol, timeframe=timeframe, limit=limit)
+            alt = sym.replace('/', '')
+            if alt != sym:
+                logger.debug("Fallo al obtener klines para %s, probando %s", sym, alt)
+                return await asyncio.to_thread(self.client.fetch_ohlcv, alt, timeframe=timeframe, limit=limit)
             raise
 
     def get_price_age_sec(self, symbol: Optional[str] = None) -> float:
@@ -467,16 +507,31 @@ class Exchange:
         """Obtiene el precio actual del símbolo configurado."""
 
         base_symbol = symbol or self.config.get('symbol', 'BTC/USDT')
-        with self._price_lock:
-            cached = self._price_cache.get(base_symbol)
-        age = self.get_price_age_sec(base_symbol)
-        if cached and age <= 2.0:
-            return float(cached.get("price", 0.0))
+
+        def _from_cache(key: str) -> Optional[float]:
+            with self._price_lock:
+                cached = self._price_cache.get(key)
+            if not cached:
+                return None
+            age = max(0.0, time.time() - float(cached.get("ts", 0.0)))
+            if age <= 2.0:
+                try:
+                    return float(cached.get("price", 0.0))
+                except Exception:
+                    return None
+            return None
+
+        for key in (base_symbol, base_symbol.replace('/', ''), f"{base_symbol}:USDT"):
+            px = _from_cache(key)
+            if px is not None:
+                return px
+
         candidates = [base_symbol]
-        if base_symbol.endswith('/USDT') and ':USDT' not in base_symbol:
+        no_slash = base_symbol.replace('/', '')
+        if no_slash not in candidates:
+            candidates.append(no_slash)
+        if base_symbol.endswith('/USDT') and f"{base_symbol}:USDT" not in candidates:
             candidates.append(f"{base_symbol}:USDT")
-        if base_symbol.replace('/', '') not in candidates:
-            candidates.append(base_symbol.replace('/', ''))
 
         clients: List[Any] = []
         if self.public_client is not None:
