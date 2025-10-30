@@ -11,6 +11,7 @@ from ccxt.base.errors import ExchangeError, NetworkError
 from config import S
 from bot.exchanges.binance_filters import build_filters
 from bot.exchange_client import ensure_position_mode, get_ccxt, reset_ccxt_client
+from bot.runtime_state import get_mode as runtime_get_mode
 
 
 logger = logging.getLogger(__name__)
@@ -76,6 +77,24 @@ class Exchange:
         self._price_lock = threading.Lock()
         self._price_stream = None
         self._start_price_stream()
+
+    def _is_paper_runtime(self) -> bool:
+        """
+        Evalúa el modo efectivo en tiempo real, sin depender de S.PAPER.
+        Retorna True si el runtime no está en 'live' o si no hay credenciales
+        aplicadas al cliente actual.
+        """
+
+        mode = (runtime_get_mode() or "paper").lower()
+        if mode not in {"real", "live"}:
+            return True
+
+        client = getattr(self, "client", None)
+        if client is None:
+            # Durante la inicialización aún no hay cliente construido.
+            return False
+        api_key = getattr(client, "apiKey", None)
+        return not bool(api_key)
 
     # --------- NUEVO: posiciones abiertas (CCXT) ---------
     async def get_open_position(self, symbol: Optional[str] = None) -> Optional[Dict[str, Any]]:
@@ -173,7 +192,7 @@ class Exchange:
             from brokers import ACTIVE_LIVE_CLIENT
 
             nat = ACTIVE_LIVE_CLIENT
-            if nat:
+            if nat and not self._is_paper_runtime():
                 acct = await asyncio.to_thread(nat.futures_account)
                 for pos in acct.get("positions", []):
                     sym = str(pos.get("symbol") or "")
@@ -219,12 +238,12 @@ class Exchange:
         except Exception:
             pass
 
-        # 2) Fallback nativo (python-binance): wallet de USD-M
+        # 2) Fallback nativo (python-binance): wallet de USD-M (solo si runtime live)
         try:
             from brokers import ACTIVE_LIVE_CLIENT  # client python-binance si estás en REAL
 
             nat = ACTIVE_LIVE_CLIENT
-            if nat:
+            if nat and not self._is_paper_runtime():
                 # futures_account_balance devuelve lista de assets de la wallet USDM
                 data = await asyncio.to_thread(nat.futures_account_balance)
                 for a in data or []:
@@ -378,7 +397,8 @@ class Exchange:
 
     async def upgrade_to_real_if_needed(self):
         """Si cambiaste a REAL y este Exchange sigue 'público', lo reautentico en caliente."""
-        if S.PAPER:
+        mode = (runtime_get_mode() or "paper").lower()
+        if mode not in {"real", "live"}:
             return
         if self.is_authenticated and getattr(self.client, "apiKey", None):
             return
@@ -415,7 +435,7 @@ class Exchange:
         """ Configura e inicializa el cliente del exchange. """
         self.is_authenticated = False  # Bandera de estado
 
-        if S.PAPER:
+        if self._is_paper_runtime():
             client = self._new_usdm_client()
             self._apply_client_options(client)
             self.public_client = client
@@ -454,7 +474,7 @@ class Exchange:
         if self.client is None:
             return
 
-        if S.PAPER:
+        if self._is_paper_runtime():
             logger.debug(
                 "PAPER: omitiendo set_position_mode(one_way=%s) (no aplica en paper)",
                 one_way,
@@ -477,7 +497,7 @@ class Exchange:
             )
 
     async def _ensure_auth_for_private(self):
-        if S.PAPER:
+        if self._is_paper_runtime():
             return
         await self.upgrade_to_real_if_needed()
 
@@ -617,7 +637,7 @@ class Exchange:
         # CCXT acepta 'BTC/USDT' y lo mapea a 'BTCUSDT'. No sumar ':USDT'.
         lev_int = int(float(str(leverage).lower().replace("x", "").strip()))
 
-        if S.PAPER:
+        if self._is_paper_runtime():
             logger.info("PAPER: skipping set_leverage(%s, %s)", lev_int, sym)
             return
 
@@ -669,7 +689,7 @@ class Exchange:
         """Obtiene posiciones abiertas evitando llamadas privadas en paper."""
         if self.client is None:
             return []
-        if S.PAPER:
+        if self._is_paper_runtime():
             return []
         await self._ensure_auth_for_private()
         try:
@@ -699,7 +719,7 @@ class Exchange:
         if price is None:
             raise RuntimeError(f"No se pudo obtener precio para ejecutar la orden de {symbol}.")
 
-        if not S.PAPER:
+        if not self._is_paper_runtime():
             try:
                 await asyncio.to_thread(ensure_position_mode, self.hedge_mode)
             except Exception:
