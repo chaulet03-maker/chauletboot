@@ -10,6 +10,8 @@ from typing import Any, Callable, Optional
 from paper_store import PaperStore
 from state_store import update_open_position
 
+from bot.runtime_state import get_mode as runtime_get_mode
+
 try:
     from binance.error import BinanceAPIException, BinanceOrderException, BinanceRequestException  # type: ignore
 except Exception:  # pragma: no cover - python-binance opcional en tests
@@ -758,7 +760,8 @@ def _build_paper_store(start_equity: float) -> PaperStore:
 
 def build_broker(settings, client_factory: Callable[..., Any]):
     global ACTIVE_PAPER_STORE, ACTIVE_LIVE_CLIENT
-    if settings.PAPER:
+    is_paper = (runtime_get_mode() == "paper")
+    if is_paper:
         ACTIVE_PAPER_STORE = _build_paper_store(settings.start_equity)
         logger.warning(
             "MODO: 🧪 SIMULADO | equity inicial: %.2f USDT | store=%s",

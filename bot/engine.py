@@ -188,6 +188,23 @@ class TradingApp:
         self._eq_on_open = 0.0
         self._entry_ts = None
         self._bars_in_position = 0
+        try:
+            self.sl_equity_pct = float(
+                self.config.get(
+                    "sl_equity_pct",
+                    os.getenv("DEFAULT_SL_EQUITY_PCT", "10"),
+                )
+            )
+        except Exception:
+            self.sl_equity_pct = 10.0
+        try:
+            self.tp_equity_pct = float(self.config.get("tp_equity_pct", 0.0) or 0.0)
+        except Exception:
+            self.tp_equity_pct = 0.0
+        try:
+            self.max_position_hours = int(self.config.get("max_position_hours", 16))
+        except Exception:
+            self.max_position_hours = 16
         self._entry_locks: Dict[tuple[str, str, int], float] = {}
         self._entry_lock_gc_last = monotonic()
         try:
@@ -315,6 +332,24 @@ class TradingApp:
             )
 
         return current if current == target else target
+
+    def set_sl_equity_pct(self, pct: float) -> None:
+        try:
+            value = max(0.1, float(pct))
+        except Exception:
+            value = 10.0
+        self.sl_equity_pct = value
+        if isinstance(self.config, dict):
+            self.config["sl_equity_pct"] = float(value)
+
+    def set_tp_equity_pct(self, pct: float | None) -> None:
+        try:
+            value = max(0.0, float(pct or 0.0))
+        except Exception:
+            value = 0.0
+        self.tp_equity_pct = value
+        if isinstance(self.config, dict):
+            self.config["tp_equity_pct"] = float(value)
 
     # === Rejection recording helpers ===
     def record_rejection(self, symbol: str, side: str, code: str, detail: str = "", ts=None):
@@ -510,7 +545,7 @@ class TradingApp:
                 self.logger.exception(f"Shock gate check failed: {e}")
 
             # 0) Refrescar mark-to-market en paper utilizando el precio actual
-            if S.PAPER and trading.POSITION_SERVICE is not None:
+            if runtime_get_mode() != "real" and trading.POSITION_SERVICE is not None:
                 try:
                     last_px = await self.exchange.get_current_price(self.config.get('symbol', 'BTC/USDT'))
                     if last_px is not None:
@@ -536,7 +571,7 @@ class TradingApp:
                 bot_has_open = side != "FLAT" and abs(qty_local) > 1e-12
 
                 # --- En REAL nunca confiar en local si el exchange no reporta abierta ---
-                if not S.PAPER:
+                if runtime_get_mode() == "real":
                     try:
                         ex_pos = await self.exchange.get_open_position(self.config.get("symbol"))
                         ex_qty = float(
@@ -695,49 +730,59 @@ class TradingApp:
                     float(position.get('contracts') or position.get('size') or 0.0),
                     position.get('symbol') or self.config.get('symbol'),
                 )
-                try:
-                    max_hours = float(self.config.get("max_position_hours", 0) or 0.0)
-                except Exception:
-                    max_hours = 0.0
-                if max_hours > 0:
-                    entry_ts = getattr(self, "_entry_ts", None)
-                    if entry_ts is None:
-                        raw_entry = (
-                            position.get("timestamp")
-                            or position.get("time")
-                            or position.get("entryTime")
-                            or position.get("updateTime")
-                        )
-                        parsed_ts = None
-                        if raw_entry is not None:
+                now_ts = pd.Timestamp.utcnow().tz_localize("UTC")
+                side = (position.get('side') or '').upper()
+                qty_raw = position.get('contracts') or position.get('size') or 0.0
+                qty = float(qty_raw) if qty_raw is not None else 0.0
+                entry_px = float(position.get('entryPrice') or 0.0)
+                mark_px = float(position.get('markPrice') or position.get('mark') or entry_px)
+                sign = 1.0 if side == "LONG" else -1.0
+                pnl_now = (mark_px - entry_px) * qty * sign
+
+                if getattr(self, "_entry_ts", None) is None:
+                    raw_entry = (
+                        position.get("timestamp")
+                        or position.get("time")
+                        or position.get("entryTime")
+                        or position.get("updateTime")
+                    )
+                    parsed_ts = None
+                    if raw_entry is not None:
+                        try:
+                            parsed_ts = pd.Timestamp(int(raw_entry), unit="ms", tz="UTC")
+                        except Exception:
                             try:
-                                parsed_ts = pd.Timestamp(int(raw_entry), unit="ms", tz="UTC")
+                                parsed_ts = pd.to_datetime(raw_entry, utc=True)
                             except Exception:
-                                try:
-                                    parsed_ts = pd.to_datetime(raw_entry, utc=True)
-                                except Exception:
-                                    parsed_ts = None
-                        if parsed_ts is None:
-                            parsed_ts = pd.Timestamp.utcnow().tz_localize("UTC")
-                        self._entry_ts = parsed_ts
-                        entry_ts = parsed_ts
+                                parsed_ts = None
+                    self._entry_ts = parsed_ts or now_ts
+
+                if self.max_position_hours and getattr(self, "_entry_ts", None) is not None:
                     try:
-                        age_hours = (pd.Timestamp.utcnow().tz_localize("UTC") - entry_ts).total_seconds() / 3600.0
+                        age_hours = (now_ts - self._entry_ts).total_seconds() / 3600.0
                     except Exception:
                         age_hours = 0.0
-                    if age_hours >= max_hours:
-                        logging.info("Tiempo máximo de posición alcanzado (%.1fh). Cerrando…", age_hours)
+                    if age_hours >= float(self.max_position_hours):
+                        await self.notifier.send(
+                            f"⏰ Máximo {self.max_position_hours}h alcanzado. Cerrando posición del BOT."
+                        )
                         await self.close_all()
                         return
+
+                if float(self.tp_equity_pct) > 0 and float(self._eq_on_open) > 0:
+                    target_pnl = self._eq_on_open * float(self.tp_equity_pct) / 100.0
+                    if pnl_now >= target_pnl:
+                        await self.notifier.send(
+                            f"🎯 TP +{float(self.tp_equity_pct):.1f}% del equity alcanzado. Cierro posición."
+                        )
+                        await self.close_all()
+                        return
+
                 last_price = None
                 try:
-                    now_ts = pd.Timestamp.utcnow().tz_localize("UTC")
                     last_price = await self.exchange.get_current_price(
                         self.config.get('symbol', 'BTC/USDT')
                     )
-                    side = (position.get('side') or '').upper()
-                    qty_raw = position.get('contracts') or position.get('size') or 0.0
-                    qty = float(qty_raw) if qty_raw is not None else 0.0
                     if last_price is not None and side and qty > 0:
                         self._apply_funding_if_needed(now_ts, float(last_price), side, qty)
                 except Exception as exc:
@@ -1217,39 +1262,21 @@ class TradingApp:
                     return None
                 return val if math.isfinite(val) else None
 
-            sl_price = None
-            sl_fixed = None
+            sl_price = _finite_or_none(
+                self.strategy.calculate_sl(entry_price, last_candle, signal, eq_on_open)
+            )
             try:
-                sl_fixed = self.config.get("sl_fixed_price")
-                if sl_fixed not in (None, ""):
-                    sl_fixed = float(sl_fixed)
-                else:
-                    sl_fixed = None
+                eq_value = float(eq_on_open)
             except Exception:
-                sl_fixed = None
-            if sl_fixed is not None:
-                sl_price = float(sl_fixed)
-            else:
-                try:
-                    sl_pct = float(self.config.get("sl_equity_pct", 10.0))
-                except Exception:
-                    sl_pct = 10.0
-                try:
-                    eq_value = float(eq_on_open)
-                except Exception:
-                    eq_value = 0.0
-                if sl_pct > 0 and eq_value > 0 and qty > 0:
-                    risk_usd = (sl_pct / 100.0) * eq_value
-                    if risk_usd > 0:
-                        move = risk_usd / qty
-                        if signal == "LONG":
-                            sl_price = entry_price - move
-                        else:
-                            sl_price = entry_price + move
-            if sl_price is None:
-                sl_price = _finite_or_none(
-                    self.strategy.calculate_sl(entry_price, last_candle, signal, eq_on_open)
-                )
+                eq_value = 0.0
+            if eq_value > 0 and qty > 0 and float(self.sl_equity_pct) > 0:
+                risk_usd = eq_value * float(self.sl_equity_pct) / 100.0
+                move = risk_usd / qty if risk_usd > 0 else 0.0
+                if move > 0:
+                    if signal == "LONG":
+                        sl_price = entry_price - move
+                    else:
+                        sl_price = entry_price + move
             if sl_price is None:
                 _emit_motive({"reasons": ["SL inválido"]}, side_value=signal)
                 return
@@ -1891,6 +1918,10 @@ class TradingApp:
             except Exception:
                 pass
 
+            self._entry_ts = None
+            self._eq_on_open = 0.0
+            self._risk_usd_trade = 0.0
+
             return {"status": "closed", "summary": summary, "order": close_result.get("order")}
         except Exception as exc:
             self.logger.exception("close_all failed: %s", exc)
@@ -1907,8 +1938,30 @@ class TradingApp:
         trades_path = persistence_cfg.get("trades_csv", os.path.join(base_dir, "trades.csv"))
         return equity_path, trades_path
 
+    def get_period_stats(self, days: int) -> dict | None:
+        try:
+            import pandas as pd
+
+            equity_csv, _ = self._csv_paths()
+            df = pd.read_csv(equity_csv, parse_dates=["ts"])
+            df["ts"] = pd.to_datetime(df["ts"], utc=True, errors="coerce")
+            now = pd.Timestamp.utcnow()
+            since = now - pd.Timedelta(days=days)
+            window = df[df["ts"] >= since]
+            if window.empty:
+                return None
+            equity_ini = float(window["equity"].iloc[0])
+            equity_fin = float(window["equity"].iloc[-1])
+            if "pnl" in window.columns:
+                pnl_val = float(window["pnl"].sum())
+            else:
+                pnl_val = equity_fin - equity_ini
+            return {"equity_ini": equity_ini, "equity_fin": equity_fin, "pnl": pnl_val}
+        except Exception:
+            return None
+
     def _sum_income(self, income_type: str, start_ms: int, end_ms: int) -> float:
-        if S.PAPER or ACTIVE_LIVE_CLIENT is None:
+        if runtime_get_mode() != "real" or ACTIVE_LIVE_CLIENT is None:
             return 0.0
         client = ACTIVE_LIVE_CLIENT
         total = 0.0
@@ -2002,7 +2055,7 @@ class TradingApp:
                 f"PnL neto:       ${pnl:,.2f} ({pct:+.2f}%)\n"
                 f"Trades: {total_trades} (W:{wins}/L:{losses})"
             )
-            if not S.PAPER:
+            if runtime_get_mode() == "real":
                 try:
                     start_ms = int(since.timestamp() * 1000)
                     end_ms = int(now.timestamp() * 1000)

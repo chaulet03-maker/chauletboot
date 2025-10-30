@@ -8,7 +8,6 @@ from typing import Any, Dict, List, Mapping, Optional
 import ccxt
 from ccxt.base.errors import ExchangeError, NetworkError
 
-from config import S
 from bot.exchanges.binance_filters import build_filters
 from bot.exchange_client import ensure_position_mode, get_ccxt, reset_ccxt_client
 from bot.runtime_state import get_mode as runtime_get_mode
@@ -95,6 +94,9 @@ class Exchange:
             return False
         api_key = getattr(client, "apiKey", None)
         return not bool(api_key)
+
+    def is_paper(self) -> bool:
+        return self._is_paper_runtime()
 
     # --------- NUEVO: posiciones abiertas (CCXT) ---------
     async def get_open_position(self, symbol: Optional[str] = None) -> Optional[Dict[str, Any]]:
@@ -192,7 +194,7 @@ class Exchange:
             from brokers import ACTIVE_LIVE_CLIENT
 
             nat = ACTIVE_LIVE_CLIENT
-            if nat and not self._is_paper_runtime():
+            if nat and not self.is_paper():
                 acct = await asyncio.to_thread(nat.futures_account)
                 for pos in acct.get("positions", []):
                     sym = str(pos.get("symbol") or "")
@@ -243,7 +245,7 @@ class Exchange:
             from brokers import ACTIVE_LIVE_CLIENT  # client python-binance si estás en REAL
 
             nat = ACTIVE_LIVE_CLIENT
-            if nat and not self._is_paper_runtime():
+            if nat and not self.is_paper():
                 # futures_account_balance devuelve lista de assets de la wallet USDM
                 data = await asyncio.to_thread(nat.futures_account_balance)
                 for a in data or []:
@@ -253,6 +255,31 @@ class Exchange:
         except Exception:
             pass
         return 0.0
+
+    async def update_protections(
+        self,
+        *,
+        symbol: str,
+        side: str,
+        qty: float,
+        sl: float | None = None,
+        tp: float | None = None,
+    ) -> dict[str, Any]:
+        import trading
+
+        broker = getattr(trading, "BROKER", None)
+        if broker is None:
+            return {"ok": False, "reason": "broker unavailable"}
+
+        norm_symbol = str(symbol or self.config.get("symbol", "BTC/USDT")).replace("/", "")
+        return await asyncio.to_thread(
+            broker.update_protections,
+            norm_symbol,
+            side,
+            float(qty),
+            tp,
+            sl,
+        )
 
     def _start_price_stream(self):
         symbol = self.config.get("symbol", "BTC/USDT")
@@ -435,7 +462,7 @@ class Exchange:
         """ Configura e inicializa el cliente del exchange. """
         self.is_authenticated = False  # Bandera de estado
 
-        if self._is_paper_runtime():
+        if self.is_paper():
             client = self._new_usdm_client()
             self._apply_client_options(client)
             self.public_client = client
@@ -474,7 +501,7 @@ class Exchange:
         if self.client is None:
             return
 
-        if self._is_paper_runtime():
+        if self.is_paper():
             logger.debug(
                 "PAPER: omitiendo set_position_mode(one_way=%s) (no aplica en paper)",
                 one_way,
@@ -497,7 +524,7 @@ class Exchange:
             )
 
     async def _ensure_auth_for_private(self):
-        if self._is_paper_runtime():
+        if self.is_paper():
             return
         await self.upgrade_to_real_if_needed()
 
@@ -637,7 +664,7 @@ class Exchange:
         # CCXT acepta 'BTC/USDT' y lo mapea a 'BTCUSDT'. No sumar ':USDT'.
         lev_int = int(float(str(leverage).lower().replace("x", "").strip()))
 
-        if self._is_paper_runtime():
+        if self.is_paper():
             logger.info("PAPER: skipping set_leverage(%s, %s)", lev_int, sym)
             return
 
@@ -719,7 +746,7 @@ class Exchange:
         if price is None:
             raise RuntimeError(f"No se pudo obtener precio para ejecutar la orden de {symbol}.")
 
-        if not self._is_paper_runtime():
+        if not self.is_paper():
             try:
                 await asyncio.to_thread(ensure_position_mode, self.hedge_mode)
             except Exception:
