@@ -10,6 +10,7 @@ logger = logging.getLogger(__name__)
 
 TELEGRAM_MAX_LEN = 4096  # límite de Telegram
 
+
 def _load_token_chat() -> Tuple[Optional[str], Optional[str]]:
     """
     Intenta primero con config.py (si existe),
@@ -37,7 +38,9 @@ def _load_token_chat() -> Tuple[Optional[str], Optional[str]]:
 
     return token, chat
 
+
 _TELEGRAM_BOT_TOKEN, _TELEGRAM_CHAT_ID = _load_token_chat()
+
 
 def _chunks(text: str, limit: int = TELEGRAM_MAX_LEN) -> Iterable[str]:
     """Parte el texto en trozos <= limit, cortando en '\n' cuando sea posible."""
@@ -57,6 +60,7 @@ def _chunks(text: str, limit: int = TELEGRAM_MAX_LEN) -> Iterable[str]:
         out.append(s[:cut])
         s = s[cut:].lstrip("\n")
     return out
+
 
 def notify(
     msg: str,
@@ -99,7 +103,7 @@ def notify(
                     try:
                         data = r.json()
                         retry_after = (
-                            data.get("parameters", {}).get("retry_after")
+                            (data.get("parameters") or {}).get("retry_after")
                             or data.get("retry_after")
                         )
                         delay = float(retry_after) if retry_after else max(2.0 * delay, 1.0)
@@ -116,7 +120,6 @@ def notify(
                         # si no parsea JSON pero ok HTTP, lo damos por bueno
                         break
 
-                # HTTP != ok
                 logger.warning("Notifier: Telegram %s: %s", r.status_code, r.text[:300])
                 if attempt < retries:
                     time.sleep(delay)
@@ -133,14 +136,3 @@ def notify(
                 break
 
     return ok_all
-Cómo integrarlo con tu endpoint.py
-Ya que ahí usás config, podés delegar:
-
-python
-Copiar código
-# en endpoint.py
-from notifier import notify
-
-def enviar_notificacion(mensaje):
-    if not notify(mensaje):
-        print("Advertencia: no se pudo enviar la notificación por Telegram.")
