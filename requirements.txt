@@ -12,4 +12,5 @@ pytz==2024.1
 ta==0.11.0
 schedule==1.2.2                        # <- NUEVO: el bot lo importa
 APScheduler==3.10.4                    # <- opcional pero recomendado; lo usa el JobQueue
-httpx>=0.27                            # <- versión compatible con PTB 20.7
+# PTB 20.7 requiere httpx ~= 0.25.2
+httpx==0.25.2
