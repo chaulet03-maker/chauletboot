@@ -1378,15 +1378,36 @@ def _format_close_result(result: Any) -> tuple[bool, str | None]:
     if pnl_val is None:
         pnl_val = summary.get("pnl_balance_delta")
 
+    # Fallback: calcular PnL en USDT por diferencia de precios y qty
+    try:
+        pnl_usd_calc = (exit_price - entry_price) * qty
+        if side == "SHORT":
+            pnl_usd_calc = -pnl_usd_calc
+    except Exception:
+        pnl_usd_calc = None
+
+    # Porcentaje según la entrada (movimiento de precio, no equity)
+    try:
+        delta_pct = ((exit_price - entry_price) / entry_price) * (-100 if side == "SHORT" else 100)
+    except Exception:
+        delta_pct = None
+
     msg = (
         "<b>✅ Cerré la posición del BOT</b>\n"
         f"• Lado: <b>{side}</b>\n"
         f"• Cantidad: {qty:.6f}\n"
         f"• Precio: entrada {entry_price:,.2f} | salida {exit_price:,.2f}"
     )
-    if pnl_val is not None:
+    # Mostrar PnL en USDT y el % (sobre precio de entrada)
+    pnl_to_show = pnl_val if pnl_val is not None else pnl_usd_calc
+    if pnl_to_show is not None:
         try:
-            msg += f"\n• PnL: {float(pnl_val):+,.2f}"
+            msg += f"\n• PnL: {float(pnl_to_show):+,.2f} USDT"
+        except Exception:
+            msg += f"\n• PnL: {pnl_to_show} USDT"
+    if delta_pct is not None:
+        try:
+            msg += f" ({float(delta_pct):+.2f}%)"
         except Exception:
             pass
     return True, msg
