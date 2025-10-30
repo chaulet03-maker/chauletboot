@@ -23,7 +23,11 @@ def get_ccxt() -> ccxt.Exchange:
         "enableRateLimit": True,
         "options": {"defaultType": "future"},
     })
-    ex.load_markets(reload=True)
+    try:
+        ex.load_markets(reload=True)
+    except Exception as exc:
+        logger.warning("No se pudo cargar mercados vía CCXT: %s", exc)
+        raise RuntimeError("Faltan credenciales (ccxt) o sin conectividad") from exc
     _CCXT = ex
     return ex
 
