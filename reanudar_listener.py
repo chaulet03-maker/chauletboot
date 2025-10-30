@@ -2,7 +2,7 @@ import os
 import time
 import requests
 
-from notifier import notify
+from bot.telemetry.notifier import notify
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")

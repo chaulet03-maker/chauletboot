@@ -5,7 +5,7 @@ import logging
 from datetime import datetime, timedelta, timezone
 from typing import Any, Mapping, Optional
 
-from notifier import notify
+from bot.telemetry.notifier import notify
 from pause_manager import ShockPauseManager
 
 DEFAULT_SHOCK_MOVE_THRESHOLD = 7.0

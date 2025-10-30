@@ -6,6 +6,9 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 import yaml
+from dotenv import load_dotenv
+
+load_dotenv()
 
 
 def _candidate_paths(path: Optional[str]) -> list[Path]:

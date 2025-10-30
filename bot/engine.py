@@ -41,6 +41,7 @@ from risk_guards import (
     is_paused_now,
 )
 from reanudar_listener import listen_reanudar
+from bot.runtime_state import get_mode as runtime_get_mode
 
 
 def _compute_order_qty_from_equity(
@@ -685,6 +686,40 @@ class TradingApp:
                     float(position.get('contracts') or position.get('size') or 0.0),
                     position.get('symbol') or self.config.get('symbol'),
                 )
+                try:
+                    max_hours = float(self.config.get("max_position_hours", 0) or 0.0)
+                except Exception:
+                    max_hours = 0.0
+                if max_hours > 0:
+                    entry_ts = getattr(self, "_entry_ts", None)
+                    if entry_ts is None:
+                        raw_entry = (
+                            position.get("timestamp")
+                            or position.get("time")
+                            or position.get("entryTime")
+                            or position.get("updateTime")
+                        )
+                        parsed_ts = None
+                        if raw_entry is not None:
+                            try:
+                                parsed_ts = pd.Timestamp(int(raw_entry), unit="ms", tz="UTC")
+                            except Exception:
+                                try:
+                                    parsed_ts = pd.to_datetime(raw_entry, utc=True)
+                                except Exception:
+                                    parsed_ts = None
+                        if parsed_ts is None:
+                            parsed_ts = pd.Timestamp.utcnow().tz_localize("UTC")
+                        self._entry_ts = parsed_ts
+                        entry_ts = parsed_ts
+                    try:
+                        age_hours = (pd.Timestamp.utcnow().tz_localize("UTC") - entry_ts).total_seconds() / 3600.0
+                    except Exception:
+                        age_hours = 0.0
+                    if age_hours >= max_hours:
+                        logging.info("Tiempo máximo de posición alcanzado (%.1fh). Cerrando…", age_hours)
+                        await self.close_all()
+                        return
                 last_price = None
                 try:
                     now_ts = pd.Timestamp.utcnow().tz_localize("UTC")
@@ -1172,9 +1207,39 @@ class TradingApp:
                     return None
                 return val if math.isfinite(val) else None
 
-            sl_price = _finite_or_none(
-                self.strategy.calculate_sl(entry_price, last_candle, signal, eq_on_open)
-            )
+            sl_price = None
+            sl_fixed = None
+            try:
+                sl_fixed = self.config.get("sl_fixed_price")
+                if sl_fixed not in (None, ""):
+                    sl_fixed = float(sl_fixed)
+                else:
+                    sl_fixed = None
+            except Exception:
+                sl_fixed = None
+            if sl_fixed is not None:
+                sl_price = float(sl_fixed)
+            else:
+                try:
+                    sl_pct = float(self.config.get("sl_equity_pct", 10.0))
+                except Exception:
+                    sl_pct = 10.0
+                try:
+                    eq_value = float(eq_on_open)
+                except Exception:
+                    eq_value = 0.0
+                if sl_pct > 0 and eq_value > 0 and qty > 0:
+                    risk_usd = (sl_pct / 100.0) * eq_value
+                    if risk_usd > 0:
+                        move = risk_usd / qty
+                        if signal == "LONG":
+                            sl_price = entry_price - move
+                        else:
+                            sl_price = entry_price + move
+            if sl_price is None:
+                sl_price = _finite_or_none(
+                    self.strategy.calculate_sl(entry_price, last_candle, signal, eq_on_open)
+                )
             if sl_price is None:
                 _emit_motive({"reasons": ["SL inválido"]}, side_value=signal)
                 return
@@ -1366,6 +1431,7 @@ class TradingApp:
         entry_price = 0.0
         leverage = 1.0
         mark_price = 0.0
+        entry_time_raw = None
         for entry in entries:
             entry_symbol = str(entry.get("symbol") or entry.get("symbolName") or "").upper()
             if entry_symbol != symbol_no_slash:
@@ -1377,6 +1443,13 @@ class TradingApp:
             entry_price = _as_float(entry, "entryPrice", "entry_price", "avgPrice", "avgEntryPrice")
             leverage = max(1.0, _as_float(entry, "leverage"))
             mark_price = _as_float(entry, "markPrice", "mark_price", default=entry_price)
+            if entry_time_raw is None:
+                entry_time_raw = (
+                    entry.get("updateTime")
+                    or entry.get("entryTime")
+                    or entry.get("time")
+                    or entry.get("timestamp")
+                )
             position_side = str(entry.get("positionSide", "")).upper()
             if position_side in {"LONG", "SHORT", "BOTH"}:
                 break
@@ -1486,6 +1559,18 @@ class TradingApp:
             qty_abs,
             avg_bot_f,
         )
+        parsed_entry_ts = None
+        if entry_time_raw is not None:
+            try:
+                parsed_entry_ts = pd.Timestamp(int(entry_time_raw), unit="ms", tz="UTC")
+            except Exception:
+                try:
+                    parsed_entry_ts = pd.to_datetime(entry_time_raw, utc=True)
+                except Exception:
+                    parsed_entry_ts = None
+        if parsed_entry_ts is None:
+            parsed_entry_ts = pd.Timestamp.utcnow().tz_localize("UTC")
+        self._entry_ts = parsed_entry_ts
         return True
 
     async def _preload_position_from_store(self) -> None:
@@ -1585,8 +1670,9 @@ class TradingApp:
             else:
                 loop.run_until_complete(task)
 
-        mode_msg = "🧪 Modo SIMULADO activo" if S.PAPER else "🔴 Modo REAL activo"
-        if S.PAPER:
+        runtime_mode = (runtime_get_mode() or "paper").lower()
+        mode_msg = "🔴 Modo REAL activo" if runtime_mode in {"real", "live"} else "🧪 Modo SIMULADO activo"
+        if runtime_mode not in {"real", "live"}:
             try:
                 equity = float(getattr(trading.BROKER, "equity"))
                 mode_msg += f"\nEquity sim: ${equity:.2f} USDT"
@@ -1894,11 +1980,12 @@ class TradingApp:
                 pass
 
             title = "🗓️ Reporte 24h" if days == 1 else "📈 Reporte 7d"
+            pct = ((equity_fin - equity_ini) / equity_ini * 100.0) if equity_ini else 0.0
             msg = (
                 f"{title}\n"
                 f"Equity inicial: ${equity_ini:,.2f}\n"
                 f"Equity final:   ${equity_fin:,.2f}\n"
-                f"PnL neto:       ${pnl:,.2f}\n"
+                f"PnL neto:       ${pnl:,.2f} ({pct:+.2f}%)\n"
                 f"Trades: {total_trades} (W:{wins}/L:{losses})"
             )
             if not S.PAPER:
