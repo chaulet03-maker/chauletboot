@@ -354,20 +354,89 @@ class PositionService:
             "mark": round(mark, 2),
         }
 
-    def _status_live(self) -> dict[str, Any]:
-        pos_qty = 0.0
-        avg_price = 0.0
-        if self.store:
-            try:
-                state = self.store.load()
-                pos_qty = float(state.get("pos_qty") or 0.0)
-                avg_price = float(state.get("avg_price") or 0.0)
-            except Exception:
-                logger.debug("No se pudo leer store live", exc_info=True)
+    def _fetch_live_position(self) -> Optional[Dict[str, Any]]:
+        client = self.client
+        if client is None:
+            return None
 
-        mark = 0.0
+        symbol_no_slash = self.symbol.replace("/", "")
+        payload: Any = None
+
+        if hasattr(client, "futures_position_information"):
+            try:
+                payload = client.futures_position_information(symbol=symbol_no_slash)
+            except Exception:
+                payload = None
+
+        if not payload:
+            if hasattr(client, "fapiPrivate_get_positionrisk"):
+                try:
+                    payload = client.fapiPrivate_get_positionrisk({"symbol": symbol_no_slash})
+                except Exception:
+                    payload = None
+            elif hasattr(client, "fapiPrivateGetPositionRisk"):
+                try:
+                    payload = client.fapiPrivateGetPositionRisk({"symbol": symbol_no_slash})
+                except Exception:
+                    payload = None
+
+        entries: list[Dict[str, Any]] = []
+        if isinstance(payload, list):
+            entries = [entry for entry in payload if isinstance(entry, dict)]
+        elif isinstance(payload, dict):
+            entries = [payload]
+
+        for entry in entries:
+            entry_symbol = str(entry.get("symbol") or entry.get("symbolName") or "").upper()
+            if entry_symbol != symbol_no_slash.upper():
+                continue
+            try:
+                raw_amount = (
+                    entry.get("positionAmt")
+                    or entry.get("position_amt")
+                    or entry.get("amount")
+                    or entry.get("qty")
+                    or 0.0
+                )
+                amount = float(raw_amount)
+            except Exception:
+                amount = 0.0
+
+            if abs(amount) <= EPS_QTY:
+                continue
+
+            side = "LONG" if amount > 0 else "SHORT"
+
+            try:
+                entry_price = float(entry.get("entryPrice") or entry.get("avgPrice") or 0.0)
+            except Exception:
+                entry_price = 0.0
+
+            try:
+                mark_price = float(
+                    entry.get("markPrice")
+                    or entry.get("mark_price")
+                    or entry.get("entryPrice")
+                    or entry.get("avgPrice")
+                    or 0.0
+                )
+            except Exception:
+                mark_price = 0.0
+
+            return {
+                "side": side,
+                "qty": abs(amount),
+                "entry_price": entry_price,
+                "mark_price": mark_price,
+            }
+
+        return None
+
+    def _status_live(self) -> dict[str, Any]:
         client = self.client
         symbol_no_slash = self.symbol.replace("/", "")
+
+        mark = 0.0
         if client and hasattr(client, "futures_mark_price"):
             try:
                 mp = client.futures_mark_price(symbol=symbol_no_slash)
@@ -376,16 +445,37 @@ class PositionService:
             except Exception:
                 logger.debug("No se pudo obtener markPrice privado.", exc_info=True)
 
+        live_position = self._fetch_live_position()
+
+        pos_qty = 0.0
+        avg_price = 0.0
+        side = "FLAT"
+
+        if live_position:
+            side = str(live_position.get("side") or "FLAT").upper()
+            qty_live = float(live_position.get("qty") or 0.0)
+            avg_price = float(live_position.get("entry_price") or 0.0)
+            mark_live = float(live_position.get("mark_price") or 0.0)
+            if mark <= 0 and mark_live > 0:
+                mark = mark_live
+            if side == "SHORT":
+                pos_qty = -qty_live
+            else:
+                pos_qty = qty_live
+
+        if not live_position and self.store:
+            try:
+                state = self.store.load()
+                pos_qty = float(state.get("pos_qty") or 0.0)
+                avg_price = float(state.get("avg_price") or 0.0)
+                side = "LONG" if pos_qty > 0 else "SHORT" if pos_qty < 0 else "FLAT"
+            except Exception:
+                logger.debug("No se pudo leer store live", exc_info=True)
+
         if mark <= 0:
             public_mark = self._fetch_public_mark()
             if public_mark is not None:
                 mark = float(public_mark)
-
-        side = "FLAT"
-        if pos_qty > 0:
-            side = "LONG"
-        elif pos_qty < 0:
-            side = "SHORT"
 
         equity = 0.0
         try:
@@ -396,10 +486,10 @@ class PositionService:
         pnl = 0.0
         qty = abs(pos_qty)
         if qty > 0 and avg_price > 0 and mark > 0:
-            if side == "LONG":
-                pnl = (mark - avg_price) * qty
-            else:
+            if side == "SHORT":
                 pnl = (avg_price - mark) * qty
+            else:
+                pnl = (mark - avg_price) * qty
 
         return {
             "symbol": self.symbol,
