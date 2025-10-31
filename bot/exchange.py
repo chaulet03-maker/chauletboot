@@ -195,6 +195,31 @@ class Exchange:
         ccxt_client = getattr(self, "client", None)
         if ccxt_client is None or not hasattr(ccxt_client, "fetch_positions"):
             return None
+        # --- LIVE mode: no te apropies de posiciones manuales ---
+        # Si el bot NO abrió posición (no está en state_store), devolvé None.
+        try:
+            from state_store import load_state  # import local para evitar ciclos
+            sym_key = symbol or self.config.get("symbol", "BTC/USDT")
+            st = load_state() or {}
+            open_pos = (st.get("open_positions") or {}).get(sym_key)
+            qty_st = float((open_pos or {}).get("qty") or 0.0)
+            if open_pos and abs(qty_st) > 0.0:
+                side_st = str(open_pos.get("side", "")).upper()
+                entry_st = float(open_pos.get("entry_price") or 0.0)
+                try:
+                    mark_st = await self.get_current_price(sym_key)
+                except Exception:
+                    mark_st = entry_st
+                return {
+                    "symbol": sym_key,
+                    "side": side_st,
+                    "contracts": abs(qty_st),
+                    "entryPrice": entry_st,
+                    "markPrice": float(mark_st or entry_st),
+                }
+        except Exception:
+            pass
+
         try:
             pos_list = await asyncio.to_thread(ccxt_client.fetch_positions, [sym])
         except Exception:
