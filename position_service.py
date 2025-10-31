@@ -123,46 +123,84 @@ def split_total_vs_bot(
     bot_pos: Optional[Dict[str, Any]],
     mark: float,
 ) -> Dict[str, Dict[str, float | str]]:
-    """Separa la posición total en porciones BOT vs manual y calcula PnL estimado."""
+    """Separa la posición total en porciones BOT vs manual y calcula PnL estimado.
 
-    total_qty, total_side, _ = _extract_qty_and_side(acct_pos)
-    bot_qty, bot_side, _ = _extract_qty_and_side(bot_pos)
+    La implementación anterior asumía que las posiciones manuales siempre iban en la
+    misma dirección que la posición total reportada por la cuenta. Ese supuesto
+    dejaba de ser cierto cuando coexistían posiciones del bot y manuales con lados
+    opuestos (por ejemplo, el bot LONG y una cobertura manual SHORT). Como la API de
+    Binance reporta cantidades con signo, usamos ese dato para obtener la porción
+    manual como una diferencia firmada en vez de limitarse a restar magnitudes.
+    Esto permite distinguir correctamente las posiciones manuales aunque el neto de
+    la cuenta esté del lado opuesto o incluso se acerque a cero.
+    """
 
-    if bot_side == "FLAT" and bot_qty <= EPS_QTY:
+    total_qty, total_side, total_signed = _extract_qty_and_side(acct_pos)
+    bot_qty, bot_side, bot_signed = _extract_qty_and_side(bot_pos)
+
+    if bot_side == "FLAT" and abs(bot_qty) <= EPS_QTY:
         bot_qty = 0.0
+        bot_signed = 0.0
+        bot_side = "FLAT"
 
-    if total_side == "FLAT" and total_qty <= EPS_QTY:
+    if total_side == "FLAT" and abs(total_qty) <= EPS_QTY:
         total_qty = 0.0
+        total_signed = 0.0
+        total_side = "FLAT"
 
     total_entry = _extract_price(acct_pos, "entry_price", "entryPrice", "avgPrice")
     bot_entry = _extract_price(bot_pos, "entry_price", "entryPrice", "avgPrice")
 
-    manual_qty = max(total_qty - bot_qty, 0.0)
-    if manual_qty < EPS_QTY:
+    manual_signed = total_signed - bot_signed
+    manual_qty = abs(manual_signed)
+    if manual_qty <= EPS_QTY:
         manual_qty = 0.0
+        manual_signed = 0.0
+
+    manual_side = "FLAT"
+    if manual_signed > EPS_QTY:
+        manual_side = "LONG"
+    elif manual_signed < -EPS_QTY:
+        manual_side = "SHORT"
 
     manual_entry = 0.0
-    if manual_qty > EPS_QTY and total_entry > 0 and total_qty > 0:
+    if manual_side != "FLAT":
         try:
-            manual_entry = (total_entry * total_qty - bot_entry * bot_qty) / manual_qty
-        except ZeroDivisionError:
+            total_notional = float(total_entry or 0.0) * total_signed
+            bot_notional = float(bot_entry or 0.0) * bot_signed
+            manual_notional = total_notional - bot_notional
+            manual_entry = manual_notional / manual_signed if manual_signed else 0.0
+        except Exception:
+            manual_entry = 0.0
+        if manual_entry <= 0:
             manual_entry = 0.0
 
-    manual_side = total_side if manual_qty > EPS_QTY else "FLAT"
     mark_val = float(mark or 0.0)
+
+    total_side_output = "FLAT"
+    if total_signed > EPS_QTY:
+        total_side_output = "LONG"
+    elif total_signed < -EPS_QTY:
+        total_side_output = "SHORT"
+
+    bot_side_output = "FLAT"
+    if bot_signed > EPS_QTY:
+        bot_side_output = "LONG"
+    elif bot_signed < -EPS_QTY:
+        bot_side_output = "SHORT"
 
     return {
         "total": {
-            "side": total_side if total_qty > EPS_QTY else "FLAT",
-            "qty": round(total_qty, 6),
+            "side": total_side_output,
+            "qty": round(abs(total_signed), 6),
             "entry_price": round(total_entry, 6) if total_entry else 0.0,
-            "pnl": _pnl(total_side, total_qty, total_entry, mark_val),
+            "pnl": _pnl(total_side_output, abs(total_signed), total_entry, mark_val),
         },
         "bot": {
-            "side": bot_side if bot_qty > EPS_QTY else "FLAT",
-            "qty": round(bot_qty, 6),
+            "side": bot_side_output,
+            "qty": round(abs(bot_signed), 6),
             "entry_price": round(bot_entry, 6) if bot_entry else 0.0,
-            "pnl": _pnl(bot_side, bot_qty, bot_entry, mark_val),
+            "pnl": _pnl(bot_side_output, abs(bot_signed), bot_entry, mark_val),
         },
         "manual": {
             "side": manual_side,
