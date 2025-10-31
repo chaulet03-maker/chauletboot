@@ -778,9 +778,10 @@ def close_now(symbol: str | None = None):
             hedged = bool(client_options.get("hedgeMode"))
         elif "hedge_mode" in client_options:
             hedged = bool(client_options.get("hedge_mode"))
-    order_kwargs: Dict[str, Any] = {
+    order_kwargs = {
         "order_type": "market",
         "symbol": target_symbol,
+        "reduceOnly": True,
         "reduce_only": True,
         "newOrderRespType": "RESULT",
     }
@@ -955,6 +956,7 @@ def close_bot_position_market() -> dict[str, Any]:
 
     kwargs = {
         "symbol": symbol_conf,
+        "reduceOnly": True,
         "reduce_only": True,
         "newOrderRespType": "RESULT",
     }

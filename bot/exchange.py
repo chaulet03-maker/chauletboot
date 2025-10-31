@@ -994,21 +994,35 @@ class Exchange:
             )
 
         if close_bot:
+            order_kwargs.setdefault("reduceOnly", True)
             order_kwargs.setdefault("reduce_only", True)
             options = None
-            try:
-                options = getattr(self.client, "options", None)
-            except Exception:
-                options = None
-            if not isinstance(options, dict) and isinstance(self.config, Mapping):
+            params_options = extra_params.get("options") if isinstance(extra_params, dict) else None
+            if isinstance(params_options, Mapping):
+                options = params_options
+            elif isinstance(self.config, Mapping):
                 exchange_cfg = self.config.get("exchange")
                 if isinstance(exchange_cfg, Mapping):
                     opt_cfg = exchange_cfg.get("options")
                     if isinstance(opt_cfg, Mapping):
                         options = opt_cfg
-            is_hedge = bool(options.get("hedgeMode")) if isinstance(options, dict) else self.hedge_mode
+            if options is None:
+                try:
+                    client_options = getattr(self.client, "options", None)
+                    if isinstance(client_options, Mapping):
+                        options = client_options
+                except Exception:
+                    options = None
+            is_hedge = False
+            if isinstance(options, Mapping):
+                try:
+                    is_hedge = bool(options.get("hedgeMode"))
+                except Exception:
+                    is_hedge = False
             if not is_hedge:
                 order_kwargs.pop("positionSide", None)
+                if isinstance(extra_params, dict):
+                    extra_params.pop("positionSide", None)
 
         if extra_params:
             order_kwargs.update(extra_params)

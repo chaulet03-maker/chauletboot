@@ -10,6 +10,8 @@ from paper_store import PaperStore
 
 logger = logging.getLogger(__name__)
 
+EPS_QTY = 1e-9
+
 
 def fetch_live_equity_usdm() -> float:
     """Obtiene el equity real de la cuenta de Futuros USD-M (USDT)."""
@@ -65,6 +67,57 @@ def fetch_live_equity_usdm() -> float:
     return 0.0
 
 
+def _pnl(side: str, qty: float, entry: float, mark: float) -> float:
+    if not qty or qty < EPS_QTY:
+        return 0.0
+    if not entry or entry <= 0 or not mark or mark <= 0:
+        return 0.0
+    sign = 1 if (side or "").upper() == "LONG" else -1
+    try:
+        return round((mark - entry) * qty * sign, 2)
+    except Exception:
+        return 0.0
+
+
+def _extract_qty_and_side(data: Optional[Dict[str, Any]]) -> tuple[float, str, float]:
+    if not isinstance(data, dict):
+        return 0.0, "FLAT", 0.0
+    raw_qty = data.get("qty") or data.get("contracts") or data.get("positionAmt")
+    try:
+        signed_qty = float(raw_qty)
+    except Exception:
+        signed_qty = 0.0
+    side_raw = str(data.get("side") or "").upper()
+    if not side_raw:
+        if signed_qty > EPS_QTY:
+            side_raw = "LONG"
+        elif signed_qty < -EPS_QTY:
+            side_raw = "SHORT"
+    qty = abs(signed_qty)
+    if qty < EPS_QTY:
+        qty = 0.0
+        signed_qty = 0.0
+        if not side_raw:
+            side_raw = "FLAT"
+    return qty, side_raw or "FLAT", signed_qty
+
+
+def _extract_price(data: Optional[Dict[str, Any]], *keys: str) -> float:
+    if not isinstance(data, dict):
+        return 0.0
+    for key in keys:
+        value = data.get(key)
+        if value in (None, ""):
+            continue
+        try:
+            price = float(value)
+        except Exception:
+            continue
+        if price > 0:
+            return price
+    return 0.0
+
+
 def split_total_vs_bot(
     acct_pos: Optional[Dict[str, Any]],
     bot_pos: Optional[Dict[str, Any]],
@@ -72,71 +125,91 @@ def split_total_vs_bot(
 ) -> Dict[str, Dict[str, float | str]]:
     """Separa la posición total en porciones BOT vs manual y calcula PnL estimado."""
 
-    def _pnl(side: str, qty: float, entry: float, mark_px: float) -> float:
-        if qty <= 0 or entry <= 0 or mark_px <= 0:
-            return 0.0
-        sign = 1 if (side or "").upper() == "LONG" else -1
-        return round((mark_px - entry) * qty * sign, 2)
+    total_qty, total_side, _ = _extract_qty_and_side(acct_pos)
+    bot_qty, bot_side, _ = _extract_qty_and_side(bot_pos)
 
-    total = acct_pos or {}
-    bot = bot_pos or {}
+    if bot_side == "FLAT" and bot_qty <= EPS_QTY:
+        bot_qty = 0.0
 
-    def _float(value: Any) -> float:
+    if total_side == "FLAT" and total_qty <= EPS_QTY:
+        total_qty = 0.0
+
+    total_entry = _extract_price(acct_pos, "entry_price", "entryPrice", "avgPrice")
+    bot_entry = _extract_price(bot_pos, "entry_price", "entryPrice", "avgPrice")
+
+    manual_qty = max(total_qty - bot_qty, 0.0)
+    if manual_qty < EPS_QTY:
+        manual_qty = 0.0
+
+    manual_entry = 0.0
+    if manual_qty > EPS_QTY and total_entry > 0 and total_qty > 0:
         try:
-            return float(value)
-        except Exception:
-            return 0.0
-
-    tq = _float(total.get("qty") or total.get("contracts") or total.get("positionAmt"))
-    te = _float(total.get("entry_price") or total.get("entryPrice") or total.get("avgPrice"))
-    ts = (str(total.get("side")) if total.get("side") is not None else "").upper()
-    if not ts and tq > 0:
-        ts = "LONG"
-    elif not ts and tq < 0:
-        ts = "SHORT"
-
-    bq_signed = bot.get("qty") or bot.get("contracts") or bot.get("positionAmt")
-    bq = abs(_float(bq_signed))
-    be = _float(bot.get("entry_price") or bot.get("entryPrice") or bot.get("avgPrice"))
-    bs = (str(bot.get("side")) if bot.get("side") is not None else "").upper()
-    if not bs and _float(bq_signed) < 0:
-        bs = "SHORT"
-    elif not bs and bq > 0:
-        bs = "LONG"
-
-    tq = abs(tq)
-
-    mq = max(tq - bq, 0.0)
-    me = 0.0
-    if mq > 0 and te > 0 and tq > 0:
-        try:
-            me = (te * tq - be * bq) / mq
+            manual_entry = (total_entry * total_qty - bot_entry * bot_qty) / manual_qty
         except ZeroDivisionError:
-            me = 0.0
-    ms = ts or ("LONG" if mq > 0 else "FLAT")
+            manual_entry = 0.0
 
-    mark_px = _float(mark)
+    manual_side = total_side if manual_qty > EPS_QTY else "FLAT"
+    mark_val = float(mark or 0.0)
 
     return {
         "total": {
-            "side": ts or ("LONG" if tq > 0 else "FLAT"),
-            "qty": round(tq, 6),
-            "entry_price": round(te, 6) if te else 0.0,
-            "pnl": _pnl(ts or ("LONG" if tq > 0 else "SHORT" if tq < 0 else "FLAT"), tq, te, mark_px),
+            "side": total_side if total_qty > EPS_QTY else "FLAT",
+            "qty": round(total_qty, 6),
+            "entry_price": round(total_entry, 6) if total_entry else 0.0,
+            "pnl": _pnl(total_side, total_qty, total_entry, mark_val),
         },
         "bot": {
-            "side": bs or ("LONG" if bq > 0 else "FLAT"),
-            "qty": round(bq, 6),
-            "entry_price": round(be, 6) if be else 0.0,
-            "pnl": _pnl(bs or ("LONG" if bq > 0 else "SHORT" if bq < 0 else "FLAT"), bq, be, mark_px),
+            "side": bot_side if bot_qty > EPS_QTY else "FLAT",
+            "qty": round(bot_qty, 6),
+            "entry_price": round(bot_entry, 6) if bot_entry else 0.0,
+            "pnl": _pnl(bot_side, bot_qty, bot_entry, mark_val),
         },
         "manual": {
-            "side": ms or ("LONG" if mq > 0 else "FLAT"),
-            "qty": round(mq, 6),
-            "entry_price": round(me, 6) if me else 0.0,
-            "pnl": _pnl(ms or ("LONG" if mq > 0 else "SHORT" if mq < 0 else "FLAT"), mq, me, mark_px),
+            "side": manual_side,
+            "qty": round(manual_qty, 6),
+            "entry_price": round(manual_entry, 6) if manual_entry else 0.0,
+            "pnl": _pnl(manual_side, manual_qty, manual_entry, mark_val),
         },
     }
+
+
+async def reconcile_bot_store_with_account(trader, exchange, symbol: str, mark: float) -> None:
+    """Reconcilia el store del BOT con la posición total de la cuenta."""
+
+    if trader is None or exchange is None or not hasattr(exchange, "fetch_positions"):
+        return
+
+    try:
+        acct_positions = await exchange.fetch_positions(symbol)
+    except Exception:
+        acct_positions = None
+
+    acct = None
+    if isinstance(acct_positions, list):
+        acct = acct_positions[0] if acct_positions else None
+    elif isinstance(acct_positions, dict):
+        acct = acct_positions
+
+    try:
+        bot = await trader.check_open_position(exchange=None)
+    except Exception:
+        bot = None
+
+    total_qty, _, _ = _extract_qty_and_side(acct)
+    bot_qty, _, _ = _extract_qty_and_side(bot)
+
+    if total_qty < EPS_QTY and bot_qty > EPS_QTY:
+        await trader.set_position(None)
+        logger.info(
+            "Reconciliación: cuenta FLAT pero store del BOT tenía posición -> limpiado."
+        )
+        return
+
+    if total_qty + EPS_QTY < bot_qty:
+        await trader.set_position(None)
+        logger.info(
+            "Reconciliación: total < bot_qty (cerraste manual). BOT marcado FLAT."
+        )
 
 
 class PositionService:

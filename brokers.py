@@ -110,7 +110,7 @@ class SimBroker:
         symbol_ledger = _normalize_symbol(symbol_val)
         bot_id = get_bot_id()
         side_u = str(side).upper()
-        reduce_only = bool(kwargs.get("reduce_only", False))
+        reduce_only = bool(kwargs.get("reduce_only", kwargs.get("reduceOnly", False)))
         client_oid = kwargs.get("newClientOrderId") or make_client_oid(
             bot_id, str(symbol_val).replace("/", ""), mode
         )
@@ -466,7 +466,7 @@ class BinanceBroker:
         mode = "live"
         bot_id = get_bot_id()
         side_u = str(side).upper()
-        reduce_only_flag = bool(kwargs.get("reduce_only", False))
+        reduce_only_flag = bool(kwargs.get("reduce_only", kwargs.get("reduceOnly", False)))
         client_oid = (
             kwargs.get("newClientOrderId")
             or kwargs.get("client_order_id")
@@ -477,7 +477,7 @@ class BinanceBroker:
         params = {
             k: v
             for k, v in kwargs.items()
-            if k not in {"symbol", "sl", "tp", "client_order_id", "reduce_only"}
+            if k not in {"symbol", "sl", "tp", "client_order_id", "reduce_only", "reduceOnly"}
         }
         explicit_type = params.pop("order_type", None)
         if explicit_type is None:
