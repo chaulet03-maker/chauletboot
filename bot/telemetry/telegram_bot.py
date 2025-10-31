@@ -39,7 +39,12 @@ from bot.telemetry.command_registry import CommandRegistry, normalize
 from bot.telemetry.formatter import open_msg
 from state_store import load_state, update_open_position
 import trading
-from position_service import EPS_QTY, fetch_live_equity_usdm, split_total_vs_bot
+from position_service import (
+    EPS_QTY,
+    fetch_live_equity_usdm,
+    reconcile_bot_store_with_account,
+    split_total_vs_bot,
+)
 
 logger = logging.getLogger("telegram")
 
@@ -187,6 +192,7 @@ async def _compute_position_split(app) -> tuple[Dict[str, Dict[str, Any]], float
             if mark_price:
                 break
     mark_val = mark_price if mark_price and mark_price > 0 else 0.0
+    await reconcile_bot_store_with_account(trader, exchange, symbol_cfg, mark_val)
     split = split_total_vs_bot(acct_pos, bot_pos, mark_val)
     return split, mark_val, symbol_cfg
 

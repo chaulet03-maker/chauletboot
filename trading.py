@@ -758,7 +758,7 @@ def close_now(symbol: str | None = None):
     qty = float(status.get("qty") or status.get("pos_qty") or 0.0)
     qty = abs(qty)
 
-    if side == "FLAT" or qty <= 0:
+    if side == "FLAT" or qty <= 0 or abs(qty) <= 1e-9:
         return {"status": "noop", "msg": "Sin posición para cerrar"}
 
     target_symbol = (

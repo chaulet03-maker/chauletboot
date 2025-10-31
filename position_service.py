@@ -228,6 +228,62 @@ class PositionService:
         self.public_client = ccxt_client or live_client
         self.symbol = symbol
 
+    # --- NEW: helpers to pull live position from exchange as source of truth ---
+    def _fetch_account_position_ccxt(self) -> tuple[float, float] | None:
+        """Return (qty, entry_price) using CCXT if available."""
+        client = getattr(self, "public_client", None) or getattr(self, "client", None)
+        symbol = self.symbol or ""
+        if not symbol:
+            return None
+        try:
+            if client and hasattr(client, "fetch_positions"):
+                res = client.fetch_positions([symbol]) if symbol else client.fetch_positions()
+                seq = res or []
+                if isinstance(seq, dict):
+                    seq = [seq]
+                sym_norm = symbol.replace("/", "").upper()
+                for item in seq:
+                    info = item.get("info") if isinstance(item, dict) else None
+                    item_sym = (item.get("symbol") or (info or {}).get("symbol") or "")
+                    item_sym = str(item_sym).replace("/", "").upper()
+                    if item_sym == sym_norm:
+                        qty = (
+                            item.get("contracts")
+                            or item.get("positionAmt")
+                            or (info or {}).get("positionAmt")
+                            or 0
+                        )
+                        entry = (
+                            item.get("entryPrice")
+                            or item.get("avgEntryPrice")
+                            or (info or {}).get("entryPrice")
+                            or 0
+                        )
+                        return float(qty), float(entry)
+        except Exception:
+            logger.debug("CCXT fetch_positions fallo.", exc_info=True)
+        return None
+
+    def _fetch_account_position_sdk(self) -> tuple[float, float] | None:
+        """Return (qty, entry_price) using python-binance futures_account if available."""
+        client = getattr(self, "client", None)
+        if not client or not hasattr(client, "futures_account"):
+            return None
+        try:
+            acct = client.futures_account()
+            positions = acct.get("positions") or []
+            sym = (self.symbol or "").replace("/", "").upper()
+            if not sym:
+                return None
+            for p in positions:
+                if str(p.get("symbol", "")).upper() == sym:
+                    qty = float(p.get("positionAmt") or 0)
+                    entry = float(p.get("entryPrice") or 0)
+                    return qty, entry
+        except Exception:
+            logger.debug("SDK futures_account fallo.", exc_info=True)
+        return None
+
     def refresh(self) -> None:
         """Recarga el estado desde el store compartido."""
         if not self.store:
@@ -252,7 +308,7 @@ class PositionService:
         if client is None:
             return None
 
-        symbol_no_slash = self.symbol.replace("/", "")
+        symbol_no_slash = (self.symbol or "").replace("/", "")
 
         # Preferimos el endpoint de premium index si está disponible
         try:
@@ -355,9 +411,22 @@ class PositionService:
         }
 
     def _status_live(self) -> dict[str, Any]:
+        # LIVE: Binance es la verdad. No confiar en store local para qty/entry.
+        EPS = EPS_QTY if "EPS_QTY" in globals() else 1e-9
+
         pos_qty = 0.0
         avg_price = 0.0
-        if self.store:
+
+        # 1) CCXT -> 2) SDK -> 3) último recurso: store sólo para mostrar
+        got = self._fetch_account_position_ccxt()
+        if got is None:
+            got = self._fetch_account_position_sdk()
+        if isinstance(got, tuple):
+            try:
+                pos_qty, avg_price = float(got[0] or 0.0), float(got[1] or 0.0)
+            except Exception:
+                pos_qty, avg_price = 0.0, 0.0
+        if abs(pos_qty) <= EPS and getattr(self, "store", None):
             try:
                 state = self.store.load()
                 pos_qty = float(state.get("pos_qty") or 0.0)
@@ -365,9 +434,10 @@ class PositionService:
             except Exception:
                 logger.debug("No se pudo leer store live", exc_info=True)
 
+        # Mark: primero privado, luego público
         mark = 0.0
         client = self.client
-        symbol_no_slash = self.symbol.replace("/", "")
+        symbol_no_slash = (self.symbol or "").replace("/", "")
         if client and hasattr(client, "futures_mark_price"):
             try:
                 mp = client.futures_mark_price(symbol=symbol_no_slash)
@@ -375,31 +445,34 @@ class PositionService:
                     mark = float(mp.get("markPrice") or 0.0)
             except Exception:
                 logger.debug("No se pudo obtener markPrice privado.", exc_info=True)
-
         if mark <= 0:
             public_mark = self._fetch_public_mark()
             if public_mark is not None:
                 mark = float(public_mark)
 
+        # Side con épsilon
         side = "FLAT"
-        if pos_qty > 0:
+        if pos_qty > EPS:
             side = "LONG"
-        elif pos_qty < 0:
+        elif pos_qty < -EPS:
             side = "SHORT"
 
+        # Equity y PnL
         equity = 0.0
         try:
             equity = fetch_live_equity_usdm()
         except Exception:
             logger.debug("No se pudo obtener equity live.", exc_info=True)
 
-        pnl = 0.0
         qty = abs(pos_qty)
-        if qty > 0 and avg_price > 0 and mark > 0:
+        pnl = 0.0
+        try:
             if side == "LONG":
                 pnl = (mark - avg_price) * qty
-            else:
+            elif side == "SHORT":
                 pnl = (avg_price - mark) * qty
+        except Exception:
+            pnl = 0.0
 
         return {
             "symbol": self.symbol,
