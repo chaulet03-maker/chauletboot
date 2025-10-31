@@ -11,7 +11,7 @@ from bot.mode_manager import Mode, ModeResult, get_mode
 from config import RAW_CONFIG, S
 from brokers import ACTIVE_LIVE_CLIENT, ACTIVE_PAPER_STORE, build_broker
 from binance_client import client_factory
-from position_service import PositionService
+from position_service import PositionService, EPS_QTY
 from paper_store import PaperStore
 from state_store import on_close_filled, on_open_filled
 from bot.runtime_state import get_mode as runtime_get_mode
@@ -193,7 +193,7 @@ def _fetch_live_position(client: Any, symbol_norm: str) -> Optional[Dict[str, An
             )
         except Exception:
             amount = 0.0
-        if abs(amount) <= 0.0:
+        if abs(amount) <= EPS_QTY:
             continue
         side = "LONG" if amount > 0 else "SHORT"
         try:

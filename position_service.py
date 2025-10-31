@@ -5,8 +5,15 @@ import time
 from typing import Any, Dict, Optional
 
 import brokers
-from config import S
 from paper_store import PaperStore
+from bot.runtime_state import get_mode as runtime_get_mode
+
+
+def _runtime_is_paper() -> bool:
+    try:
+        return (runtime_get_mode() or "paper").lower() not in {"real", "live"}
+    except Exception:
+        return True
 
 logger = logging.getLogger(__name__)
 
@@ -277,7 +284,7 @@ class PositionService:
 
     # ------------------------------------------------------------------
     def mark_to_market(self, mark: float) -> None:
-        if not (S.PAPER and self.store):
+        if not (_runtime_is_paper() and self.store):
             return
         try:
             self.store.save(mark=float(mark))
@@ -336,7 +343,7 @@ class PositionService:
         return None
 
     def _maybe_refresh_paper_mark(self, state: dict[str, Any]) -> dict[str, Any]:
-        if not (S.PAPER and self.store):
+        if not (_runtime_is_paper() and self.store):
             return state
         updated = int(state.get("updated") or 0)
         mark = float(state.get("mark") or 0.0)
@@ -599,7 +606,7 @@ class PositionService:
 
     # ------------------------------------------------------------------
     def get_status(self) -> dict[str, Any]:
-        if S.PAPER:
+        if _runtime_is_paper():
             return self._status_paper()
         return self._status_live()
 

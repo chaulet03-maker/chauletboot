@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from config import S
+from bot.runtime_state import get_mode as runtime_get_mode
 
 
 class SafeBinanceClient:
@@ -10,12 +10,12 @@ class SafeBinanceClient:
         self._c = real_client
 
     def futures_create_order(self, *args, **kwargs):
-        if S.PAPER:
+        if (runtime_get_mode() or "paper").lower() not in {"real", "live"}:
             raise RuntimeError("Bloqueado: intento de orden LIVE con trading_mode=simulado")
         return self._c.futures_create_order(*args, **kwargs)
 
     def futures_account(self, *args, **kwargs):
-        if S.PAPER:
+        if (runtime_get_mode() or "paper").lower() not in {"real", "live"}:
             raise RuntimeError("Bloqueado en PAPER: endpoint de cuenta")
         return self._c.futures_account(*args, **kwargs)
 

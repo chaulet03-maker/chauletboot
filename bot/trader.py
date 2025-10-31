@@ -155,6 +155,23 @@ class Trader:
             except Exception as exc:
                 logging.debug("PAPER check_open_position fallo: %s", exc)
             return self._open_position
+        # 2) REAL: consultar live en exchange (fuente de verdad)
+        if trading.POSITION_SERVICE is not None:
+            try:
+                st = trading.POSITION_SERVICE.get_status()
+                side = (st.get("side") or "FLAT").upper()
+                if side != "FLAT":
+                    self._open_position = {
+                        "symbol": st.get("symbol", self.config.get("symbol", "BTC/USDT")),
+                        "side": side,
+                        "contracts": float(st.get("qty") or st.get("size") or 0.0),
+                        "entryPrice": float(st.get("entry_price") or 0.0),
+                        "markPrice": float(st.get("mark") or 0.0),
+                    }
+                    return self._open_position
+                self._open_position = None
+            except Exception as exc:
+                logging.debug("REAL check_open_position fallo: %s", exc)
 
         # IMPORTANTE:
         # La posición del BOT vive en el store (self._open_position).
