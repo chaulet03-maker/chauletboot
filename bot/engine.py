@@ -1903,6 +1903,19 @@ class TradingApp:
 
             if str(close_result.get("status", "")).lower() == "noop":
                 reason = close_result.get("msg") or "No había posición del BOT para cerrar."
+                trader = getattr(self, "trader", None)
+                if trader and hasattr(trader, "set_position"):
+                    try:
+                        await trader.set_position(None)
+                    except Exception:
+                        self.logger.debug(
+                            "No se pudo limpiar la caché de posición tras cierre noop.",
+                            exc_info=True,
+                        )
+                try:
+                    self.position_open = False
+                except Exception:
+                    pass
                 return {"status": "noop", "reason": reason}
 
             bal_after = await _safe_fetch_balance()
@@ -1983,6 +1996,20 @@ class TradingApp:
             self._entry_ts = None
             self._eq_on_open = 0.0
             self._risk_usd_trade = 0.0
+
+            trader = getattr(self, "trader", None)
+            if trader and hasattr(trader, "set_position"):
+                try:
+                    await trader.set_position(None)
+                except Exception:
+                    self.logger.debug(
+                        "No se pudo limpiar la caché de posición tras cierre.",
+                        exc_info=True,
+                    )
+            try:
+                self.position_open = False
+            except Exception:
+                pass
 
             return {"status": "closed", "summary": summary, "order": close_result.get("order")}
         except Exception as exc:
