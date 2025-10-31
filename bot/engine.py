@@ -2029,8 +2029,6 @@ class TradingApp:
 
     def get_period_stats(self, days: int) -> dict | None:
         try:
-            import pandas as pd
-
             equity_csv, _ = self._csv_paths()
             df = pd.read_csv(equity_csv, parse_dates=["ts"])
             df["ts"] = pd.to_datetime(df["ts"], utc=True, errors="coerce")
@@ -2090,8 +2088,6 @@ class TradingApp:
         except Exception:
             tz = None
         try:
-            import pandas as pd
-
             equity_csv, trades_csv = self._csv_paths()
             equity_ini = equity_fin = pnl = 0.0
             total_trades = wins = losses = 0
@@ -2177,8 +2173,6 @@ class TradingApp:
 
     # ===== Funding helpers (modo simulado) =====
     def _load_funding_series(self, path: str):
-        import pandas as pd
-
         df = pd.read_csv(path)
         df.columns = [c.lower() for c in df.columns]
         ts_col = "timestamp" if "timestamp" in df.columns else ("time" if "time" in df.columns else "date")
