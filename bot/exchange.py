@@ -155,13 +155,10 @@ class Exchange:
         mode = (runtime_get_mode() or "paper").lower()
         if mode not in {"real", "live"}:
             return True
-
-        client = getattr(self, "client", None)
-        if client is None:
-            # Durante la inicialización aún no hay cliente construido.
-            return False
-        api_key = getattr(client, "apiKey", None)
-        return not bool(api_key)
+        # En modo REAL/LIVE consideramos el runtime como live aunque CCXT todavía
+        # no tenga credenciales disponibles; se usan fallbacks nativos en las
+        # llamadas que lo requieran.
+        return False
 
     def is_paper(self) -> bool:
         return self._is_paper_runtime()
@@ -226,6 +223,32 @@ class Exchange:
                 "entryPrice": entry_price,
                 "markPrice": mark_price,
             }
+        # Fallback nativo (python-binance)
+        try:
+            from brokers import ACTIVE_LIVE_CLIENT
+
+            nat = ACTIVE_LIVE_CLIENT
+            if nat and not self.is_paper():
+                acct = await asyncio.to_thread(nat.futures_account)
+                for pos in acct.get("positions", []):
+                    sym_raw = str(pos.get("symbol") or "")
+                    if sym_raw.replace("/", "") != target:
+                        continue
+                    amt = float(pos.get("positionAmt") or 0.0)
+                    if abs(amt) == 0.0:
+                        continue
+                    side = "LONG" if amt > 0 else "SHORT"
+                    entry = float(pos.get("entryPrice") or 0.0)
+                    mark = float(pos.get("markPrice") or 0.0)
+                    return {
+                        "symbol": sym,
+                        "side": side,
+                        "contracts": abs(amt),
+                        "entryPrice": entry,
+                        "markPrice": mark,
+                    }
+        except Exception:
+            pass
         return None
 
     async def list_open_positions(self) -> List[Dict[str, Any]]:
