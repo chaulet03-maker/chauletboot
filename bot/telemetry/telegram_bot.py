@@ -24,7 +24,7 @@ from logging_setup import LOG_DIR, LOG_FILE
 from time_fmt import fmt_ar
 from config import S, MANUAL_OPEN_RISK_PCT
 from bot.motives import MOTIVES
-from bot.mode_manager import get_mode
+from bot.mode_manager import get_mode, _read_cfg as _read_cfg_yaml, _write_cfg as _write_cfg_yaml
 from bot.identity import get_bot_id
 from bot.ledger import bot_position
 from bot.pnl import pnl_summary_bot
@@ -763,6 +763,125 @@ def _parse_fraction(value) -> Optional[float]:
     if frac > 1:
         frac = min(frac, 100.0) / 100.0
     return min(frac, 1.0)
+
+
+def _parse_tp_pct(value: Any) -> float:
+    """Parsea valores de porcentaje flexibles como "10", "10%" o "0.8%"."""
+
+    if value is None:
+        raise ValueError("valor vacío")
+
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            raise ValueError("valor vacío")
+        has_pct = text.endswith("%")
+        if has_pct:
+            text = text[:-1].strip()
+        text = text.replace(",", ".")
+        if not text:
+            raise ValueError("valor vacío")
+        try:
+            numeric = float(text)
+        except ValueError as exc:  # pragma: no cover - defensivo
+            raise ValueError("no es un número") from exc
+        if not math.isfinite(numeric):
+            raise ValueError("no es un número")
+        if has_pct:
+            numeric /= 100.0
+        elif abs(numeric) > 1.0:
+            numeric /= 100.0
+        return numeric
+
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("no es un número") from exc
+    if not math.isfinite(numeric):
+        raise ValueError("no es un número")
+    if abs(numeric) > 1.0:
+        numeric /= 100.0
+    return numeric
+
+
+def _try_parse_tp_pct(value: Any, *, allow_zero: bool = False) -> Optional[float]:
+    try:
+        pct = _parse_tp_pct(value)
+    except ValueError:
+        return None
+    if pct < 0:
+        return None
+    if pct == 0 and not allow_zero:
+        return None
+    return pct
+
+
+def _collect_admin_ids(cfg: Dict[str, Any]) -> set[int]:
+    ids: set[int] = set()
+
+    def _add(raw_item: Any) -> None:
+        if raw_item is None:
+            return
+        if isinstance(raw_item, (list, tuple, set)):
+            for item in raw_item:
+                _add(item)
+            return
+        text = str(raw_item).strip()
+        if not text:
+            return
+        parts = re.split(r"[\s,]+", text)
+        for part in parts:
+            if not part:
+                continue
+            try:
+                ids.add(int(part))
+            except ValueError:
+                continue
+
+    if isinstance(cfg, dict):
+        _add(cfg.get("telegram_admin_ids"))
+        _add(cfg.get("telegram_admins"))
+        telegram_cfg = cfg.get("telegram") if isinstance(cfg.get("telegram"), dict) else {}
+        if isinstance(telegram_cfg, dict):
+            _add(telegram_cfg.get("admin_ids"))
+            _add(telegram_cfg.get("admins"))
+
+    env_admins = os.getenv("TELEGRAM_ADMIN_IDS")
+    if env_admins:
+        _add(env_admins)
+
+    return ids
+
+
+def _user_is_admin(update: Update, cfg: Dict[str, Any]) -> bool:
+    admin_ids = _collect_admin_ids(cfg)
+    if not admin_ids:
+        return True
+    user = update.effective_user if update else None
+    if user is None or getattr(user, "id", None) is None:
+        return False
+    try:
+        return int(user.id) in admin_ids
+    except Exception:
+        return False
+
+
+def _persist_tp_mapping(lev_key: str, pct: float) -> None:
+    try:
+        raw_cfg = _read_cfg_yaml() or {}
+    except Exception:
+        raw_cfg = {}
+    if not isinstance(raw_cfg, dict):
+        raw_cfg = {}
+    mapping = raw_cfg.get("tp_eq_pct_by_leverage")
+    if not isinstance(mapping, dict):
+        mapping = {}
+    mapping[str(lev_key)] = float(round(pct, 6))
+    raw_cfg["tp_eq_pct_by_leverage"] = mapping
+    try:
+        _write_cfg_yaml(raw_cfg)
+    except Exception:
+        logger.warning("No se pudo persistir tp_eq_pct_by_leverage en config", exc_info=True)
 
 
 def _get_equity_fraction(engine) -> float:
@@ -1720,25 +1839,97 @@ async def tp_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if app is None or message is None:
         return
 
-    args = context.args or []
+    args = [arg.strip() for arg in (context.args or []) if arg.strip()]
+    cfg = _engine_config(app)
+    if not isinstance(cfg, dict):
+        cfg = {}
+
+    mapping = cfg.get("tp_eq_pct_by_leverage")
+    if not isinstance(mapping, dict):
+        mapping = {}
+
+    default_candidates = [
+        cfg.get("target_eq_pnl_pct"),
+        cfg.get("tp_equity_pct"),
+        cfg.get("tp_pct"),
+    ]
+    strategy_cfg = cfg.get("strategy")
+    if isinstance(strategy_cfg, dict):
+        default_candidates.extend(
+            [
+                strategy_cfg.get("target_eq_pnl_pct"),
+                strategy_cfg.get("tp_pct"),
+            ]
+        )
+    default_pct = 0.10
+    for candidate in default_candidates:
+        parsed_candidate = _try_parse_tp_pct(candidate, allow_zero=True)
+        if parsed_candidate is not None:
+            default_pct = parsed_candidate
+            break
+
+    def _current_pct_for(lev: int) -> float:
+        raw_val = mapping.get(str(lev)) if isinstance(mapping, dict) else None
+        if raw_val is None and isinstance(mapping, dict):
+            raw_val = mapping.get(lev)
+        parsed = _try_parse_tp_pct(raw_val, allow_zero=True)
+        return parsed if parsed is not None else default_pct
+
     if not args:
-        current = float(getattr(app, "tp_equity_pct", 0.0) or 0.0)
-        msg = "TP automático desactivado." if current <= 0 else f"TP automático: +{current:.2f}% del equity."
-        await message.reply_text(msg)
+        tp5 = _current_pct_for(5)
+        tp10 = _current_pct_for(10)
+        await message.reply_text(
+            "TP actual:\n"
+            f"• x5: {tp5 * 100:.3f}%\n"
+            f"• x10: {tp10 * 100:.3f}%\n"
+            f"(default {default_pct * 100:.3f}%)"
+        )
         return
+
+    if not _user_is_admin(update, cfg):
+        await message.reply_text("No autorizado.")
+        return
+
+    if len(args) < 2:
+        await message.reply_text("Uso: /tp x5 10   ó   /tp x10 0.8%")
+        return
+
+    lev_token = args[0].lower().lstrip("/")
+    if lev_token.startswith("x"):
+        lev_token = lev_token[1:]
+    try:
+        lev_value = int(lev_token)
+    except Exception:
+        lev_value = None
+    if lev_value not in {5, 10}:
+        await message.reply_text("Leverage inválido. Usá x5 o x10.")
+        return
+
+    raw_pct_text = " ".join(args[1:]).strip()
+    try:
+        pct_value = _parse_tp_pct(raw_pct_text)
+    except ValueError as exc:
+        await message.reply_text(f"Valor inválido: {exc}")
+        return
+
+    if not (0 < pct_value <= 0.5):
+        await message.reply_text("Rango inválido. Recomendado: 0.1%–5%.")
+        return
+
+    mapping = dict(mapping) if not isinstance(mapping, dict) else mapping
+    mapping[str(lev_value)] = float(round(pct_value, 6))
+    cfg["tp_eq_pct_by_leverage"] = mapping
 
     try:
-        pct = max(0.0, float(" ".join(args).strip().replace(",", ".")))
+        strategy = getattr(app, "strategy", None)
+        if strategy and isinstance(getattr(strategy, "config", None), dict):
+            strategy.config["tp_eq_pct_by_leverage"] = mapping
     except Exception:
-        await message.reply_text("Formato inválido. Usá `tp 10` para +10% del equity.")
-        return
+        logger.debug("No se pudo sincronizar strategy.config con tp_eq_pct_by_leverage", exc_info=True)
 
-    if hasattr(app, "set_tp_equity_pct"):
-        app.set_tp_equity_pct(pct)
+    _persist_tp_mapping(str(lev_value), pct_value)
 
-    await message.reply_text(
-        "✅ TP automático desactivado." if pct == 0 else f"✅ TP automático a +{pct:.2f}% del equity."
-    )
+    await message.reply_text(f"OK. TP x{lev_value} = {pct_value * 100:.3f}%")
 
 
 async def precio_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2250,7 +2441,7 @@ def _populate_registry() -> None:
         "tp",
         tp_command,
         aliases=["takeprofit"],
-        help_text="Cierra la posición si supera un % objetivo. Ej: `tp 10`.",
+        help_text="Consulta o ajusta el TP por apalancamiento. Ej: `tp x5 0.8%`.",
     )
     REGISTRY.register(
         "killswitch",
