@@ -964,6 +964,7 @@ class Exchange:
         sl_price: float,
         tp_price: float,
         symbol: Optional[str] = None,
+        params: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Crea una orden pasando SIEMPRE por la ruta segura de trading."""
 
@@ -982,12 +983,35 @@ class Exchange:
             except Exception:
                 logger.warning("No se pudo asegurar el modo de posición antes de abrir", exc_info=True)
 
+        extra_params = dict(params or {})
+        close_bot = bool(extra_params.pop("close_bot", False))
+
         order_kwargs = dict(symbol=symbol, sl=sl_price, tp=tp_price, order_type="MARKET")
         if self.hedge_mode:
             side_upper = str(side).upper()
             order_kwargs["positionSide"] = (
                 "SHORT" if side_upper in {"SELL", "SHORT"} else "LONG"
             )
+
+        if close_bot:
+            order_kwargs.setdefault("reduce_only", True)
+            options = None
+            try:
+                options = getattr(self.client, "options", None)
+            except Exception:
+                options = None
+            if not isinstance(options, dict) and isinstance(self.config, Mapping):
+                exchange_cfg = self.config.get("exchange")
+                if isinstance(exchange_cfg, Mapping):
+                    opt_cfg = exchange_cfg.get("options")
+                    if isinstance(opt_cfg, Mapping):
+                        options = opt_cfg
+            is_hedge = bool(options.get("hedgeMode")) if isinstance(options, dict) else self.hedge_mode
+            if not is_hedge:
+                order_kwargs.pop("positionSide", None)
+
+        if extra_params:
+            order_kwargs.update(extra_params)
 
         from trading import place_order_safe
 

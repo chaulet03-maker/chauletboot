@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import Any, Optional
+from typing import Any, Dict, Optional
 
 import brokers
 from config import S
@@ -63,6 +63,80 @@ def fetch_live_equity_usdm() -> float:
         logger.debug("fapiPrivateV2GetAccount falló", exc_info=True)
 
     return 0.0
+
+
+def split_total_vs_bot(
+    acct_pos: Optional[Dict[str, Any]],
+    bot_pos: Optional[Dict[str, Any]],
+    mark: float,
+) -> Dict[str, Dict[str, float | str]]:
+    """Separa la posición total en porciones BOT vs manual y calcula PnL estimado."""
+
+    def _pnl(side: str, qty: float, entry: float, mark_px: float) -> float:
+        if qty <= 0 or entry <= 0 or mark_px <= 0:
+            return 0.0
+        sign = 1 if (side or "").upper() == "LONG" else -1
+        return round((mark_px - entry) * qty * sign, 2)
+
+    total = acct_pos or {}
+    bot = bot_pos or {}
+
+    def _float(value: Any) -> float:
+        try:
+            return float(value)
+        except Exception:
+            return 0.0
+
+    tq = _float(total.get("qty") or total.get("contracts") or total.get("positionAmt"))
+    te = _float(total.get("entry_price") or total.get("entryPrice") or total.get("avgPrice"))
+    ts = (str(total.get("side")) if total.get("side") is not None else "").upper()
+    if not ts and tq > 0:
+        ts = "LONG"
+    elif not ts and tq < 0:
+        ts = "SHORT"
+
+    bq_signed = bot.get("qty") or bot.get("contracts") or bot.get("positionAmt")
+    bq = abs(_float(bq_signed))
+    be = _float(bot.get("entry_price") or bot.get("entryPrice") or bot.get("avgPrice"))
+    bs = (str(bot.get("side")) if bot.get("side") is not None else "").upper()
+    if not bs and _float(bq_signed) < 0:
+        bs = "SHORT"
+    elif not bs and bq > 0:
+        bs = "LONG"
+
+    tq = abs(tq)
+
+    mq = max(tq - bq, 0.0)
+    me = 0.0
+    if mq > 0 and te > 0 and tq > 0:
+        try:
+            me = (te * tq - be * bq) / mq
+        except ZeroDivisionError:
+            me = 0.0
+    ms = ts or ("LONG" if mq > 0 else "FLAT")
+
+    mark_px = _float(mark)
+
+    return {
+        "total": {
+            "side": ts or ("LONG" if tq > 0 else "FLAT"),
+            "qty": round(tq, 6),
+            "entry_price": round(te, 6) if te else 0.0,
+            "pnl": _pnl(ts or ("LONG" if tq > 0 else "SHORT" if tq < 0 else "FLAT"), tq, te, mark_px),
+        },
+        "bot": {
+            "side": bs or ("LONG" if bq > 0 else "FLAT"),
+            "qty": round(bq, 6),
+            "entry_price": round(be, 6) if be else 0.0,
+            "pnl": _pnl(bs or ("LONG" if bq > 0 else "SHORT" if bq < 0 else "FLAT"), bq, be, mark_px),
+        },
+        "manual": {
+            "side": ms or ("LONG" if mq > 0 else "FLAT"),
+            "qty": round(mq, 6),
+            "entry_price": round(me, 6) if me else 0.0,
+            "pnl": _pnl(ms or ("LONG" if mq > 0 else "SHORT" if mq < 0 else "FLAT"), mq, me, mark_px),
+        },
+    }
 
 
 class PositionService:
