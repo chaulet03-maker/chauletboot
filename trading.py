@@ -554,10 +554,10 @@ def rebuild(mode: Mode) -> None:
     BROKER = build_broker(S, client_factory)
 
     ACTIVE_DATA_DIR = get_data_dir()
-    bot_store = ACTIVE_PAPER_STORE or PaperStore(path=get_paper_store_path(), start_equity=S.start_equity)
-    if mode != "simulado":
-        # En REAL: NO reasignar bot_store a un PaperStore de disco
-        pass
+    bot_store = ACTIVE_PAPER_STORE or PaperStore(
+        path=get_paper_store_path(), start_equity=S.start_equity
+    )
+    # En REAL: NO reasignes bot_store. La posición se obtiene del exchange.
 
     shared_store = getattr(BROKER, "store", None)
     if shared_store is not None:

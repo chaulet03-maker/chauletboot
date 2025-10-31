@@ -8,6 +8,8 @@ import uuid
 from dataclasses import asdict, dataclass
 from typing import Any, Dict, Optional
 
+from bot.runtime_state import get_mode as runtime_get_mode
+
 STATE_PATH = os.getenv("BOT_STATE_PATH", "./state.json")
 
 
@@ -28,6 +30,13 @@ class Position:
     mode: str = "paper"  # "paper" | "live"
     fees: float = 0.0
     gross_pnl: float = 0.0
+
+
+def _runtime_is_paper() -> bool:
+    try:
+        return (runtime_get_mode() or "paper").lower() not in {"real", "live"}
+    except Exception:
+        return True
 
 
 def _atomic_write(path: str, data: bytes) -> None:
@@ -223,11 +232,17 @@ def on_open_filled(
     mode: str = "paper",
     fee: float = 0.0,
 ) -> None:
+    # En REAL no persistimos posición del BOT en disco
+    if not _runtime_is_paper():
+        return
     pos = create_position(symbol, side, qty, price, lev, tp, sl, mode, fee)
     persist_open(pos)
 
 
 def on_close_filled(symbol: str, exit_price: float, fee: float = 0.0) -> None:
+    # En REAL no persistimos posición del BOT en disco
+    if not _runtime_is_paper():
+        return
     state = load_state()
     open_positions = state.get("open_positions", {})
     pos = open_positions.get(symbol)
