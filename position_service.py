@@ -53,6 +53,22 @@ def fetch_live_equity_usdm() -> float:
     except Exception:
         logger.debug("fetch_balance(type=future) falló; intento fallback", exc_info=True)
 
+    # Fallback robusto: /fapi/v2/balance (lista por asset) y sumas
+    try:
+        if hasattr(client, "fapiPrivateV2GetBalance"):
+            bal_list = client.fapiPrivateV2GetBalance()
+            # Busca USDT
+            if isinstance(bal_list, (list, tuple)):
+                for it in bal_list:
+                    if (it or {}).get("asset") == "USDT":
+                        # 'balance' o 'walletBalance' o 'cashBalance' (algunos tenants)
+                        for key in ("balance", "walletBalance", "cashBalance", "availableBalance"):
+                            v = (it or {}).get(key)
+                            if v is not None:
+                                return float(v)
+    except Exception:
+        logger.debug("fapiPrivateV2GetBalance falló", exc_info=True)
+
     try:
         if hasattr(client, "fapiPrivateV2GetAccount"):
             acct = client.fapiPrivateV2GetAccount()
