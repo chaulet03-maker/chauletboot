@@ -35,6 +35,7 @@ from core.strategy import Strategy
 from core.indicators import add_indicators
 from config import S
 import trading
+from position_service import reconcile_bot_store_with_account
 from risk_guards import (
     clear_pause_if_expired,
     get_pause_manager,
@@ -554,6 +555,19 @@ class TradingApp:
                 self.connection_lost = False
 
             logging.info("Iniciando ciclo de análisis de mercado...")
+            symbol_cfg = self.config.get("symbol", "BTC/USDT")
+            try:
+                await reconcile_bot_store_with_account(
+                    self.trader,
+                    self.exchange,
+                    symbol_cfg,
+                    0.0,
+                )
+            except Exception:
+                self.logger.debug(
+                    "No se pudo reconciliar posición del BOT con la cuenta.",
+                    exc_info=True,
+                )
             try:
                 self.last_signal_ts = pd.Timestamp.now(tz="UTC")
             except Exception:

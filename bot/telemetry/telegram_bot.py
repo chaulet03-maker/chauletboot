@@ -39,7 +39,7 @@ from bot.telemetry.command_registry import CommandRegistry, normalize
 from bot.telemetry.formatter import open_msg
 from state_store import load_state, update_open_position
 import trading
-from position_service import fetch_live_equity_usdm, split_total_vs_bot
+from position_service import EPS_QTY, fetch_live_equity_usdm, split_total_vs_bot
 
 logger = logging.getLogger("telegram")
 
@@ -192,35 +192,68 @@ async def _compute_position_split(app) -> tuple[Dict[str, Dict[str, Any]], float
 
 
 def _format_split_summary(split: Dict[str, Dict[str, Any]], mark: float) -> str:
-    mark_txt = f"{mark:,.2f}" if mark and mark > 0 else None
+    def _fmt_qty(value: Any) -> str:
+        try:
+            return f"{float(value):.6f}"
+        except Exception:
+            return "0.000000"
 
-    def _section(title: str, data: Dict[str, Any], pnl_label: str) -> str:
-        side = str(data.get("side") or "FLAT").upper()
-        qty = _safe_float(data.get("qty"))
-        entry_price = _safe_float(data.get("entry_price"))
-        pnl_val = _safe_float(data.get("pnl"))
-        lines = [f"<b>{title}</b>", f"• {side} {qty:.6f}"]
-        if entry_price > 0 or (mark_txt and qty > 0):
-            entry_txt = f"{entry_price:,.2f}" if entry_price > 0 else "—"
-            mark_str = mark_txt if mark_txt is not None else "—"
-            lines.append(f"• Entrada: {entry_txt} | Mark: {mark_str}")
-        lines.append(f"• {pnl_label}: {pnl_val:+,.2f}")
-        return "\n".join(lines)
+    def _fmt_price(value: Any) -> str:
+        try:
+            price = float(value)
+        except Exception:
+            return "—"
+        if price <= 0:
+            return "—"
+        return f"{price:.2f}"
 
-    bot_section = _section("📌 Posición del BOT", split.get("bot", {}), "PnL BOT")
-    manual_section = _section("👤 Manual/Otras", split.get("manual", {}), "PnL Manual")
+    def _fmt_pnl(value: Any) -> str:
+        try:
+            pnl_val = float(value)
+        except Exception:
+            pnl_val = 0.0
+        return f"{pnl_val:+.2f}"
 
-    total_data = split.get("total", {})
+    mark_txt = _fmt_price(mark)
+
+    bot_data = split.get("bot") or {}
+    bot_qty = _safe_float(bot_data.get("qty"))
+    bot_side = str(bot_data.get("side") or "FLAT").upper()
+    bot_section = (
+        "\n".join(
+            [
+                "📌 <b>Posición del BOT</b>",
+                f"• {bot_side} {_fmt_qty(bot_data.get('qty'))}",
+                f"• Entrada: {_fmt_price(bot_data.get('entry_price'))} | Mark: {mark_txt}",
+                f"• PnL BOT: {_fmt_pnl(bot_data.get('pnl'))}",
+            ]
+        )
+        if bot_qty > EPS_QTY
+        else ""
+    )
+
+    manual_data = split.get("manual") or {}
+    manual_side = str(manual_data.get("side") or "FLAT").upper()
+    manual_section = "\n".join(
+        [
+            "🧑‍💼 <b>Manual/Otras</b>",
+            f"• {manual_side} {_fmt_qty(manual_data.get('qty'))}",
+            f"• PnL Manual: {_fmt_pnl(manual_data.get('pnl'))}",
+        ]
+    )
+
+    total_data = split.get("total") or {}
     total_side = str(total_data.get("side") or "FLAT").upper()
-    total_qty = _safe_float(total_data.get("qty"))
-    total_pnl = _safe_float(total_data.get("pnl"))
-    total_lines = [
-        "<b>🧮 TOTAL (BOT + Manual)</b>",
-        f"• {total_side} {total_qty:.6f}",
-        f"• PnL TOTAL: {total_pnl:+,.2f}",
-    ]
+    total_section = "\n".join(
+        [
+            "🧮 <b>TOTAL (BOT + Manual)</b>",
+            f"• {total_side} {_fmt_qty(total_data.get('qty'))}",
+            f"• PnL TOTAL: {_fmt_pnl(total_data.get('pnl'))}",
+        ]
+    )
 
-    return "\n\n".join([bot_section, manual_section, "\n".join(total_lines)])
+    sections = [section for section in (bot_section, manual_section, total_section) if section]
+    return "\n\n".join(sections)
 
 
 async def open_command(update: Update, context: ContextTypes.DEFAULT_TYPE):

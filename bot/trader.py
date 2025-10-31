@@ -156,6 +156,9 @@ class Trader:
                 logging.debug("PAPER check_open_position fallo: %s", exc)
             return self._open_position
 
+        # IMPORTANTE:
+        # La posición del BOT vive en el store (self._open_position).
+        # La posición TOTAL de la cuenta se consulta por fuera sólo para reportes/reconciliación.
         return self._open_position
 
     async def set_position(self, position_data: Optional[Dict[str, Any]]) -> None:
