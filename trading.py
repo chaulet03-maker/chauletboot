@@ -554,18 +554,23 @@ def rebuild(mode: Mode) -> None:
     BROKER = build_broker(S, client_factory)
 
     ACTIVE_DATA_DIR = get_data_dir()
-    bot_store = ACTIVE_PAPER_STORE or PaperStore(
-        path=get_paper_store_path(), start_equity=S.start_equity
-    )
-    # En REAL no montamos PaperStore para posición del BOT.
+    if mode == "simulado":
+        bot_store: Optional[PaperStore] = ACTIVE_PAPER_STORE or PaperStore(
+            path=get_paper_store_path(), start_equity=S.start_equity
+        )
+    else:
+        bot_store = ACTIVE_PAPER_STORE
 
     shared_store = getattr(BROKER, "store", None)
     if shared_store is not None:
         bot_store = shared_store
 
-    try:
-        ACTIVE_STORE_PATH = Path(bot_store.path).resolve()
-    except Exception:
+    if bot_store is not None:
+        try:
+            ACTIVE_STORE_PATH = Path(bot_store.path).resolve()
+        except Exception:
+            ACTIVE_STORE_PATH = None
+    else:
         ACTIVE_STORE_PATH = None
 
     POSITION_SERVICE = PositionService(
