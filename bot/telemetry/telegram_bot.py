@@ -39,7 +39,7 @@ from bot.telemetry.command_registry import CommandRegistry, normalize
 from bot.telemetry.formatter import open_msg
 from state_store import load_state, update_open_position
 import trading
-from position_service import fetch_live_equity_usdm
+from position_service import fetch_live_equity_usdm, split_total_vs_bot
 
 logger = logging.getLogger("telegram")
 
@@ -69,6 +69,158 @@ def _fmt_sign_money(v: float) -> str:
         return "0,00"
     s = "➕" if v >= 0 else "➖"
     return f"{s} ${_fmt_money(abs(v))}"
+
+
+def _safe_float(value: Any) -> float:
+    try:
+        return float(value)
+    except Exception:
+        return 0.0
+
+
+def _merge_position_entry(entry: Any) -> Dict[str, Any]:
+    if not isinstance(entry, dict):
+        return {}
+    merged: Dict[str, Any] = {}
+    info = entry.get("info") if isinstance(entry.get("info"), dict) else None
+    if isinstance(info, dict):
+        merged.update(info)
+    merged.update(entry)
+    return merged
+
+
+def _account_position_for_symbol(entry: Any, symbol_norm: str) -> Optional[Dict[str, Any]]:
+    merged = _merge_position_entry(entry)
+    if not merged:
+        return None
+    sym_candidate = str(
+        merged.get("symbol")
+        or merged.get("pair")
+        or merged.get("symbolName")
+        or merged.get("symbolDisplay")
+        or ""
+    ).replace("/", "").upper()
+    if sym_candidate != symbol_norm:
+        return None
+
+    raw_qty = (
+        merged.get("positionAmt")
+        or merged.get("contracts")
+        or merged.get("qty")
+        or merged.get("size")
+    )
+    if raw_qty in (None, ""):
+        return None
+    qty_val = _safe_float(raw_qty)
+    if abs(qty_val) <= 0.0:
+        return None
+
+    entry_price = _safe_float(
+        merged.get("entryPrice")
+        or merged.get("avgEntryPrice")
+        or merged.get("entry_price")
+        or merged.get("avgPrice")
+    )
+    mark_price = _safe_float(
+        merged.get("markPrice")
+        or merged.get("mark_price")
+        or merged.get("mark")
+    )
+    side_raw = merged.get("side") or merged.get("positionSide")
+    if not side_raw:
+        side_raw = "LONG" if qty_val > 0 else "SHORT"
+
+    return {
+        "symbol": merged.get("symbol") or merged.get("pair") or symbol_norm,
+        "side": str(side_raw).upper(),
+        "qty": abs(qty_val),
+        "entry_price": entry_price,
+        "markPrice": mark_price,
+    }
+
+
+async def _compute_position_split(app) -> tuple[Dict[str, Dict[str, Any]], float, str]:
+    symbol_cfg = (
+        app.config.get("symbol", "BTC/USDT") if getattr(app, "config", None) else "BTC/USDT"
+    )
+    symbol_norm = _normalized_symbol(symbol_cfg)
+
+    exchange = getattr(app, "exchange", None)
+    acct_pos: Optional[Dict[str, Any]] = None
+    if exchange and hasattr(exchange, "fetch_positions"):
+        try:
+            fetched = await exchange.fetch_positions(symbol_cfg)
+        except Exception:
+            fetched = None
+        if isinstance(fetched, list):
+            for entry in fetched:
+                candidate = _account_position_for_symbol(entry, symbol_norm)
+                if candidate:
+                    acct_pos = candidate
+                    break
+        elif isinstance(fetched, dict):
+            acct_pos = _account_position_for_symbol(fetched, symbol_norm)
+
+    trader = getattr(app, "trader", None)
+    bot_pos = None
+    if trader and hasattr(trader, "check_open_position"):
+        try:
+            bot_pos = await trader.check_open_position(exchange=None)
+        except Exception:
+            bot_pos = None
+
+    mark_price = None
+    if exchange and hasattr(exchange, "get_current_price"):
+        try:
+            mark_price = await exchange.get_current_price(symbol_cfg)
+        except Exception:
+            mark_price = None
+    if mark_price is None:
+        for source in (bot_pos, acct_pos):
+            if isinstance(source, dict):
+                for key in ("mark", "markPrice", "mark_price"):
+                    if source.get(key) not in (None, ""):
+                        candidate = _safe_float(source.get(key))
+                        if candidate > 0:
+                            mark_price = candidate
+                            break
+            if mark_price:
+                break
+    mark_val = mark_price if mark_price and mark_price > 0 else 0.0
+    split = split_total_vs_bot(acct_pos, bot_pos, mark_val)
+    return split, mark_val, symbol_cfg
+
+
+def _format_split_summary(split: Dict[str, Dict[str, Any]], mark: float) -> str:
+    mark_txt = f"{mark:,.2f}" if mark and mark > 0 else None
+
+    def _section(title: str, data: Dict[str, Any], pnl_label: str) -> str:
+        side = str(data.get("side") or "FLAT").upper()
+        qty = _safe_float(data.get("qty"))
+        entry_price = _safe_float(data.get("entry_price"))
+        pnl_val = _safe_float(data.get("pnl"))
+        lines = [f"<b>{title}</b>", f"• {side} {qty:.6f}"]
+        if entry_price > 0 or (mark_txt and qty > 0):
+            entry_txt = f"{entry_price:,.2f}" if entry_price > 0 else "—"
+            mark_str = mark_txt if mark_txt is not None else "—"
+            lines.append(f"• Entrada: {entry_txt} | Mark: {mark_str}")
+        lines.append(f"• {pnl_label}: {pnl_val:+,.2f}")
+        return "\n".join(lines)
+
+    bot_section = _section("📌 Posición del BOT", split.get("bot", {}), "PnL BOT")
+    manual_section = _section("👤 Manual/Otras", split.get("manual", {}), "PnL Manual")
+
+    total_data = split.get("total", {})
+    total_side = str(total_data.get("side") or "FLAT").upper()
+    total_qty = _safe_float(total_data.get("qty"))
+    total_pnl = _safe_float(total_data.get("pnl"))
+    total_lines = [
+        "<b>🧮 TOTAL (BOT + Manual)</b>",
+        f"• {total_side} {total_qty:.6f}",
+        f"• PnL TOTAL: {total_pnl:+,.2f}",
+    ]
+
+    return "\n\n".join([bot_section, manual_section, "\n".join(total_lines)])
 
 
 async def open_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -156,6 +308,21 @@ async def estado_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"• PnL 7d:  {_fmt_stats(week_stats)}"
     )
 
+    try:
+        split_info, _, _ = await _compute_position_split(app)
+    except Exception:
+        split_info = None
+    if isinstance(split_info, dict):
+        bot_qty = _safe_float((split_info.get("bot") or {}).get("qty"))
+        manual_qty = _safe_float((split_info.get("manual") or {}).get("qty"))
+        if bot_qty > 0 or manual_qty > 0:
+            bot_pnl = _safe_float((split_info.get("bot") or {}).get("pnl"))
+            total_pnl = _safe_float((split_info.get("total") or {}).get("pnl"))
+            text += (
+                f"\n• PnL BOT: {bot_pnl:+,.2f}"
+                f"\n• PnL TOTAL: {total_pnl:+,.2f}"
+            )
+
     await message.reply_html(text)
 
 
@@ -166,26 +333,13 @@ async def posicion_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     try:
-        pos = await app.exchange.get_open_position(app.config.get("symbol"))
-    except Exception:
-        pos = None
-
-    if not pos:
-        await message.reply_text("El BOT no tiene posición abierta.")
+        split_data, mark_price, _ = await _compute_position_split(app)
+    except Exception as exc:
+        await message.reply_text(f"No pude obtener la información de posiciones: {exc}")
         return
 
-    side = str(pos.get("side", "")).upper()
-    qty = float(pos.get("contracts") or pos.get("positionAmt") or pos.get("size") or 0.0)
-    entry = float(pos.get("entryPrice") or pos.get("avgPrice") or 0.0)
-    mark = float(pos.get("markPrice") or pos.get("mark") or entry)
-    pnl = (mark - entry) * qty * (1.0 if side == "LONG" else -1.0)
-
-    await message.reply_html(
-        "<b>📌 Posición del BOT</b>\n"
-        f"• {side} {qty:.6f}\n"
-        f"• Entrada: {entry:,.2f} | Mark: {mark:,.2f}\n"
-        f"• PnL actual: {pnl:+,.2f}"
-    )
+    summary_text = _format_split_summary(split_data, mark_price)
+    await message.reply_html(summary_text)
 
 
 async def posiciones_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -194,59 +348,59 @@ async def posiciones_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if app is None or message is None:
         return
 
-    symbol_cfg = app.config.get("symbol", "BTC/USDT") if getattr(app, "config", None) else "BTC/USDT"
-
     try:
-        managed = await app.exchange.get_open_position(symbol_cfg)
-    except Exception:
-        managed = None
+        split_data, mark_price, symbol_cfg = await _compute_position_split(app)
+    except Exception as exc:
+        await message.reply_text(f"No pude obtener la información de posiciones: {exc}")
+        return
+
+    sections: List[str] = [_format_split_summary(split_data, mark_price)]
 
     try:
         allpos = await app.exchange.list_open_positions()
     except Exception:
         allpos = []
 
-    others: List[Dict[str, Any]] = []
-    if managed:
-        target_symbol = str(managed.get("symbol") or symbol_cfg)
-        target_qty = float(managed.get("contracts") or 0.0)
-        for p in allpos or []:
-            sym = str(p.get("symbol") or "")
-            qty = float(p.get("contracts") or p.get("positionAmt") or p.get("size") or 0.0)
-            if sym == target_symbol and abs(qty - target_qty) <= 1e-9:
-                continue
-            others.append(p)
-    else:
-        others = list(allpos or [])
-
-    parts: List[str] = []
-    if managed:
-        s = managed
-        side = str(s.get("side", "")).upper()
-        qty = float(s.get("contracts") or 0.0)
-        ep = float(s.get("entryPrice") or 0.0)
-        mp = float(s.get("markPrice") or ep)
-        pnl = (mp - ep) * qty * (1.0 if side == "LONG" else -1.0)
-        parts.append(
-            "<b>🤖 BOT</b>\n"
-            f"• {s.get('symbol', symbol_cfg)} {side} {qty:.6f}\n"
-            f"• Entrada: {ep:,.2f} | Mark: {mp:,.2f}\n"
-            f"• PnL: {pnl:+,.2f}"
+    symbol_norm = _normalized_symbol(symbol_cfg)
+    other_sections: List[str] = []
+    for entry in allpos or []:
+        merged = _merge_position_entry(entry)
+        sym_raw = str(merged.get("symbol") or "").replace("/", "")
+        if not sym_raw:
+            continue
+        if sym_raw.upper() == symbol_norm:
+            continue
+        qty = _safe_float(
+            merged.get("contracts")
+            or merged.get("positionAmt")
+            or merged.get("qty")
+            or merged.get("size")
         )
-    for s in others:
-        side = str(s.get("side", "")).upper()
-        qty = float(s.get("contracts") or s.get("positionAmt") or s.get("size") or 0.0)
-        ep = float(s.get("entryPrice") or s.get("avgPrice") or 0.0)
-        mp = float(s.get("markPrice") or s.get("mark") or ep)
-        pnl = (mp - ep) * qty * (1.0 if side == "LONG" else -1.0)
-        parts.append(
-            "<b>👤 Manual/Otras</b>\n"
-            f"• {s.get('symbol', '')} {side} {qty:.6f}\n"
-            f"• Entrada: {ep:,.2f} | Mark: {mp:,.2f}\n"
+        if qty <= 0:
+            continue
+        side = str(merged.get("side") or merged.get("positionSide") or "FLAT").upper()
+        entry_px = _safe_float(merged.get("entryPrice") or merged.get("avgPrice"))
+        mark_px = _safe_float(merged.get("markPrice") or merged.get("mark"))
+        pnl = 0.0
+        if entry_px > 0 and mark_px > 0:
+            pnl = (mark_px - entry_px) * qty
+            if side == "SHORT":
+                pnl = -pnl
+        entry_txt = f"{entry_px:,.2f}" if entry_px > 0 else "—"
+        mark_txt = f"{mark_px:,.2f}" if mark_px > 0 else "—"
+        symbol_disp = merged.get("symbol") or merged.get("pair") or sym_raw
+        other_sections.append(
+            f"<b>{symbol_disp} {side}</b>\n"
+            f"• Qty: {qty:.6f}\n"
+            f"• Entrada: {entry_txt} | Mark: {mark_txt}\n"
             f"• PnL: {pnl:+,.2f}"
         )
 
-    await message.reply_html("\n\n".join(parts) if parts else "No hay posiciones abiertas.")
+    if other_sections:
+        sections.append("<b>📈 Otras posiciones</b>")
+        sections.append("\n\n".join(other_sections))
+
+    await message.reply_html("\n\n".join(sections))
 
 
 # Valores por defecto para TP/SL expresados como % del precio de entrada.
@@ -1537,83 +1691,6 @@ async def cerrar_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.effective_message
     if app is None or message is None:
         return
-
-    symbol = app.config.get("symbol", "BTC/USDT") if getattr(app, "config", None) else "BTC/USDT"
-    if getattr(app, "is_live", False):
-        try:
-            pos = await app.exchange.get_open_position(symbol)
-        except Exception:
-            pos = None
-        if pos:
-            side_pos = str(pos.get("side") or pos.get("positionSide") or "").upper()
-            try:
-                qty_val = float(
-                    pos.get("contracts")
-                    or pos.get("positionAmt")
-                    or pos.get("size")
-                    or pos.get("qty")
-                    or 0.0
-                )
-            except Exception:
-                qty_val = 0.0
-            qty_val = abs(qty_val)
-            if side_pos in {"LONG", "SHORT"} and qty_val > 0:
-                client = trading.get_live_client()
-                if client is None:
-                    await message.reply_text("No hay cliente LIVE disponible para cerrar la posición.")
-                    return
-                try:
-                    rules = await asyncio.to_thread(trading.get_symbol_rules, symbol)
-                except Exception as exc:
-                    await message.reply_text(f"Error al obtener filtros del símbolo: {exc}")
-                    return
-                try:
-                    result = await asyncio.to_thread(
-                        trading.close_position_hard,
-                        client,
-                        symbol,
-                        side_pos,
-                        qty_val if side_pos == "LONG" else -qty_val,
-                        int(rules.get("price_precision") or 2),
-                        int(rules.get("qty_precision") or 0),
-                    )
-                except Exception as exc:
-                    await message.reply_text(f"Error al cerrar: {exc}")
-                    return
-                if not result.get("ok"):
-                    await message.reply_text(
-                        f"Error al cerrar: {result.get('error') or result.get('msg')}"
-                    )
-                    return
-                await asyncio.to_thread(trading.bootstrap_real_state)
-                qty_closed = float(result.get("qty") or qty_val)
-                price_val = result.get("price")
-                close_msg = (
-                    "<b>✅ Cerré la posición del BOT</b>\n"
-                    f"• Lado: <b>{side_pos}</b>\n"
-                    f"• Cantidad: {qty_closed:.6f}"
-                )
-                if price_val not in (None, ""):
-                    try:
-                        close_msg += f"\n• Precio de cierre: {float(price_val):,.2f}"
-                    except Exception:
-                        pass
-                await message.reply_html(close_msg)
-                try:
-                    app.manual_block_until = time.time() + 600
-                    log = getattr(app, "log", None) or getattr(app, "logger", None)
-                    if log is not None:
-                        log.info(
-                            "Cooldown activado por cierre manual: 10 min sin entradas nuevas."
-                        )
-                    return
-                except Exception:
-                    if getattr(app, "logger", None) is not None:
-                        app.logger.debug(
-                            "No se pudo establecer el cooldown manual tras cierre.",
-                            exc_info=True,
-                        )
-                    return
 
     try:
         result = await app.close_all()

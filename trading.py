@@ -747,7 +747,7 @@ def place_order_safe(side: str, qty: float, price: float | None = None, **kwargs
 
 
 def close_now(symbol: str | None = None):
-    """Cierra la posición actual de inmediato usando orden MARKET compatible con hedge."""
+    """Cierra la posición del BOT con orden MARKET reduce-only usando la qty propia."""
 
     ensure_initialized()
     if POSITION_SERVICE is None or BROKER is None:
@@ -755,72 +755,61 @@ def close_now(symbol: str | None = None):
 
     status = POSITION_SERVICE.get_status() or {}
     side = (status.get("side") or "FLAT").upper()
-    target_symbol = symbol or status.get("symbol") or getattr(S, "symbol", None) or "BTC/USDT"
-    runtime_mode = (runtime_get_mode() or "paper").lower()
-    live_client = get_live_client() if runtime_mode in {"real", "live"} else None
-
     qty = float(status.get("qty") or status.get("pos_qty") or 0.0)
-    used_live = False
-    live_summary: Optional[Dict[str, Any]] = None
-
-    if live_client is not None:
-        live_info = _fetch_live_position(live_client, _normalize_symbol(target_symbol))
-        if live_info:
-            side = str(live_info.get("side") or side).upper()
-            qty = float(live_info.get("qty") or 0.0)
-            if qty <= 0:
-                return {"status": "noop", "msg": "No hay posición live"}
-            used_live = True
-        else:
-            return {"status": "noop", "msg": "No hay posición abierta en el exchange"}
+    qty = abs(qty)
 
     if side == "FLAT" or qty <= 0:
         return {"status": "noop", "msg": "Sin posición para cerrar"}
 
+    target_symbol = (
+        symbol
+        or status.get("symbol")
+        or getattr(S, "symbol", None)
+        or "BTC/USDT"
+    )
+
     close_side = "SELL" if side == "LONG" else "BUY"
 
-    if used_live and live_client is not None:
-        rules = _extract_symbol_rules(live_client, target_symbol)
-        live_summary = close_position_hard(
-            live_client,
-            target_symbol,
-            side,
-            qty,
-            price_precision=int(rules.get("price_precision") or 2),
-            qty_precision=int(rules.get("qty_precision") or 0),
-        )
-        if not live_summary.get("ok"):
-            return {
-                "status": "error",
-                "msg": live_summary.get("error") or live_summary.get("msg") or "No se pudo cerrar posición",
-                "details": live_summary,
-            }
-        result_payload = live_summary.get("order")
-        close_price = live_summary.get("price")
-        effective_qty = float(live_summary.get("qty") or qty)
-    else:
-        hedged = _config_uses_hedge(RAW_CONFIG)
-        kwargs = dict(order_type="market", symbol=target_symbol, reduce_only=True)
-        if hedged and side in {"LONG", "SHORT"}:
-            kwargs["positionSide"] = side
-        result_payload = BROKER.place_order(close_side, qty, None, **kwargs)
-        fallback_px = get_latest_price(target_symbol)
-        if fallback_px is None:
-            fallback_px = status.get("mark")
-        close_price = _infer_fill_price(result_payload, fallback_px)
-        effective_qty = qty
+    hedged = _config_uses_hedge(RAW_CONFIG)
+    broker_client = getattr(BROKER, "client", None)
+    client_options = getattr(broker_client, "options", None) if broker_client else None
+    if isinstance(client_options, dict):
+        if "hedgeMode" in client_options:
+            hedged = bool(client_options.get("hedgeMode"))
+        elif "hedge_mode" in client_options:
+            hedged = bool(client_options.get("hedge_mode"))
+    order_kwargs: Dict[str, Any] = {
+        "order_type": "market",
+        "symbol": target_symbol,
+        "reduce_only": True,
+        "newOrderRespType": "RESULT",
+    }
+    if hedged and side in {"LONG", "SHORT"}:
+        order_kwargs["positionSide"] = side
+
+    result_payload = BROKER.place_order(close_side, qty, None, **order_kwargs)
+
+    fallback_px = get_latest_price(target_symbol)
+    if fallback_px is None:
+        fallback_px = status.get("mark") or status.get("mark_price")
+    close_price = _infer_fill_price(result_payload, fallback_px)
+    effective_qty = qty
 
     try:
         if POSITION_SERVICE is not None and getattr(POSITION_SERVICE, "store", None):
-            if not used_live and isinstance(result_payload, dict) and result_payload.get("sim"):
+            is_sim = isinstance(result_payload, dict) and result_payload.get("sim")
+            if is_sim:
                 try:
                     POSITION_SERVICE.refresh()
                 except Exception:
                     logger.warning("PAPER: refresh tras cierre falló", exc_info=True)
-            else:
+            elif close_price is not None:
                 bot_side = "SHORT" if side == "LONG" else "LONG"
-                if close_price is not None:
-                    POSITION_SERVICE.apply_fill(bot_side, float(effective_qty), float(close_price))
+                POSITION_SERVICE.apply_fill(
+                    bot_side,
+                    float(effective_qty),
+                    float(close_price),
+                )
         fee_paid = _extract_order_fee(result_payload)
         if close_price is not None:
             try:
@@ -828,10 +817,8 @@ def close_now(symbol: str | None = None):
             except Exception:
                 logger.debug("No se pudo persistir cierre en state_store.", exc_info=True)
     except Exception:
-        if not used_live and isinstance(result_payload, dict) and result_payload.get("sim"):
-            logger.warning("PAPER: no se pudo reflejar cierre en store.", exc_info=True)
-        else:
-            logger.debug("No se pudo reflejar cierre en store.", exc_info=True)
+        logger.debug("No se pudo reflejar cierre en store.", exc_info=True)
+
     summary: dict[str, Any] = {
         "status": "ok",
         "order": result_payload,
@@ -841,8 +828,6 @@ def close_now(symbol: str | None = None):
     }
     if close_price is not None:
         summary["close_price"] = float(close_price)
-    if live_summary is not None:
-        summary["details"] = live_summary
     return summary
 
 

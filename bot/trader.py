@@ -156,15 +156,6 @@ class Trader:
                 logging.debug("PAPER check_open_position fallo: %s", exc)
             return self._open_position
 
-        # 2) LIVE: si tenemos exchange, tratemos de obtener la posición real
-        if exchange and hasattr(exchange, "fetch_positions"):
-            try:
-                positions = await exchange.fetch_positions(self.config.get('symbol', 'BTC/USDT'))
-                if positions:
-                    self._open_position = positions[0]
-                    return self._open_position
-            except Exception as exc:
-                logging.debug("No se pudo obtener la posición desde el exchange: %s", exc)
         return self._open_position
 
     async def set_position(self, position_data: Optional[Dict[str, Any]]) -> None:
