@@ -38,7 +38,12 @@ from bot.telemetry.command_registry import CommandRegistry, normalize
 from bot.telemetry.formatter import open_msg
 from state_store import load_state, update_open_position
 import trading
-from position_service import EPS_QTY, fetch_live_equity_usdm, split_total_vs_bot
+from position_service import (
+    EPS_QTY,
+    PositionService,
+    fetch_live_equity_usdm,
+    split_total_vs_bot,
+)
 
 logger = logging.getLogger("telegram")
 
@@ -143,6 +148,7 @@ async def _compute_position_split(app) -> tuple[Dict[str, Dict[str, Any]], float
         app.config.get("symbol", "BTC/USDT") if getattr(app, "config", None) else "BTC/USDT"
     )
     symbol_norm = _normalized_symbol(symbol_cfg)
+    mode = str(get_mode() or "").lower()
 
     exchange = getattr(app, "exchange", None)
     acct_pos: Optional[Dict[str, Any]] = None
@@ -186,6 +192,65 @@ async def _compute_position_split(app) -> tuple[Dict[str, Dict[str, Any]], float
             if mark_price:
                 break
     mark_val = mark_price if mark_price and mark_price > 0 else 0.0
+
+    if mode == "real":
+        status = None
+        try:
+            trading.ensure_initialized("real")
+        except Exception:
+            logger.debug("No se pudo inicializar trading en modo real.", exc_info=True)
+
+        svc = trading.POSITION_SERVICE
+        if svc is None:
+            try:
+                svc = PositionService(
+                    live_client=getattr(app, "exchange", None),
+                    symbol=symbol_cfg,
+                )
+            except Exception:
+                svc = None
+
+        if svc is not None:
+            try:
+                status = svc.get_status()
+            except Exception:
+                logger.debug("No se pudo obtener status live desde PositionService.", exc_info=True)
+
+        if not status and isinstance(acct_pos, dict):
+            status = {
+                "side": str(acct_pos.get("side") or acct_pos.get("positionSide") or "FLAT").upper(),
+                "qty": _safe_float(acct_pos.get("qty") or acct_pos.get("positionAmt")),
+                "entry_price": _safe_float(
+                    acct_pos.get("entry_price")
+                    or acct_pos.get("entryPrice")
+                    or acct_pos.get("avgPrice")
+                ),
+                "mark": _safe_float(
+                    acct_pos.get("markPrice")
+                    or acct_pos.get("mark_price")
+                    or mark_val
+                ),
+                "pnl": _safe_float(acct_pos.get("pnl")),
+            }
+
+        total_part = {
+            "side": str((status or {}).get("side") or "FLAT").upper(),
+            "qty": round(_safe_float((status or {}).get("qty")), 6),
+            "entry_price": round(
+                _safe_float((status or {}).get("entry_price") or (status or {}).get("entryPrice")),
+                6,
+            ),
+            "pnl": round(_safe_float((status or {}).get("pnl")), 2),
+        }
+        flat_part = {"side": "FLAT", "qty": 0.0, "entry_price": 0.0, "pnl": 0.0}
+        mark_candidate = _safe_float(
+            (status or {}).get("mark")
+            or (status or {}).get("mark_price")
+            or (status or {}).get("markPrice")
+            or mark_val
+        )
+        return {"total": total_part, "bot": flat_part, "manual": flat_part}, mark_candidate, symbol_cfg
+
     split = split_total_vs_bot(acct_pos, bot_pos, mark_val)
     return split, mark_val, symbol_cfg
 
