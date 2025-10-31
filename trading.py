@@ -15,7 +15,7 @@ from position_service import PositionService, EPS_QTY
 from paper_store import PaperStore
 from state_store import on_close_filled, on_open_filled
 from bot.runtime_state import get_mode as runtime_get_mode
-from paths import get_data_dir, get_live_store_path, get_paper_store_path
+from paths import get_data_dir, get_paper_store_path
 
 logger = logging.getLogger(__name__)
 
@@ -556,8 +556,8 @@ def rebuild(mode: Mode) -> None:
     ACTIVE_DATA_DIR = get_data_dir()
     bot_store = ACTIVE_PAPER_STORE or PaperStore(path=get_paper_store_path(), start_equity=S.start_equity)
     if mode != "simulado":
-        live_store_path = get_live_store_path()
-        bot_store = PaperStore(path=live_store_path, start_equity=S.start_equity)
+        # En REAL: NO reasignar bot_store a un PaperStore de disco
+        pass
 
     shared_store = getattr(BROKER, "store", None)
     if shared_store is not None:
