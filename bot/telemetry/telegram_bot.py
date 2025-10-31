@@ -1941,9 +1941,9 @@ async def precio_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     parts = text.split()
     symbols: Iterable[str]
     if len(parts) >= 2:
-        symbols = [parts[1].upper()]
+        tok = parts[1].upper(); tok = tok.split(':',1)[0] if ':' in tok else tok; symbols = [tok]
     else:
-        symbols = getattr(engine, "symbols", []) or list(getattr(engine, "price_cache", {}).keys()) or ["BTC/USDT:USDT"]
+        symbols = getattr(engine, "symbols", []) or list(getattr(engine, "price_cache", {}).keys()) or ["BTC/USDT"]
     responses = []
     for sym in symbols:
         price = None
