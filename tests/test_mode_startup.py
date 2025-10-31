@@ -7,6 +7,12 @@ import config
 from paper_store import PaperStore
 
 
+def _get_trading_module():
+    import trading
+
+    return trading
+
+
 def _reset_paths(monkeypatch):
     import paths
 
@@ -22,7 +28,7 @@ def _reset_paths(monkeypatch):
 
 
 def _reset_trading_state():
-    import trading
+    trading = _get_trading_module()
 
     trading.BROKER = None
     trading.POSITION_SERVICE = None
@@ -91,17 +97,16 @@ def test_startup_real_env_persists_and_live_store(tmp_path, monkeypatch):
     cfg_disk = config.load_raw_config(str(cfg_path))
     assert str(cfg_disk.get("trading_mode")).lower() == "real"
 
-    import trading
+    trading = _get_trading_module()
     from paths import get_live_store_path
 
     _reset_trading_state()
 
-    from config import S
-
     def _fake_build_public_ccxt():
+        settings = config.S
         return SimpleNamespace(
-            apiKey=getattr(S, "binance_api_key", None),
-            secret=getattr(S, "binance_api_secret", None),
+            apiKey=getattr(settings, "binance_api_key", None),
+            secret=getattr(settings, "binance_api_secret", None),
         )
 
     monkeypatch.setattr(trading, "_build_public_ccxt", _fake_build_public_ccxt)
@@ -136,19 +141,18 @@ def test_runtime_flip_preserves_live_store(tmp_path, monkeypatch):
     cfg = config.load_raw_config(str(cfg_path))
     mode_manager.ensure_startup_mode(cfg, env_mode="real", persist=True)
 
-    import trading
+    trading = _get_trading_module()
     from paths import get_live_store_path, get_paper_store_path
 
     _reset_trading_state()
 
     live_store_path = get_live_store_path()
 
-    from config import S
-
     def _fake_build_public_ccxt():
+        settings = config.S
         return SimpleNamespace(
-            apiKey=getattr(S, "binance_api_key", None),
-            secret=getattr(S, "binance_api_secret", None),
+            apiKey=getattr(settings, "binance_api_key", None),
+            secret=getattr(settings, "binance_api_secret", None),
         )
 
     monkeypatch.setattr(trading, "_build_public_ccxt", _fake_build_public_ccxt)
@@ -171,7 +175,8 @@ def test_runtime_flip_preserves_live_store(tmp_path, monkeypatch):
 
 def test_exchange_respects_paper_mode(tmp_path, monkeypatch):
     from bot.exchange import Exchange
-    import trading
+
+    trading = _get_trading_module()
 
     data_dir = tmp_path / "data"
     monkeypatch.setenv("DATA_DIR", str(data_dir))

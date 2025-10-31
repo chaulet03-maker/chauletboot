@@ -15,6 +15,18 @@ from bot.runtime_state import get_mode as runtime_get_mode
 from bot.price_ws import PriceStream
 
 
+def _get_trading_module():
+    import trading
+
+    return trading
+
+
+def _get_brokers_module():
+    import brokers
+
+    return brokers
+
+
 logger = logging.getLogger(__name__)
 
 def create_order_smart(
@@ -171,7 +183,7 @@ class Exchange:
         # En modo PAPER nunca interrogamos posiciones “live”.
         if self.is_paper():
             try:
-                import trading
+                trading = _get_trading_module()
 
                 svc = getattr(trading, "POSITION_SERVICE", None)
                 if svc is None:
@@ -250,9 +262,9 @@ class Exchange:
             }
         # Fallback nativo (python-binance)
         try:
-            from brokers import ACTIVE_LIVE_CLIENT
+            brokers = _get_brokers_module()
 
-            nat = ACTIVE_LIVE_CLIENT
+            nat = getattr(brokers, "ACTIVE_LIVE_CLIENT", None)
             if nat and not self.is_paper():
                 acct = await asyncio.to_thread(nat.futures_account)
                 for pos in acct.get("positions", []):
@@ -335,9 +347,9 @@ class Exchange:
 
         # 2) Fallback nativo (python-binance)
         try:
-            from brokers import ACTIVE_LIVE_CLIENT
+            brokers = _get_brokers_module()
 
-            nat = ACTIVE_LIVE_CLIENT
+            nat = getattr(brokers, "ACTIVE_LIVE_CLIENT", None)
             if nat and not self.is_paper():
                 acct = await asyncio.to_thread(nat.futures_account)
                 for pos in acct.get("positions", []):
@@ -423,7 +435,7 @@ class Exchange:
         # En modo PAPER devolvemos el equity del PaperStore/pos service.
         if self.is_paper():
             try:
-                import trading
+                trading = _get_trading_module()
 
                 svc = getattr(trading, "POSITION_SERVICE", None)
                 if svc is not None:
@@ -463,9 +475,9 @@ class Exchange:
 
         # 2) Fallback nativo (python-binance): wallet de USD-M (solo si runtime live)
         try:
-            from brokers import ACTIVE_LIVE_CLIENT  # client python-binance si estás en REAL
+            brokers = _get_brokers_module()  # client python-binance si estás en REAL
 
-            nat = ACTIVE_LIVE_CLIENT
+            nat = getattr(brokers, "ACTIVE_LIVE_CLIENT", None)
             if nat and not self.is_paper():
                 # futures_account_balance devuelve lista de assets de la wallet USDM
                 data = await asyncio.to_thread(nat.futures_account_balance)
@@ -486,7 +498,7 @@ class Exchange:
         sl: float | None = None,
         tp: float | None = None,
     ) -> dict[str, Any]:
-        import trading
+        trading = _get_trading_module()
 
         broker = getattr(trading, "BROKER", None)
         if broker is None:

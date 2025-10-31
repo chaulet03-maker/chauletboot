@@ -853,8 +853,6 @@ class RiskSizingBacktester:
             anchor_biased = price + k * (anchor_raw - price)
         donde k = self.anchor_bias_frac (1.0 = sin cambio; 0.5 = 50% hacia price).
         """
-        import numpy as np
-
         if self.grid_anchor == "ema30":
             raw = row.get("ema30", np.nan)
         elif self.grid_anchor == "ema200_4h":
@@ -873,8 +871,6 @@ class RiskSizingBacktester:
         return float(price + k * (float(raw) - price))
 
     def _micro_anchor_price(self, row: pd.Series) -> Optional[float]:
-        import numpy as np
-
         if self.micro_anchor == "ema50":
             val = row.get("ema50", np.nan)
         else:
@@ -953,8 +949,6 @@ class RiskSizingBacktester:
     def _signal_micro(self, row: pd.Series) -> Optional[str]:
         if not self.enable_micro:
             return None
-
-        import numpy as np
 
         c = float(row["close"])
         atr = float(row["atr"])
