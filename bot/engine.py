@@ -1628,6 +1628,8 @@ class TradingApp:
             except Exception:
                 self.logger.debug("No se pudo actualizar el store con la posición live.", exc_info=True)
 
+        is_paper_runtime = _runtime_is_paper()
+
         try:
             pos = create_position(
                 symbol=sym,
@@ -1637,13 +1639,13 @@ class TradingApp:
                 leverage=float(leverage_i),
                 mode="live",
             )
-            if _runtime_is_paper():
+            if is_paper_runtime:
                 persist_open(pos)
         except Exception:
             self.logger.debug("No se pudo persistir la posición live en state_store.", exc_info=True)
 
         try:
-            if _runtime_is_paper():
+            if is_paper_runtime:
                 if hasattr(self.trader, "_open_position"):
                     self.trader._open_position = {
                         "symbol": sym,
