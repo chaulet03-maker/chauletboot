@@ -168,11 +168,13 @@ async def _compute_position_split(app) -> tuple[Dict[str, Dict[str, Any]], float
 
     trader = getattr(app, "trader", None)
     bot_pos = None
-    if trader and hasattr(trader, "check_open_position"):
+    if mode == "simulado" and trader and hasattr(trader, "check_open_position"):
         try:
             bot_pos = await trader.check_open_position(exchange=None)
         except Exception:
             bot_pos = None
+    else:
+        bot_pos = None
 
     mark_price = None
     if exchange and hasattr(exchange, "get_current_price"):

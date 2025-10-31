@@ -107,6 +107,13 @@ def _runtime_mode_value() -> str:
         return "paper"
 
 
+def _runtime_is_paper() -> bool:
+    try:
+        return (runtime_get_mode() or "paper").lower() not in {"real", "live"}
+    except Exception:
+        return True
+
+
 class _EngineBrokerAdapter:
     def __init__(self, app: "TradingApp"):
         self.app = app
@@ -1630,19 +1637,21 @@ class TradingApp:
                 leverage=float(leverage_i),
                 mode="live",
             )
-            persist_open(pos)
+            if _runtime_is_paper():
+                persist_open(pos)
         except Exception:
             self.logger.debug("No se pudo persistir la posición live en state_store.", exc_info=True)
 
         try:
-            if hasattr(self.trader, "_open_position"):
-                self.trader._open_position = {
-                    "symbol": sym,
-                    "side": side_bot,
-                    "contracts": qty_abs,
-                    "entryPrice": avg_bot_f,
-                    "markPrice": mark_val,
-                }
+            if _runtime_is_paper():
+                if hasattr(self.trader, "_open_position"):
+                    self.trader._open_position = {
+                        "symbol": sym,
+                        "side": side_bot,
+                        "contracts": qty_abs,
+                        "entryPrice": avg_bot_f,
+                        "markPrice": mark_val,
+                    }
         except Exception:
             self.logger.debug("No se pudo actualizar la cache del trader con la posición live.", exc_info=True)
 
