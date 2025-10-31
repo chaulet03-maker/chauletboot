@@ -27,7 +27,7 @@ def _ensure_numeric(df: pd.DataFrame, cols: Iterable[str]) -> pd.DataFrame:
 def _normalize_ts(df: pd.DataFrame, ts_col: str = "ts") -> pd.DataFrame:
     """
     Asegura que ts sea datetime UTC, ordenado asc y sin duplicados.
-    Si hay duplicados en ts, se conserva la **última** fila.
+    Si hay duplicados en ts, **se eliminan todas** las filas repetidas.
     """
     out = df.copy()
     if ts_col not in out.columns:
@@ -38,8 +38,8 @@ def _normalize_ts(df: pd.DataFrame, ts_col: str = "ts") -> pd.DataFrame:
     out = out.dropna(subset=[ts_col])
     # Ordenar por ts
     out = out.sort_values(ts_col, kind="mergesort")
-    # Quitar duplicados en ts (mantener la última lectura)
-    out = out.drop_duplicates(subset=[ts_col], keep="last").reset_index(drop=True)
+    # Quitar duplicados en ts (eliminar TODAS las entradas repetidas)
+    out = out.drop_duplicates(subset=[ts_col], keep=False).reset_index(drop=True)
     return out
 
 
@@ -71,7 +71,7 @@ def _ensure_ohlc_schema(df: pd.DataFrame) -> pd.DataFrame:
     out = (
         out.dropna(subset=["ts"])
            .sort_values("ts")
-           .drop_duplicates("ts", keep="last")
+           .drop_duplicates("ts", keep=False)
            .reset_index(drop=True)
     )
     for c in ["open", "high", "low", "close", "volume"]:
