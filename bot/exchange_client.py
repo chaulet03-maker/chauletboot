@@ -12,28 +12,57 @@ _CCXT = None
 
 
 def get_ccxt() -> ccxt.Exchange:
+    """Crea un singleton CCXT para Binance USDM leyendo .env y admitiendo *_REAL/*_TEST."""
     global _CCXT
     if _CCXT is not None:
         return _CCXT
-    api_key = os.getenv("BINANCE_API_KEY") or os.getenv("binance_api_key")
-    api_secret = os.getenv("BINANCE_API_SECRET") or os.getenv("binance_api_secret")
-    ex = ccxt.binanceusdm({
+
+    # Cargar .env si existe (defensivo)
+    try:
+        from dotenv import load_dotenv  # no rompe si no está
+        load_dotenv()
+    except Exception:
+        pass
+
+    use_testnet = (os.getenv("BINANCE_UMFUTURES_TESTNET", "false").lower() == "true")
+
+    # Pares de variables admitidas (en orden de preferencia según testnet)
+    candidates = [
+        ("BINANCE_API_KEY_TEST", "BINANCE_API_SECRET_TEST"),
+        ("BINANCE_API_KEY_REAL", "BINANCE_API_SECRET_REAL"),
+        ("BINANCE_API_KEY", "BINANCE_API_SECRET"),
+        ("BINANCE_KEY", "BINANCE_SECRET"),
+    ]
+    ordered = (
+        [candidates[0], candidates[1], candidates[2], candidates[3]] if use_testnet
+        else [candidates[1], candidates[2], candidates[3], candidates[0]]
+    )
+
+    api_key = api_secret = None
+    for k, s in ordered:
+        ak = os.getenv(k) or os.getenv(k.lower())
+        sk = os.getenv(s) or os.getenv(s.lower())
+        if ak and sk:
+            api_key, api_secret = ak, sk
+            break
+
+    if not api_key or not api_secret:
+        raise RuntimeError("Faltan credenciales Binance USDM: definí BINANCE_API_KEY/_SECRET (o *_REAL / *_TEST).")
+
+    params = {
         "apiKey": api_key,
         "secret": api_secret,
         "enableRateLimit": True,
-        "timeout": 20000,
-        "options": {
-            "defaultType": "future",
-            "adjustForTimeDifference": True,
-            "warnOnFetchOHLCVLimitArgument": False,
-        },
+        "options": {"defaultType": "future", "adjustForTimeDifference": True},
         "recvWindow": 10000,
-    })
+    }
+    ex = ccxt.binanceusdm(params)
     try:
-        ex.load_markets(reload=True)
-    except Exception as exc:
-        logger.warning("No se pudo cargar mercados vía CCXT: %s", exc)
-        raise RuntimeError("Faltan credenciales (ccxt) o sin conectividad") from exc
+        if use_testnet and hasattr(ex, "set_sandbox_mode"):
+            ex.set_sandbox_mode(True)
+    except Exception:
+        pass
+
     _CCXT = ex
     return ex
 
