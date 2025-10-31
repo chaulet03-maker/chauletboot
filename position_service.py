@@ -21,72 +21,53 @@ EPS_QTY = 1e-9
 
 
 def fetch_live_equity_usdm() -> float:
-    """Obtiene el equity real de la cuenta de Futuros USD-M (USDT)."""
-
-    # Import lazily to avoid circular dependencies during application start-up.
-    from bot.exchange_client import get_ccxt
-
-    client = get_ccxt()
+    """Equity para USDⓈ-M (USDT)."""
 
     try:
-        bal = client.fetch_balance({"type": "future"})
-        if isinstance(bal, dict):
-            usdt = bal.get("USDT")
-            if isinstance(usdt, dict):
-                total = usdt.get("total")
-                if total is not None:
-                    return float(total)
-                alt_total = (usdt.get("free", 0.0) or 0.0) + (usdt.get("used", 0.0) or 0.0)
-                return float(alt_total)
+        from bot import exchange_client
+
+        client = exchange_client.get_ccxt()
+        # Ruta estándar CCXT
+        try:
+            bal = client.fetch_balance({"type": "future"})
+            # ccxt puede exponerlo en bal['USDT']['total'] o similar
+            for key in ("total", "free", "used"):
+                try:
+                    v = bal.get("USDT", {}).get(key)
+                    if v is not None:
+                        return float(v)
+                except Exception:
+                    pass
+            # Fallback: algunos ccxt exponen en info
             info = bal.get("info") or {}
             if isinstance(info, dict):
-                twb = info.get("totalWalletBalance")
-                if twb is not None:
-                    return float(twb)
-                assets = info.get("assets") or []
-                for asset in assets:
-                    if (asset or {}).get("asset") == "USDT":
-                        for key in ("walletBalance", "marginBalance", "crossWalletBalance"):
-                            value = (asset or {}).get(key)
-                            if value is not None:
-                                return float(value)
-    except Exception:
-        logger.debug("fetch_balance(type=future) falló; intento fallback", exc_info=True)
+                assets = info.get("assets") or info.get("balances") or []
+                if isinstance(assets, list):
+                    for it in assets:
+                        if (it or {}).get("asset") == "USDT":
+                            for k in ("walletBalance", "balance", "cashBalance", "availableBalance"):
+                                v = (it or {}).get(k)
+                                if v is not None:
+                                    return float(v)
+        except Exception:
+            logger.debug("fetch_balance(type=future) fallo", exc_info=True)
 
-    # Fallback robusto: /fapi/v2/balance (lista por asset) y sumas
-    try:
-        if hasattr(client, "fapiPrivateV2GetBalance"):
-            bal_list = client.fapiPrivateV2GetBalance()
-            # Busca USDT
-            if isinstance(bal_list, (list, tuple)):
-                for it in bal_list:
-                    if (it or {}).get("asset") == "USDT":
-                        # 'balance' o 'walletBalance' o 'cashBalance' (algunos tenants)
-                        for key in ("balance", "walletBalance", "cashBalance", "availableBalance"):
-                            v = (it or {}).get(key)
-                            if v is not None:
-                                return float(v)
-    except Exception:
-        logger.debug("fapiPrivateV2GetBalance falló", exc_info=True)
+        # Fallback Binance nativo: /fapi/v2/balance
+        try:
+            if hasattr(client, "fapiPrivateV2GetBalance"):
+                lst = client.fapiPrivateV2GetBalance()
+                if isinstance(lst, list):
+                    for it in lst:
+                        if (it or {}).get("asset") == "USDT":
+                            for k in ("walletBalance", "balance", "cashBalance", "availableBalance"):
+                                v = (it or {}).get(k)
+                                if v is not None:
+                                    return float(v)
+        except Exception:
+            logger.debug("fapiPrivateV2GetBalance fallo", exc_info=True)
 
-    try:
-        if hasattr(client, "fapiPrivateV2GetAccount"):
-            acct = client.fapiPrivateV2GetAccount()
-        else:
-            acct = client.fapiPrivateGetAccount()
-        twb = acct.get("totalWalletBalance") if isinstance(acct, dict) else None
-        if twb is not None:
-            return float(twb)
-        assets = acct.get("assets") if isinstance(acct, dict) else []
-        for asset in assets or []:
-            if (asset or {}).get("asset") == "USDT":
-                for key in ("walletBalance", "marginBalance"):
-                    value = (asset or {}).get(key)
-                    if value is not None:
-                        return float(value)
     except Exception:
-        logger.debug("fapiPrivateV2GetAccount falló", exc_info=True)
-
+        logger.debug("fetch_live_equity_usdm() error", exc_info=True)
     return 0.0
 
 
