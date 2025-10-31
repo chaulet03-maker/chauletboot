@@ -1637,12 +1637,14 @@ class TradingApp:
                 leverage=float(leverage_i),
                 mode="live",
             )
+            # En REAL no persistimos posición del bot
             if _runtime_is_paper():
                 persist_open(pos)
         except Exception:
             self.logger.debug("No se pudo persistir la posición live en state_store.", exc_info=True)
 
         try:
+            # En REAL no seteamos cache local de posición
             if _runtime_is_paper():
                 if hasattr(self.trader, "_open_position"):
                     self.trader._open_position = {
