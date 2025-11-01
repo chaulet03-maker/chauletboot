@@ -87,14 +87,65 @@ def _quantize_amount(
     if step > 0:
         qty = math.floor(qty / step) * step
 
+    if (
+        qty <= 0
+        and step > 0
+        and min_notional > 0
+        and price is not None
+        and math.isfinite(step)
+    ):
+        try:
+            price_val = float(price)
+        except Exception:
+            price_val = 0.0
+        try:
+            raw_qty_val = float(raw_qty)
+        except Exception:
+            raw_qty_val = 0.0
+        if price_val > 0 and raw_qty_val > 0 and math.isfinite(raw_qty_val):
+            target_units = (min_notional / price_val) / step
+            if math.isfinite(target_units):
+                ceil_qty = math.ceil(target_units) * step
+                if ceil_qty > 0 and ceil_qty <= raw_qty_val * 1.10:
+                    qty = ceil_qty
+
     if min_qty > 0 and qty < min_qty:
         return 0.0
 
     if min_notional > 0 and price is not None:
         try:
-            if qty * float(price) < min_notional:
-                return 0.0
+            price_val = float(price)
         except Exception:
+            return 0.0
+        if price_val <= 0:
+            return 0.0
+        try:
+            current_notional = qty * price_val
+        except Exception:
+            return 0.0
+        if not math.isfinite(current_notional):
+            return 0.0
+        if current_notional < min_notional:
+            if step > 0 and price_val > 0:
+                target_units = (min_notional / price_val) / step
+                if math.isfinite(target_units):
+                    ceil_qty = math.ceil(target_units) * step
+                    try:
+                        raw_qty_val = float(raw_qty)
+                    except Exception:
+                        raw_qty_val = 0.0
+                    if (
+                        ceil_qty > 0
+                        and raw_qty_val > 0
+                        and math.isfinite(raw_qty_val)
+                        and ceil_qty <= raw_qty_val * 1.10
+                    ):
+                        qty = ceil_qty
+                        current_notional = qty * price_val
+                        if current_notional >= min_notional:
+                            if min_qty > 0 and qty < min_qty:
+                                return 0.0
+                            return qty
             return 0.0
 
     return qty
@@ -872,7 +923,11 @@ class TradingApp:
                 qty = float(qty_raw) if qty_raw is not None else 0.0
                 entry_px = float(position.get('entryPrice') or 0.0)
                 mark_px = float(position.get('markPrice') or position.get('mark') or entry_px)
-                sign = 1.0 if side == "LONG" else -1.0
+                sign = 0.0
+                if side == "LONG":
+                    sign = 1.0
+                elif side == "SHORT":
+                    sign = -1.0
                 pnl_now = (mark_px - entry_px) * qty * sign
 
                 if getattr(self, "_entry_ts", None) is None:
