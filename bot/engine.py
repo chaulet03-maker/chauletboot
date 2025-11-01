@@ -286,6 +286,10 @@ class TradingApp:
         except Exception:
             logging.debug("No pude blindar trader.set_position", exc_info=True)
 
+        # Throttle del sync live y cache de estado live (para logs)
+        self._live_sync_next_ts = 0.0
+        self._live_open_cached = None  # None/True/False
+
     @property
     def active_mode(self) -> str:
         return str(trading.ACTIVE_MODE).lower()
@@ -583,10 +587,17 @@ class TradingApp:
             logging.info("Iniciando ciclo de análisis de mercado...")
             # --- HARD-FLAT: si en REAL la cuenta está plana, limpiamos estado local y seguimos analizando ---
             if runtime_get_mode() == "real":
-                try:
-                    live_has = await asyncio.to_thread(self.sync_live_position)
-                except Exception:
-                    live_has = False
+                # Throttle: sincronizar como máximo cada 120s
+                now_ts = time.time()
+                do_sync = now_ts >= float(getattr(self, "_live_sync_next_ts", 0.0))
+                live_has = bool(getattr(self, "_live_open_cached", False))
+                if do_sync:
+                    try:
+                        live_has = await asyncio.to_thread(self.sync_live_position)
+                    except Exception:
+                        live_has = False
+                    self._live_sync_next_ts = now_ts + 120.0
+                    self._live_open_cached = live_has
                 if not live_has:
                     # limpiar cualquier rastro local para no “revivir” posiciones
                     try:
@@ -660,10 +671,16 @@ class TradingApp:
                 # --- En REAL nunca confiar en local si el exchange no reporta abierta ---
                 if runtime_get_mode() == "real":
                     # Primero confirmamos el estado LIVE desde el cliente real.
-                    try:
-                        live_has_open = await asyncio.to_thread(self.sync_live_position)
-                    except Exception:
-                        live_has_open = False
+                    now_ts = time.time()
+                    do_sync = now_ts >= float(getattr(self, "_live_sync_next_ts", 0.0))
+                    live_has_open = bool(getattr(self, "_live_open_cached", False))
+                    if do_sync:
+                        try:
+                            live_has_open = await asyncio.to_thread(self.sync_live_position)
+                        except Exception:
+                            live_has_open = False
+                        self._live_sync_next_ts = now_ts + 120.0
+                        self._live_open_cached = live_has_open
 
                     if not live_has_open:
                         # Cuenta FLAT → limpiamos y NO permitimos que nada rehidrate localmente
@@ -1550,6 +1567,7 @@ class TradingApp:
         Devuelve True si encontró y tomó control de una posición; False si no hay.
         """
 
+        prev_open = getattr(self, "_live_open_cached", None)
         symbol = getattr(self, "symbol", None) or self.config.get("symbol", "BTC/USDT")
         trading.ensure_initialized()
 
@@ -1629,10 +1647,17 @@ class TradingApp:
         store = getattr(service, "store", None)
 
         if abs(amount) <= 0.0:
-            self.logger.info(
-                "sync_live_position: sin posición LIVE para %s. Limpiando estado local.",
-                symbol,
-            )
+            # Loguear en INFO sólo si cambió de "había" a "no hay"
+            if prev_open is True:
+                self.logger.info(
+                    "sync_live_position: ahora SIN posición LIVE para %s. Limpio estado local.",
+                    symbol,
+                )
+            else:
+                self.logger.debug(
+                    "sync_live_position: sin posición LIVE para %s (sin cambios). Limpio estado local.",
+                    symbol,
+                )
             if store is not None:
                 try:
                     store.save(pos_qty=0.0, avg_price=0.0)
@@ -1651,6 +1676,7 @@ class TradingApp:
             except Exception:
                 self.logger.debug("No se pudo limpiar cache de trader al sincronizar.", exc_info=True)
             self.position_open = False
+            self._live_open_cached = False
             return False
 
         mode = "live" if self.is_live else "paper"
@@ -1681,6 +1707,7 @@ class TradingApp:
             except Exception:
                 self.logger.debug("No se pudo limpiar cache de trader al sincronizar.", exc_info=True)
             self.position_open = False
+            self._live_open_cached = False
             self.logger.info(
                 "sync_live_position: el bot está FLAT (puede haber posiciones manuales en la cuenta)."
             )
@@ -1728,12 +1755,22 @@ class TradingApp:
             self.logger.debug("No se pudo actualizar la cache del trader con la posición live.", exc_info=True)
 
         self.position_open = True
-        self.logger.info(
-            "sync_live_position: posición del BOT adoptada %s %.6f @ %.2f",
-            side_bot,
-            qty_abs,
-            avg_bot_f,
-        )
+        # INFO sólo si cambió de "no hay" a "hay"
+        if prev_open in (False, None):
+            self.logger.info(
+                "sync_live_position: posición LIVE adoptada %s %.6f @ %.2f",
+                side_bot,
+                qty_abs,
+                avg_bot_f,
+            )
+        else:
+            self.logger.debug(
+                "sync_live_position: posición LIVE ya presente %s %.6f @ %.2f",
+                side_bot,
+                qty_abs,
+                avg_bot_f,
+            )
+        self._live_open_cached = True
         parsed_entry_ts = None
         if entry_time_raw is not None:
             try:
