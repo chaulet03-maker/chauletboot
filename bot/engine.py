@@ -1005,7 +1005,7 @@ class TradingApp:
 
             if ban_hours_str and in_ban_hours(ban_hours_str):
                 logging.info("[RISK] Hora baneada (UTC). No se abre nueva posición.")
-                _emit_motive({"reasons": ["hora baneada"]})
+                _emit_motive({"reasons": ["ban_hours", "hora baneada"]})
                 return
 
             klines_1h = await self.exchange.get_klines('1h')
@@ -1401,6 +1401,16 @@ class TradingApp:
                     )
                 except Exception:
                     logging.debug("No se pudo notificar fallo de qty=0", exc_info=True)
+                _emit_motive(
+                    {
+                        "reasons": [
+                            "qty_rejected:minNotional/stepSize",
+                            reason,
+                        ]
+                    },
+                    price_value=price_signal,
+                    side_value=signal,
+                )
                 return
 
             def _finite_or_none(value: Any) -> Optional[float]:
@@ -1450,6 +1460,15 @@ class TradingApp:
                 filled = 0.0
             if filled <= 0:
                 logging.warning("Orden enviada pero SIN FILL (>0). No se anuncia apertura.")
+                _emit_motive(
+                    {
+                        "reasons": [
+                            "order_rejected:no_fill",
+                        ]
+                    },
+                    price_value=price_signal,
+                    side_value=signal,
+                )
                 return
 
             # 2) Esperar a que el store (POSITION_SERVICE) deje de estar FLAT
