@@ -2,11 +2,42 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Literal
 
 import brokers
 from paper_store import PaperStore
 from bot.runtime_state import get_mode as runtime_get_mode
+
+try:
+    from bot import ledger as ledger_module  # type: ignore
+except Exception:  # pragma: no cover - defensivo
+    ledger_module = None
+
+try:
+    from bot.identity import get_bot_id  # type: ignore
+except Exception:  # pragma: no cover - defensivo
+    def get_bot_id() -> str:  # type: ignore
+        return "bot"
+
+try:
+    from bot.exchange_client import normalize_symbol as normalize_exchange_symbol  # type: ignore
+except Exception:  # pragma: no cover - defensivo
+    def normalize_exchange_symbol(symbol: str) -> str:  # type: ignore
+        value = str(symbol or "").strip()
+        if not value:
+            return ""
+        value = value.upper()
+        if value.endswith(":USDT"):
+            return value
+        if value.endswith("/USDT"):
+            return f"{value}:USDT"
+        if value.endswith("USDT") and "/" not in value:
+            base = value[:-4]
+            return f"{base}/USDT:USDT"
+        return value
+
+
+Mode = Literal["simulado", "real"]
 
 
 def _runtime_is_paper() -> bool:
@@ -264,11 +295,114 @@ class PositionService:
         live_client: Optional[Any] = None,
         ccxt_client: Optional[Any] = None,
         symbol: str = "BTC/USDT",
+        mode: Mode | str | None = None,
     ) -> None:
         self.store = paper_store
         self.client = live_client
         self.public_client = ccxt_client or live_client
         self.symbol = symbol
+        self.mode: Mode = self._resolve_mode(mode)
+        self._ledger = ledger_module
+        self._bot_id: Optional[str] = None
+        if self._ledger is not None:
+            try:
+                self._bot_id = get_bot_id()
+            except Exception:  # pragma: no cover - defensivo
+                self._bot_id = None
+        self._cache: dict[str, dict[str, Any]] = {}
+        self._rehydrate_block_until: dict[str, float] = {}
+
+    @staticmethod
+    def _resolve_mode(mode: Mode | str | None) -> Mode:
+        if mode is None:
+            return "simulado" if _runtime_is_paper() else "real"
+        value = str(mode).strip().lower()
+        if value in {"real", "live"}:
+            return "real"
+        return "simulado"
+
+    def _cache_key(self, symbol: Optional[str] = None) -> str:
+        base = symbol or self.symbol or ""
+        normalized = normalize_exchange_symbol(base)
+        return normalized or base
+
+    def _ledger_symbol_key(self, symbol: Optional[str] = None) -> str:
+        base = symbol or self.symbol or ""
+        cleaned = base.replace("/", "")
+        return cleaned.upper()
+
+    def _ledger_mode(self) -> str:
+        return "paper" if self.mode == "simulado" else "live"
+
+    def _invalidate_cache(self, symbol: Optional[str] = None) -> None:
+        key = self._cache_key(symbol)
+        if key:
+            self._cache.pop(key, None)
+
+    def _block_rehydrate(self, symbol: Optional[str] = None, seconds: float = 120.0) -> None:
+        key = self._cache_key(symbol)
+        if not key:
+            return
+        self._rehydrate_block_until[key] = time.time() + float(seconds)
+
+    def _rehydrate_allowed(self, symbol: Optional[str] = None) -> bool:
+        key = self._cache_key(symbol)
+        if not key:
+            return True
+        until = self._rehydrate_block_until.get(key)
+        if until is None:
+            return True
+        if until <= time.time():
+            self._rehydrate_block_until.pop(key, None)
+            return True
+        return False
+
+    def _force_close_ledger(self, symbol: Optional[str] = None, *, reason: str = "exchange_flat") -> None:
+        if self._ledger is None:
+            return
+        if self._bot_id is None:
+            return
+        action = getattr(self._ledger, "force_close", None)
+        if action is None:
+            return
+        try:
+            action(self._ledger_mode(), self._bot_id, self._ledger_symbol_key(symbol), reason=reason)
+        except Exception:  # pragma: no cover - defensivo
+            logger.debug("No se pudo forzar cierre en ledger.", exc_info=True)
+
+    def _fetch_from_exchange(self, symbol: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        position = self._fetch_live_position()
+        if position is None:
+            return None
+        result = dict(position)
+        if symbol or self.symbol:
+            result.setdefault("symbol", symbol or self.symbol)
+        return result
+
+    def _rehydrate_from_ledger(self, symbol: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        if self.mode == "real":
+            return None
+        if self._ledger is None or self._bot_id is None:
+            return None
+        if not self._rehydrate_allowed(symbol):
+            return None
+        action = getattr(self._ledger, "bot_position", None)
+        if action is None:
+            return None
+        try:
+            qty, avg = action(self._ledger_mode(), self._bot_id, self._ledger_symbol_key(symbol))
+        except Exception:
+            logger.debug("No se pudo leer posición desde ledger.", exc_info=True)
+            return None
+        if abs(qty) <= EPS_QTY:
+            return None
+        side = "LONG" if qty > 0 else "SHORT"
+        return {
+            "symbol": symbol or self.symbol,
+            "side": side,
+            "qty": abs(float(qty)),
+            "entry_price": float(avg or 0.0),
+        }
 
     def refresh(self) -> None:
         """Recarga el estado desde el store compartido."""
@@ -276,15 +410,17 @@ class PositionService:
             return
         try:
             _ = self.store.load()
+            self._invalidate_cache()
         except Exception:
             raise
 
     # ------------------------------------------------------------------
     def mark_to_market(self, mark: float) -> None:
-        if not (_runtime_is_paper() and self.store):
+        if not (self.mode == "simulado" and self.store):
             return
         try:
             self.store.save(mark=float(mark))
+            self._invalidate_cache()
         except Exception:
             logger.debug("No se pudo actualizar mark del store paper.", exc_info=True)
 
@@ -340,7 +476,7 @@ class PositionService:
         return None
 
     def _maybe_refresh_paper_mark(self, state: dict[str, Any]) -> dict[str, Any]:
-        if not (_runtime_is_paper() and self.store):
+        if not (self.mode == "simulado" and self.store):
             return state
         updated = int(state.get("updated") or 0)
         mark = float(state.get("mark") or 0.0)
@@ -368,6 +504,16 @@ class PositionService:
         pos_qty = float(state.get("pos_qty", 0.0) or 0.0)
         avg_price = float(state.get("avg_price", 0.0) or 0.0)
         mark = float(state.get("mark", 0.0) or 0.0)
+        if abs(pos_qty) <= EPS_QTY:
+            ledger_state = self._rehydrate_from_ledger(self.symbol)
+            if ledger_state is not None:
+                side_ledger = str(ledger_state.get("side") or "FLAT").upper()
+                qty_ledger = float(ledger_state.get("qty") or 0.0)
+                if side_ledger == "SHORT":
+                    pos_qty = -abs(qty_ledger)
+                else:
+                    pos_qty = abs(qty_ledger)
+                avg_price = float(ledger_state.get("entry_price") or avg_price)
         side = "FLAT"
         if pos_qty > 0:
             side = "LONG"
@@ -487,32 +633,52 @@ class PositionService:
             except Exception:
                 logger.debug("No se pudo obtener markPrice privado.", exc_info=True)
 
-        live_position = self._fetch_live_position()
+        store_has_pos = False
+        if self.store is not None:
+            try:
+                state_live = self.store.load() or {}
+                pos_store = float(state_live.get("pos_qty") or 0.0)
+                store_has_pos = abs(pos_store) > EPS_QTY
+            except Exception:
+                logger.debug("No se pudo leer store live", exc_info=True)
+
+        live_position = self._fetch_from_exchange(self.symbol)
+        exchange_flat = True
+        if live_position is not None:
+            try:
+                qty_live = float(live_position.get("qty") or 0.0)
+            except Exception:
+                qty_live = 0.0
+            exchange_flat = abs(qty_live) <= EPS_QTY
+        
+        if self.mode == "real" and exchange_flat and store_has_pos:
+            self._invalidate_cache(self.symbol)
+            if self.store is not None:
+                try:
+                    self.store.save(pos_qty=0.0, avg_price=0.0)
+                except Exception:
+                    logger.debug("No se pudo limpiar el store en live.", exc_info=True)
+            self._force_close_ledger(self.symbol, reason="exchange_flat")
+            self._block_rehydrate(self.symbol)
+            logger.info(
+                "Reconciliación: exchange FLAT -> store limpiado, ledger cerrado y bloqueo de rehidratación."
+            )
 
         pos_qty = 0.0
         avg_price = 0.0
         side = "FLAT"
 
-        if live_position:
+        if live_position and not exchange_flat:
             side = str(live_position.get("side") or "FLAT").upper()
             qty_live = float(live_position.get("qty") or 0.0)
             avg_price = float(live_position.get("entry_price") or 0.0)
             mark_live = float(live_position.get("mark_price") or 0.0)
             if mark <= 0 and mark_live > 0:
                 mark = mark_live
-            if side == "SHORT":
-                pos_qty = -qty_live
-            else:
-                pos_qty = qty_live
-
-        if not live_position and self.store:
-            try:
-                state = self.store.load()
-                pos_qty = float(state.get("pos_qty") or 0.0)
-                avg_price = float(state.get("avg_price") or 0.0)
-                side = "LONG" if pos_qty > 0 else "SHORT" if pos_qty < 0 else "FLAT"
-            except Exception:
-                logger.debug("No se pudo leer store live", exc_info=True)
+            pos_qty = -abs(qty_live) if side == "SHORT" else abs(qty_live)
+        else:
+            side = "FLAT"
+            pos_qty = 0.0
 
         if mark <= 0:
             public_mark = self._fetch_public_mark()
@@ -533,7 +699,7 @@ class PositionService:
             else:
                 pnl = (mark - avg_price) * qty
 
-        return {
+        status = {
             "symbol": self.symbol,
             "side": side,
             "entry_price": round(avg_price, 2),
@@ -542,6 +708,8 @@ class PositionService:
             "equity": round(float(equity or 0.0), 2),
             "mark": round(float(mark or 0.0), 2),
         }
+        self._cache[self._cache_key(self.symbol)] = dict(status)
+        return status
 
     def apply_fill(
         self, side: str, qty: float, price: float, fee: float = 0.0
@@ -596,16 +764,23 @@ class PositionService:
                 changes["pos_qty"],
                 changes["avg_price"],
             )
-            return self.store.save(**changes)
+            result = self.store.save(**changes)
+            self._invalidate_cache()
+            return result
         except Exception:
             logger.debug("apply_fill fallo", exc_info=True)
             return None
 
     # ------------------------------------------------------------------
     def get_status(self) -> dict[str, Any]:
-        if _runtime_is_paper():
-            return self._status_paper()
-        return self._status_live()
+        use_paper = self.mode == "simulado"
+        if not use_paper and _runtime_is_paper():
+            # Defensa: si el runtime sigue en paper pero el servicio está en real,
+            # priorizamos el modo configurado explícitamente.
+            use_paper = False
+        status = self._status_paper() if use_paper else self._status_live()
+        self._cache[self._cache_key(self.symbol)] = dict(status)
+        return status
 
 
 def build_position_service(
@@ -620,7 +795,12 @@ def build_position_service(
         if store is None:
             store = brokers.ACTIVE_PAPER_STORE or brokers._build_paper_store(settings.start_equity)
             brokers.ACTIVE_PAPER_STORE = store
-        svc = PositionService(paper_store=store, ccxt_client=ccxt_client, symbol=symbol)
+        svc = PositionService(
+            paper_store=store,
+            ccxt_client=ccxt_client,
+            symbol=symbol,
+            mode="simulado",
+        )
     else:
         if client is None:
             client = brokers.ACTIVE_LIVE_CLIENT
@@ -629,6 +809,7 @@ def build_position_service(
             live_client=client,
             ccxt_client=ccxt_client,
             symbol=symbol,
+            mode="real",
         )
     global pos_svc
     pos_svc = svc

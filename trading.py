@@ -578,6 +578,7 @@ def rebuild(mode: Mode) -> None:
         live_client=ACTIVE_LIVE_CLIENT,
         ccxt_client=PUBLIC_CCXT_CLIENT,
         symbol=S.symbol if hasattr(S, "symbol") else "BTC/USDT",
+        mode=mode,
     )
     if mode != "simulado":
         try:

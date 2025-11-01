@@ -208,6 +208,7 @@ async def _compute_position_split(app) -> tuple[Dict[str, Dict[str, Any]], float
                 svc = PositionService(
                     live_client=getattr(app, "exchange", None),
                     symbol=symbol_cfg,
+                    mode="real",
                 )
             except Exception:
                 svc = None

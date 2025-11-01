@@ -37,6 +37,16 @@ def init():
             qty REAL, avg_price REAL, updated_at INTEGER
         )"""
         )
+        c.execute(
+            """CREATE TABLE IF NOT EXISTS position_closures(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            mode TEXT, bot_id TEXT, symbol TEXT,
+            reason TEXT, ts INTEGER
+        )"""
+        )
+        c.execute(
+            "CREATE INDEX IF NOT EXISTS idx_position_closures_mode ON position_closures(mode, bot_id, symbol)"
+        )
         c.execute("CREATE INDEX IF NOT EXISTS idx_fills_time ON fills(ts)")
         c.commit()
 
@@ -157,6 +167,33 @@ def _rebuild_position(mode: str, bot_id: str, symbol: str):
             """INSERT INTO positions(mode,bot_id,symbol,qty,avg_price,updated_at)
                      VALUES(?,?,?,?,?,?)""",
             (mode, bot_id, symbol, qty, avg, now),
+        )
+        c.commit()
+
+
+def force_close(mode: str, bot_id: str, symbol: str, *, reason: str = "force_close") -> None:
+    """Marca una posición como cerrada en el ledger y registra el motivo."""
+
+    norm_mode = str(mode or "").lower() or "simulado"
+    norm_symbol = str(symbol or "").upper()
+    norm_reason = str(reason or "force_close")
+    now = int(time.time())
+    with _conn() as c:
+        updated = c.execute(
+            """UPDATE positions SET qty=0.0, avg_price=0.0, updated_at=?
+                   WHERE mode=? AND bot_id=? AND symbol=?""",
+            (now, norm_mode, bot_id, norm_symbol),
+        )
+        if updated.rowcount == 0:
+            c.execute(
+                """INSERT INTO positions(mode,bot_id,symbol,qty,avg_price,updated_at)
+                         VALUES(?,?,?,?,?,?)""",
+                (norm_mode, bot_id, norm_symbol, 0.0, 0.0, now),
+            )
+        c.execute(
+            """INSERT INTO position_closures(mode,bot_id,symbol,reason,ts)
+                     VALUES(?,?,?,?,?)""",
+            (norm_mode, bot_id, norm_symbol, norm_reason, now),
         )
         c.commit()
 
