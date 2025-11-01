@@ -69,3 +69,14 @@ def decision_event(code:str, message:str, **context):
 def log_exception(logger, message: str, **context):
     try: logger.exception(message, extra={"extra":{"context":context}})
     except Exception: logger.exception(message)
+
+
+def _warn(module: str, msg: str, exc: Exception | None = None, level: str = "warning") -> None:
+    log = logging.getLogger(__name__)
+    log_method = getattr(log, level, None)
+    if not callable(log_method):  # pragma: no cover - defensive fallback
+        log_method = log.warning
+    if exc is not None:
+        log_method(f"[{module}] {msg}: {exc}", exc_info=True)
+    else:
+        log_method(f"[{module}] {msg}")

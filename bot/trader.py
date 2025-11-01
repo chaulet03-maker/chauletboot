@@ -8,6 +8,7 @@ import trading
 from bot.paper_store import get_equity as paper_get_equity, set_equity as paper_set_equity
 from position_service import fetch_live_equity_usdm
 from bot.runtime_state import get_mode as runtime_get_mode
+from bot.logger import _warn
 
 
 def _runtime_is_paper() -> bool:
@@ -55,8 +56,8 @@ class Trader:
         if _runtime_is_paper():
             try:
                 paper_set_equity(val)
-            except Exception:
-                logging.debug("No se pudo persistir equity en bot.paper_store.", exc_info=True)
+            except Exception as exc:
+                _warn("TRADER", "No se pudo persistir equity en bot.paper_store.", exc=exc, level="debug")
         self._balance = val
 
     def _ensure_mode_consistency(self):
@@ -71,15 +72,15 @@ class Trader:
             try:
                 self._balance = float(self.equity())
                 return self._balance
-            except Exception:
-                logging.debug("No se pudo refrescar equity en modo paper.", exc_info=True)
+            except Exception as exc:
+                _warn("TRADER", "No se pudo refrescar equity en modo paper.", exc=exc, level="debug")
 
         try:
             live_equity = await asyncio.to_thread(fetch_live_equity_usdm)
             self._balance = float(live_equity)
             return self._balance
-        except Exception:
-            logging.debug("No se pudo obtener equity live vía CCXT.", exc_info=True)
+        except Exception as exc:
+            _warn("TRADER", "No se pudo obtener equity live vía CCXT.", exc=exc, level="debug")
 
         if exchange and getattr(exchange, 'client', None):
             try:
@@ -90,7 +91,7 @@ class Trader:
                     if total is not None:
                         self._balance = float(total)
             except Exception as exc:
-                logging.warning("No se pudo actualizar el balance desde el exchange: %s", exc)
+                _warn("TRADER", "No se pudo actualizar el balance desde el exchange.", exc=exc)
         return self._balance
 
     def equity(self, force_refresh: bool = False) -> float:
@@ -112,14 +113,14 @@ class Trader:
                 raw_equity = status.get("equity")
                 if raw_equity is not None:
                     equity = float(raw_equity)
-            except Exception:
-                logging.debug("No se pudo obtener equity desde PositionService.", exc_info=True)
+            except Exception as exc:
+                _warn("TRADER", "No se pudo obtener equity desde PositionService.", exc=exc, level="debug")
 
         if _runtime_is_paper() and equity is None:
             try:
                 equity = float(paper_get_equity())
-            except Exception:
-                logging.debug("No se pudo leer equity desde bot.paper_store.", exc_info=True)
+            except Exception as exc:
+                _warn("TRADER", "No se pudo leer equity desde bot.paper_store.", exc=exc, level="debug")
 
         if equity is None:
             equity = cached
@@ -148,7 +149,7 @@ class Trader:
                 if callable(fetch_method):
                     position_state = fetch_method(symbol_cfg)
             except Exception as exc:
-                logging.debug("PositionService.current_position fallo: %s", exc)
+                _warn("TRADER", "PositionService.current_position fallo.", exc=exc, level="debug")
 
             if position_state is None:
                 try:
@@ -164,7 +165,7 @@ class Trader:
                             "mark_price": float(status.get("mark") or 0.0),
                         }
                 except Exception as exc:
-                    logging.debug("PositionService.get_status fallback fallo: %s", exc)
+                    _warn("TRADER", "PositionService.get_status fallback fallo.", exc=exc, level="debug")
 
             if position_state is not None:
                 side = (position_state.get("side") or "FLAT").upper()

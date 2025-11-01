@@ -7,6 +7,7 @@ from typing import Any, Dict, Optional, Literal
 import brokers
 from paper_store import PaperStore
 from bot.runtime_state import get_mode as runtime_get_mode
+from bot.logger import _warn
 
 try:
     from bot import ledger as ledger_module  # type: ignore
@@ -80,8 +81,8 @@ def fetch_live_equity_usdm() -> float:
                                 v = (it or {}).get(k)
                                 if v is not None:
                                     return float(v)
-        except Exception:
-            logger.debug("fetch_balance(type=future) fallo", exc_info=True)
+        except Exception as exc:
+            _warn("POSITION", "fetch_balance(type=future) fallo", exc=exc, level="debug")
 
         # Fallback Binance nativo: /fapi/v2/balance
         try:
@@ -94,11 +95,11 @@ def fetch_live_equity_usdm() -> float:
                                 v = (it or {}).get(k)
                                 if v is not None:
                                     return float(v)
-        except Exception:
-            logger.debug("fapiPrivateV2GetBalance fallo", exc_info=True)
+        except Exception as exc:
+            _warn("POSITION", "fapiPrivateV2GetBalance fallo", exc=exc, level="debug")
 
-    except Exception:
-        logger.debug("fetch_live_equity_usdm() error", exc_info=True)
+    except Exception as exc:
+        _warn("POSITION", "fetch_live_equity_usdm() error", exc=exc, level="debug")
     return 0.0
 
 
@@ -289,12 +290,17 @@ async def reconcile_bot_store_with_account(trader, exchange, symbol: str, mark: 
                 if store is not None:
                     try:
                         store.save(pos_qty=0.0, avg_price=0.0)
-                    except Exception:
-                        logger.debug("No se pudo limpiar store desde reconciliación.", exc_info=True)
+                    except Exception as exc:
+                        _warn(
+                            "RECON",
+                            "No se pudo limpiar store desde reconciliación.",
+                            exc=exc,
+                            level="debug",
+                        )
                 if callable(block_rehydrate):
                     block_rehydrate(symbol, seconds=120.0)
         except Exception as _e:  # pragma: no cover - defensivo
-            logger.warning("[RECON] No pude bloquear rehidratación: %r", _e)
+            _warn("RECON", "No pude bloquear rehidratación", exc=_e)
         return
 
     if total_qty + EPS_QTY < bot_qty:
@@ -386,8 +392,8 @@ class PositionService:
             return
         try:
             action(self._ledger_mode(), self._bot_id, self._ledger_symbol_key(symbol), reason=reason)
-        except Exception:  # pragma: no cover - defensivo
-            logger.debug("No se pudo forzar cierre en ledger.", exc_info=True)
+        except Exception as exc:  # pragma: no cover - defensivo
+            _warn("RECON", "No se pudo forzar cierre en ledger.", exc=exc, level="debug")
 
     def _fetch_from_exchange(self, symbol: Optional[str] = None) -> Optional[Dict[str, Any]]:
         position = self._fetch_live_position()
@@ -410,8 +416,8 @@ class PositionService:
             return None
         try:
             qty, avg = action(self._ledger_mode(), self._bot_id, self._ledger_symbol_key(symbol))
-        except Exception:
-            logger.debug("No se pudo leer posición desde ledger.", exc_info=True)
+        except Exception as exc:
+            _warn("RECON", "No se pudo leer posición desde ledger.", exc=exc, level="debug")
             return None
         if abs(qty) <= EPS_QTY:
             return None
@@ -448,8 +454,13 @@ class PositionService:
             if pos is None and self.store is not None:
                 try:
                     state = self.store.load() or {}
-                except Exception:
-                    logger.debug("No se pudo leer store paper para rehidratación.", exc_info=True)
+                except Exception as exc:
+                    _warn(
+                        "POSITION",
+                        "No se pudo leer store paper para rehidratación.",
+                        exc=exc,
+                        level="debug",
+                    )
                     state = {}
 
                 try:
@@ -521,8 +532,13 @@ class PositionService:
         try:
             self.store.save(mark=float(mark))
             self._invalidate_cache()
-        except Exception:
-            logger.debug("No se pudo actualizar mark del store paper.", exc_info=True)
+        except Exception as exc:
+            _warn(
+                "POSITION",
+                "No se pudo actualizar mark del store paper.",
+                exc=exc,
+                level="debug",
+            )
 
     # ------------------------------------------------------------------
     def _fetch_public_mark(self) -> Optional[float]:
@@ -551,8 +567,13 @@ class PositionService:
                     mark_price = data.get("markPrice") or data.get("markprice")
                     if mark_price is not None:
                         return float(mark_price)
-        except Exception:
-            logger.debug("No se pudo obtener markPrice desde premium index público.", exc_info=True)
+        except Exception as exc:
+            _warn(
+                "POSITION",
+                "No se pudo obtener markPrice desde premium index público.",
+                exc=exc,
+                level="debug",
+            )
 
         # Fallback: ticker público
         if hasattr(client, "fetch_ticker"):
@@ -589,8 +610,13 @@ class PositionService:
         try:
             self.store.save(mark=float(price))
             return self.store.load()
-        except Exception:
-            logger.debug("No se pudo refrescar mark del store paper.", exc_info=True)
+        except Exception as exc:
+            _warn(
+                "POSITION",
+                "No se pudo refrescar mark del store paper.",
+                exc=exc,
+                level="debug",
+            )
             return state
 
     # ------------------------------------------------------------------
@@ -730,8 +756,8 @@ class PositionService:
                 mp = client.futures_mark_price(symbol=symbol_no_slash)
                 if isinstance(mp, dict):
                     mark = float(mp.get("markPrice") or 0.0)
-            except Exception:
-                logger.debug("No se pudo obtener markPrice privado.", exc_info=True)
+            except Exception as exc:
+                _warn("POSITION", "No se pudo obtener markPrice privado.", exc=exc, level="debug")
 
         store_has_pos = False
         if self.store is not None:
@@ -739,8 +765,8 @@ class PositionService:
                 state_live = self.store.load() or {}
                 pos_store = float(state_live.get("pos_qty") or 0.0)
                 store_has_pos = abs(pos_store) > EPS_QTY
-            except Exception:
-                logger.debug("No se pudo leer store live", exc_info=True)
+            except Exception as exc:
+                _warn("POSITION", "No se pudo leer store live", exc=exc, level="debug")
 
         live_position = self._fetch_from_exchange(self.symbol)
         exchange_flat = True
@@ -756,8 +782,8 @@ class PositionService:
             if self.store is not None:
                 try:
                     self.store.save(pos_qty=0.0, avg_price=0.0)
-                except Exception:
-                    logger.debug("No se pudo limpiar el store en live.", exc_info=True)
+                except Exception as exc:
+                    _warn("POSITION", "No se pudo limpiar el store en live.", exc=exc, level="debug")
             self._force_close_ledger(self.symbol, reason="exchange_flat")
             self._block_rehydrate(self.symbol)
             logger.info(
@@ -788,8 +814,8 @@ class PositionService:
         equity = 0.0
         try:
             equity = fetch_live_equity_usdm()
-        except Exception:
-            logger.debug("No se pudo obtener equity live.", exc_info=True)
+        except Exception as exc:
+            _warn("POSITION", "No se pudo obtener equity live.", exc=exc, level="debug")
 
         pnl = 0.0
         qty = abs(pos_qty)
@@ -867,8 +893,8 @@ class PositionService:
             result = self.store.save(**changes)
             self._invalidate_cache()
             return result
-        except Exception:
-            logger.debug("apply_fill fallo", exc_info=True)
+        except Exception as exc:
+            _warn("POSITION", "apply_fill fallo", exc=exc, level="debug")
             return None
 
     # ------------------------------------------------------------------
