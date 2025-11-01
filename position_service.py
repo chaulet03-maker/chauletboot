@@ -276,6 +276,25 @@ async def reconcile_bot_store_with_account(trader, exchange, symbol: str, mark: 
         logger.info(
             "Reconciliación: cuenta FLAT pero store del BOT tenía posición -> limpiado."
         )
+        try:
+            import trading
+
+            service = getattr(trading, "POSITION_SERVICE", None)
+            if service is not None:
+                close_ledger = getattr(service, "_force_close_ledger", None)
+                block_rehydrate = getattr(service, "_block_rehydrate", None)
+                store = getattr(service, "store", None)
+                if callable(close_ledger):
+                    close_ledger(symbol, reason="exchange_flat")
+                if store is not None:
+                    try:
+                        store.save(pos_qty=0.0, avg_price=0.0)
+                    except Exception:
+                        logger.debug("No se pudo limpiar store desde reconciliación.", exc_info=True)
+                if callable(block_rehydrate):
+                    block_rehydrate(symbol, seconds=120.0)
+        except Exception as _e:  # pragma: no cover - defensivo
+            logger.warning("[RECON] No pude bloquear rehidratación: %r", _e)
         return
 
     if total_qty + EPS_QTY < bot_qty:
@@ -403,6 +422,87 @@ class PositionService:
             "qty": abs(float(qty)),
             "entry_price": float(avg or 0.0),
         }
+
+    def current_position(self, symbol: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        """Devuelve la posición actual considerando el modo y bloqueos de rehidratación."""
+
+        sym = symbol or self.symbol
+        key = self._cache_key(sym)
+
+        if not sym:
+            return None
+
+        pos: Optional[Dict[str, Any]] = None
+
+        if str(self.mode).lower() == "real":
+            pos = self._fetch_from_exchange(sym)
+        else:
+            block_until = self._rehydrate_block_until.get(key, 0.0)
+            now = time.time()
+            if block_until > now:
+                self._cache.pop(key, None)
+                return None
+
+            pos = self._rehydrate_from_ledger(sym)
+
+            if pos is None and self.store is not None:
+                try:
+                    state = self.store.load() or {}
+                except Exception:
+                    logger.debug("No se pudo leer store paper para rehidratación.", exc_info=True)
+                    state = {}
+
+                try:
+                    qty_store = float(state.get("pos_qty") or 0.0)
+                except Exception:
+                    qty_store = 0.0
+
+                if abs(qty_store) > EPS_QTY:
+                    side_store = "LONG" if qty_store > 0 else "SHORT"
+                    pos = {
+                        "symbol": sym,
+                        "side": side_store,
+                        "qty": abs(qty_store),
+                        "entry_price": float(state.get("avg_price") or 0.0),
+                        "mark_price": float(state.get("mark") or 0.0),
+                    }
+
+            if pos is None:
+                cached = self._cache.get(key)
+                if isinstance(cached, dict):
+                    pos = dict(cached)
+
+        if not pos:
+            self._cache.pop(key, None)
+            return None
+
+        qty_raw = pos.get("qty") or pos.get("contracts") or pos.get("size")
+        try:
+            qty_val = abs(float(qty_raw))
+        except Exception:
+            qty_val = 0.0
+
+        side = str(pos.get("side") or "").upper()
+        if not side:
+            side = "LONG" if qty_val > 0 else "FLAT"
+
+        if qty_val <= EPS_QTY or side == "FLAT":
+            self._cache.pop(key, None)
+            return None
+
+        entry_price = _extract_price(pos, "entry_price", "entryPrice", "avg_price", "avgPrice")
+        mark_price = _extract_price(pos, "mark_price", "markPrice", "mark")
+
+        normalized = {
+            "symbol": pos.get("symbol") or sym,
+            "side": side,
+            "qty": qty_val,
+            "entry_price": entry_price,
+            "mark_price": mark_price,
+        }
+
+        self._cache[key] = dict(normalized)
+        return normalized
 
     def refresh(self) -> None:
         """Recarga el estado desde el store compartido."""

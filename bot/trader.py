@@ -137,41 +137,66 @@ class Trader:
         if self._open_position:
             return self._open_position
 
-        # 1) PAPER: leer del PositionService (persistente)
-        if _runtime_is_paper() and trading.POSITION_SERVICE is not None:
+        symbol_cfg = self.config.get("symbol", "BTC/USDT")
+        service = getattr(trading, "POSITION_SERVICE", None)
+
+        if service is not None:
+            position_state: Optional[Dict[str, Any]] = None
+
             try:
-                st = trading.POSITION_SERVICE.get_status()
-                side = (st.get("side") or "FLAT").upper()
-                if side != "FLAT":
+                fetch_method = getattr(service, "current_position", None)
+                if callable(fetch_method):
+                    position_state = fetch_method(symbol_cfg)
+            except Exception as exc:
+                logging.debug("PositionService.current_position fallo: %s", exc)
+
+            if position_state is None:
+                try:
+                    status = service.get_status()
+                    side_status = (status.get("side") or "FLAT").upper()
+                    qty_status = float(status.get("qty") or status.get("size") or 0.0)
+                    if side_status != "FLAT" and qty_status > 0:
+                        position_state = {
+                            "symbol": status.get("symbol", symbol_cfg),
+                            "side": side_status,
+                            "qty": qty_status,
+                            "entry_price": float(status.get("entry_price") or 0.0),
+                            "mark_price": float(status.get("mark") or 0.0),
+                        }
+                except Exception as exc:
+                    logging.debug("PositionService.get_status fallback fallo: %s", exc)
+
+            if position_state is not None:
+                side = (position_state.get("side") or "FLAT").upper()
+                try:
+                    qty_val = float(
+                        position_state.get("qty")
+                        or position_state.get("contracts")
+                        or position_state.get("size")
+                        or 0.0
+                    )
+                except Exception:
+                    qty_val = 0.0
+
+                if side != "FLAT" and qty_val > 0:
+                    entry_px = position_state.get("entry_price") or position_state.get("entryPrice") or 0.0
+                    mark_px = (
+                        position_state.get("mark_price")
+                        or position_state.get("markPrice")
+                        or position_state.get("mark")
+                        or 0.0
+                    )
                     self._open_position = {
-                        "symbol": st.get("symbol", self.config.get("symbol", "BTC/USDT")),
+                        "symbol": position_state.get("symbol", symbol_cfg),
                         "side": side,
-                        "contracts": float(st.get("qty") or st.get("size") or 0.0),
-                        "entryPrice": float(st.get("entry_price") or 0.0),
-                        "markPrice": float(st.get("mark") or 0.0),
+                        "contracts": float(qty_val),
+                        "entryPrice": float(entry_px or 0.0),
+                        "markPrice": float(mark_px or 0.0),
                     }
                     return self._open_position
+
                 self._open_position = None
-            except Exception as exc:
-                logging.debug("PAPER check_open_position fallo: %s", exc)
-            return self._open_position
-        # 2) REAL: consultar live en exchange (fuente de verdad)
-        if trading.POSITION_SERVICE is not None:
-            try:
-                st = trading.POSITION_SERVICE.get_status()
-                side = (st.get("side") or "FLAT").upper()
-                if side != "FLAT":
-                    self._open_position = {
-                        "symbol": st.get("symbol", self.config.get("symbol", "BTC/USDT")),
-                        "side": side,
-                        "contracts": float(st.get("qty") or st.get("size") or 0.0),
-                        "entryPrice": float(st.get("entry_price") or 0.0),
-                        "markPrice": float(st.get("mark") or 0.0),
-                    }
-                    return self._open_position
-                self._open_position = None
-            except Exception as exc:
-                logging.debug("REAL check_open_position fallo: %s", exc)
+                return self._open_position
 
         # IMPORTANTE:
         # La posición del BOT vive en el store (self._open_position).

@@ -772,6 +772,19 @@ class TradingApp:
                     return None
                 return f if math.isfinite(f) else None
 
+            # --- GUARD RAILS: en REAL no aceptamos posiciones "sintéticas" ---
+            if position:
+                try:
+                    mode = getattr(self, "mode", None) or getattr(self, "config", {}).get("mode")
+                except Exception:
+                    mode = None
+                qty_guard = position.get("contracts") or position.get("size") or 0.0
+                entry_guard = float(position.get("entryPrice") or 0.0)
+                # Si estamos en REAL y (qty ~ 0 o entryPrice == 0), es FLAT -> ignorar posición local
+                if (str(mode).upper() == "REAL") and (abs(float(qty_guard)) <= 1e-12 or entry_guard == 0.0):
+                    logging.warning("[GUARD] REAL: exchange FLAT (qty<=0 o entryPrice=0) -> ignoramos posición local")
+                    position = None
+
             if position:
                 logging.info(
                     "Posición abierta detectada: %s %.6f %s",
