@@ -24,6 +24,7 @@ from bot.exchange_client import ensure_position_mode
 from bot.trader import Trader
 from bot.storage import Storage
 from bot.telemetry.notifier import Notifier
+from bot.telemetry.metrics import METRICS
 from bot.telemetry.telegram_bot import setup_telegram_bot
 from bot.health.endpoint import attach_to_application
 from brokers import ACTIVE_LIVE_CLIENT
@@ -197,6 +198,7 @@ class TradingApp:
         self._reanudar_thread: Optional[threading.Thread] = None
         self.connection_lost = False
         self.rejection_log = deque(maxlen=10)
+        self._last_no_open_notice: dict[str, float] = {}
         self.telegram_app = setup_telegram_bot(self)
         attach_to_application(self)
         self.notifier = Notifier(application=self.telegram_app, cfg=self.config)
@@ -402,7 +404,16 @@ class TradingApp:
             self.config["tp_equity_pct"] = float(value)
 
     # === Rejection recording helpers ===
-    def record_rejection(self, symbol: str, side: str, code: str, detail: str = "", ts=None):
+    def record_rejection(
+        self,
+        symbol: str,
+        side: str,
+        code: str,
+        detail: str = "",
+        ts=None,
+        *,
+        qty: float | None = None,
+    ):
         try:
             from datetime import datetime, timezone
             from collections import deque
@@ -412,6 +423,7 @@ class TradingApp:
                 ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")
             item = {"iso": ts, "symbol": symbol, "side": side, "code": code, "detail": detail}
             self.rejection_log.append(item)
+            METRICS.record_rejection(code, qty=qty)
 
             # Reflejá también en el notificador PRO si existe
             tg = getattr(self, "telegram", None) or getattr(self, "notifier", None)
@@ -431,6 +443,17 @@ class TradingApp:
             prune_open_older_than(mode, get_bot_id(), hours=16)
         except Exception:
             self.logger.debug("No se pudo ejecutar prune_open_older_than", exc_info=True)
+
+    async def _notify_no_open(self, key: str, message: str, *, cooldown: float = 120.0) -> None:
+        now = time.time()
+        last = self._last_no_open_notice.get(key, 0.0)
+        if now - last < float(cooldown):
+            return
+        self._last_no_open_notice[key] = now
+        try:
+            await self.notifier.send(f"no abre por: {message}")
+        except Exception:
+            logging.debug("No se pudo enviar notificación de no apertura", exc_info=True)
 
     def _record_motive(self, ctx_overrides: Optional[Dict[str, Any]] = None):
         try:
@@ -576,6 +599,7 @@ class TradingApp:
 
     async def trading_loop(self, context: ContextTypes.DEFAULT_TYPE):
         """Bucle principal de trading ejecutado por la JobQueue de Telegram."""
+        METRICS.tick()
         try:
             schedule.run_pending()
             clear_pause_if_expired()
@@ -747,6 +771,14 @@ class TradingApp:
                             pass
             except Exception as exc:
                 logging.debug("PositionService mapping fail: %s", exc)
+
+            if bot_has_open and st:
+                try:
+                    METRICS.update_unrealized(float(st.get("pnl") or 0.0))
+                except Exception:
+                    METRICS.update_unrealized(0.0)
+            else:
+                METRICS.update_unrealized(0.0)
 
             cooldown_active = bool(getattr(self, "cooldown_active", False))
             freeze_90_active = bool(getattr(self, "freeze_90_active", False))
@@ -1052,6 +1084,8 @@ class TradingApp:
                     self.config.pop("_funding_rate_bps_now", None)
 
             signal = self.strategy.check_entry_signal(data)
+            if signal in ("LONG", "SHORT"):
+                METRICS.record_signal()
             if signal:
                 side_pref = signal
                 self.side_pref = signal
@@ -1144,6 +1178,33 @@ class TradingApp:
                     "gate_ok": gate_ok_val,
                 }
             )
+
+            if signal in ("LONG", "SHORT") and gate_ok_val is False:
+                gate_limit = None
+                current_rate_bps = None
+                try:
+                    gate_limit = float(gate_bps_cfg)
+                except Exception:
+                    gate_limit = None
+                try:
+                    current_rate_bps = float(rate_now_val) * 10000.0 if rate_now_val is not None else None
+                except Exception:
+                    current_rate_bps = None
+                reason_msg = "funding fuera de umbral"
+                if gate_limit is not None and current_rate_bps is not None:
+                    if signal == "LONG":
+                        reason_msg = f"funding {current_rate_bps:.2f}bps > {gate_limit:.2f}bps"
+                    else:
+                        reason_msg = f"funding {current_rate_bps:.2f}bps < -{gate_limit:.2f}bps"
+                self.record_rejection(
+                    symbol=self.config.get("symbol", ""),
+                    side=signal,
+                    code="funding_gate",
+                    detail=reason_msg,
+                )
+                _emit_motive({"gate_ok": False, "reasons": [reason_msg]}, price_value=price_signal, side_value=signal)
+                await self._notify_no_open("funding_gate", reason_msg)
+                return
 
             anchor_epoch = None
             try:
@@ -1390,17 +1451,25 @@ class TradingApp:
             filters = _flatten_symbol_filters(raw_filters)
             qty = _quantize_amount(filters, raw_qty, entry_price)
             if qty <= 0:
-                reason = (
-                    f"Equity insuficiente o stepSize/minNotional demasiado altos. "
-                    f"equity={eq_on_open:.2f} raw_qty={raw_qty:.8f}"
+                min_qty = filters.get("minQty") if isinstance(filters, dict) else None
+                min_notional = filters.get("minNotional") if isinstance(filters, dict) else None
+                detail = (
+                    f"equity={eq_on_open:.2f} raw_qty={raw_qty:.8f} minQty={min_qty} minNotional={min_notional}"
                 )
-                logging.warning("Qty=0 tras cuantización: %s", reason)
-                try:
-                    await self.notifier.send(
-                        f"⚠️ No se pudo abrir posición: {reason}"
-                    )
-                except Exception:
-                    logging.debug("No se pudo notificar fallo de qty=0", exc_info=True)
+                logging.warning("Qty=0 tras cuantización: %s", detail)
+                self.record_rejection(
+                    symbol=self.config.get("symbol", ""),
+                    side=signal,
+                    code="qty_insufficient",
+                    detail=detail,
+                    qty=raw_qty,
+                )
+                await self._notify_no_open("qty_zero", "qty insuficiente tras cuantización")
+                _emit_motive(
+                    {"reasons": [f"qty insuficiente ({detail})"]},
+                    price_value=entry_price,
+                    side_value=signal,
+                )
                 return
 
             def _finite_or_none(value: Any) -> Optional[float]:
@@ -1451,6 +1520,7 @@ class TradingApp:
             if filled <= 0:
                 logging.warning("Orden enviada pero SIN FILL (>0). No se anuncia apertura.")
                 return
+            METRICS.record_order_filled()
 
             # 2) Esperar a que el store (POSITION_SERVICE) deje de estar FLAT
             st = None
@@ -1959,6 +2029,7 @@ class TradingApp:
                     status_before = None
 
             summary_base: Dict[str, Any] = {"symbol": symbol, "side": "LONG"}
+            snapshot_before_dict = dict(snapshot_before) if isinstance(snapshot_before, dict) else None
 
             def _set_if_missing(key: str, value) -> None:
                 if value in (None, ""):
@@ -2103,6 +2174,13 @@ class TradingApp:
             if close_result.get("close_price") is not None and "exit_price" not in summary:
                 _assign_float(summary, "exit_price", close_result.get("close_price"))
 
+            if snapshot_before_dict:
+                _assign_float(summary, "sl", snapshot_before_dict.get("sl"))
+                _assign_float(summary, "tp", snapshot_before_dict.get("tp"))
+            if isinstance(status_before, dict):
+                _assign_float(summary, "sl", status_before.get("sl"))
+                _assign_float(summary, "tp", status_before.get("tp"))
+
             try:
                 now_ts = pd.Timestamp.now(tz="UTC")
                 trade_pnl = summary.get("realized_pnl") or summary.get("pnl_balance_delta")
@@ -2128,6 +2206,12 @@ class TradingApp:
                 self.position_open = False
             except Exception:
                 pass
+
+            METRICS.record_close(
+                summary=summary,
+                snapshot_before=snapshot_before_dict,
+                status_before=status_before,
+            )
 
             return {"status": "closed", "summary": summary, "order": close_result.get("order")}
         except Exception as exc:

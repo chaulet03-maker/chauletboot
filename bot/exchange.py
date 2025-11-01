@@ -13,6 +13,7 @@ from bot.exchanges.binance_filters import build_filters
 from bot.exchange_client import ensure_position_mode, get_ccxt, reset_ccxt_client, normalize_symbol
 from bot.runtime_state import get_mode as runtime_get_mode
 from bot.price_ws import PriceStream
+from bot.telemetry.metrics import METRICS
 
 
 def _get_trading_module():
@@ -1036,6 +1037,8 @@ class Exchange:
 
         from trading import place_order_safe
 
+        METRICS.record_order_sent()
+        start_ts = time.monotonic()
         order = await asyncio.to_thread(
             place_order_safe,
             side,
@@ -1043,6 +1046,8 @@ class Exchange:
             None,
             **order_kwargs,
         )
+        elapsed_ms = max((time.monotonic() - start_ts) * 1000.0, 0.0)
+        METRICS.observe_latency(elapsed_ms)
 
         logger.info("Orden ejecutada vía broker seguro: %s", order)
         return order
