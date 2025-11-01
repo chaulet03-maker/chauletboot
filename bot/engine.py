@@ -581,22 +581,24 @@ class TradingApp:
                 self.connection_lost = False
 
             logging.info("Iniciando ciclo de análisis de mercado...")
-            # --- HARD-FLAT: si en REAL la cuenta está plana, salimos del ciclo sin rehidratar nada ---
+            # --- HARD-FLAT: si en REAL la cuenta está plana, limpiamos estado local y seguimos analizando ---
             if runtime_get_mode() == "real":
                 try:
                     live_has = await asyncio.to_thread(self.sync_live_position)
                 except Exception:
                     live_has = False
                 if not live_has:
-                    # limpiar cualquier rastro local y NO seguir (evita que otro módulo "reviva" posición)
+                    # limpiar cualquier rastro local para no “revivir” posiciones
                     try:
                         if hasattr(self.trader, "_open_position"):
                             self.trader._open_position = None
                     except Exception:
                         pass
                     self.position_open = False
-                    logging.debug("[HARD-FLAT] REAL: cuenta plana -> fin de ciclo (no rehidrato).")
-                    return
+                    logging.debug(
+                        "[HARD-FLAT] REAL: cuenta plana -> limpio estado local y SIGO analizando."
+                    )
+                    # **IMPORTANTE**: NO hacemos return.
 
             symbol_cfg = self.config.get("symbol", "BTC/USDT")
             try:
