@@ -25,6 +25,7 @@ from bot.trader import Trader
 from bot.storage import Storage
 from bot.telemetry.notifier import Notifier
 from bot.telemetry.telegram_bot import setup_telegram_bot
+from bot.telemetry.metrics import get_metrics
 from bot.health.endpoint import attach_to_application
 from brokers import ACTIVE_LIVE_CLIENT
 from bot.identity import get_bot_id, make_client_oid
@@ -251,6 +252,8 @@ class TradingApp:
         self.telegram_app = setup_telegram_bot(self)
         attach_to_application(self)
         self.notifier = Notifier(application=self.telegram_app, cfg=self.config)
+        self.metrics = get_metrics()
+        self._last_no_open_notice: dict[str, float] = {}
         self.symbols = [self.config.get('symbol', 'BTC/USDT')]
         self.price_cache = {}
         self._funding_series = None
@@ -474,6 +477,12 @@ class TradingApp:
             tg = getattr(self, "telegram", None) or getattr(self, "notifier", None)
             if tg is not None and hasattr(tg, "log_reject"):
                 tg.log_reject(symbol=symbol, side=side, code=code, detail=detail)
+            metrics = getattr(self, "metrics", None)
+            if metrics is not None:
+                try:
+                    metrics.record_rejection(code or "unknown")
+                except Exception:
+                    logging.debug("No se pudo registrar rechazo en métricas", exc_info=True)
         except Exception as e:
             import logging
             logging.debug(f"record_rejection failed: {e}")
@@ -489,7 +498,7 @@ class TradingApp:
         except Exception:
             self.logger.debug("No se pudo ejecutar prune_open_older_than", exc_info=True)
 
-    def _record_motive(self, ctx_overrides: Optional[Dict[str, Any]] = None):
+    def _record_motive(self, ctx_overrides: Optional[Dict[str, Any]] = None) -> list[str]:
         try:
             def _safe_float(value: Any) -> Optional[float]:
                 if value is None:
@@ -561,8 +570,62 @@ class TradingApp:
                 )
             )
             self.logger.debug("MOTIVES/REC %s", codes)
+            return codes
         except Exception as e:
             self.logger.debug("MOTIVES/REC fail: %s", e)
+        return []
+
+    def _handle_no_open_notice(
+        self,
+        codes: list[str],
+        ctx: Dict[str, Any],
+        side: Optional[str],
+    ) -> None:
+        if not codes or not side:
+            return
+        notifier = getattr(self, "notifier", None)
+        if notifier is None or not hasattr(notifier, "send"):
+            return
+
+        labels: list[str] = []
+        for code in codes:
+            if code == "gate_fail" and "gate" not in labels:
+                labels.append("gate")
+            elif code == "min_notional" and "qty mínima" not in labels:
+                labels.append("qty mínima")
+        if not labels:
+            return
+
+        summary = ", ".join(labels)
+        reasons = []
+        raw_reasons = ctx.get("reasons") if isinstance(ctx, dict) else None
+        if isinstance(raw_reasons, (list, tuple)):
+            for reason in raw_reasons:
+                if not reason:
+                    continue
+                text = str(reason)
+                low = text.lower()
+                if any(keyword in low for keyword in ("gate", "qty", "notional", "step")):
+                    reasons.append(text)
+        detail = f" ({'; '.join(reasons[:2])})" if reasons else ""
+        side_label = side.upper()
+        message = f"ℹ️ no abre por: {summary} [{side_label}]{detail}"
+
+        key = f"{side_label}:{summary}"
+        now = time.time()
+        last_ts = self._last_no_open_notice.get(key, 0.0)
+        if now - last_ts < 60:
+            return
+        self._last_no_open_notice[key] = now
+
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                loop.create_task(notifier.send(message))
+            else:
+                loop.run_until_complete(notifier.send(message))
+        except Exception:
+            self.logger.debug("No se pudo enviar notificación 'no abre'", exc_info=True)
 
     def _cleanup_entry_locks(self, now: float, ttl: int) -> None:
         if not self._entry_locks:
@@ -633,13 +696,22 @@ class TradingApp:
 
     async def trading_loop(self, context: ContextTypes.DEFAULT_TYPE):
         """Bucle principal de trading ejecutado por la JobQueue de Telegram."""
+        metrics = getattr(self, "metrics", None)
+        tick_started = monotonic()
+        exchange_latency_ms: Optional[float] = None
+        if metrics is not None:
+            try:
+                metrics.set_unrealized(0.0)
+            except Exception:
+                logging.debug("No se pudo inicializar pnl_unrealized en métricas", exc_info=True)
+
         try:
             schedule.run_pending()
             clear_pause_if_expired()
             self.is_paused = bool(is_paused_now())
             if self.connection_lost:
                 await self.notifier.send("✅ **Conexión Reestablecida.**")
-                self.connection_lost = False
+            self.connection_lost = False
 
             logging.info("Iniciando ciclo de análisis de mercado...")
             # --- HARD-FLAT: si en REAL la cuenta está plana, limpiamos estado local y seguimos analizando ---
@@ -896,7 +968,11 @@ class TradingApp:
                 self.blackout_active = bool(ctx_local.get("blackout", self.blackout_active))
                 self.side_pref = local_side
 
-                self._record_motive(ctx_local)
+                codes = self._record_motive(ctx_local)
+                try:
+                    self._handle_no_open_notice(codes, ctx_local, local_side)
+                except Exception:
+                    self.logger.debug("No se pudo procesar aviso de no-entrada", exc_info=True)
 
             def _safe_float_local(value: Any) -> Optional[float]:
                 if value is None:
@@ -941,6 +1017,11 @@ class TradingApp:
                 elif side == "SHORT":
                     sign = -1.0
                 pnl_now = (mark_px - entry_px) * qty * sign
+                if metrics is not None:
+                    try:
+                        metrics.set_unrealized(pnl_now)
+                    except Exception:
+                        logging.debug("No se pudo actualizar pnl_unrealized en métricas", exc_info=True)
 
                 if getattr(self, "_entry_ts", None) is None:
                     raw_entry = (
@@ -969,7 +1050,7 @@ class TradingApp:
                         await self.notifier.send(
                             f"⏰ Máximo {self.max_position_hours}h alcanzado. Cerrando posición del BOT."
                         )
-                        await self.close_all()
+                        await self.close_all(reason="max_position_hours")
                         return
 
                 if float(self.tp_equity_pct) > 0 and float(self._eq_on_open) > 0:
@@ -978,7 +1059,7 @@ class TradingApp:
                         await self.notifier.send(
                             f"🎯 TP +{float(self.tp_equity_pct):.1f}% del equity alcanzado. Cierro posición."
                         )
-                        await self.close_all()
+                        await self.close_all(reason="tp_equity_pct")
                         return
 
                 last_price = None
@@ -1075,8 +1156,10 @@ class TradingApp:
                 _emit_motive({"reasons": ["ban_hours", "hora baneada"]})
                 return
 
+            fetch_start = monotonic()
             klines_1h = await self.exchange.get_klines('1h')
             klines_4h = await self.exchange.get_klines('4h')
+            exchange_latency_ms = (monotonic() - fetch_start) * 1000.0
 
             if not klines_1h or not klines_4h:
                 logging.warning("No se pudieron obtener los datos de mercado en este ciclo.")
@@ -1120,6 +1203,11 @@ class TradingApp:
 
             signal = self.strategy.check_entry_signal(data)
             if signal:
+                if metrics is not None:
+                    try:
+                        metrics.record_signal(signal)
+                    except Exception:
+                        logging.debug("No se pudo registrar métrica de señal", exc_info=True)
                 side_pref = signal
                 self.side_pref = signal
             base_ctx["reasons"] = []
@@ -1468,6 +1556,11 @@ class TradingApp:
                     )
                 except Exception:
                     logging.debug("No se pudo notificar fallo de qty=0", exc_info=True)
+                if metrics is not None:
+                    try:
+                        metrics.record_rejection("qty", raw_qty)
+                    except Exception:
+                        logging.debug("No se pudo registrar métrica de qty rechazada", exc_info=True)
                 _emit_motive(
                     {
                         "reasons": [
@@ -1593,6 +1686,16 @@ class TradingApp:
             if not self.connection_lost:
                 await self.notifier.send(f"💥 **Error inesperado en el bot:** {e}")
                 self.connection_lost = True
+        finally:
+            if metrics is not None:
+                try:
+                    total_latency_ms = (monotonic() - tick_started) * 1000.0
+                    metrics.record_tick(
+                        latency_ms=total_latency_ms,
+                        exchange_latency_ms=exchange_latency_ms,
+                    )
+                except Exception:
+                    logging.debug("No se pudieron registrar métricas del ciclo", exc_info=True)
 
     def price_of(self, symbol: str):
         return self.price_cache.get(symbol)
@@ -1998,11 +2101,12 @@ class TradingApp:
             except KeyboardInterrupt:  # pragma: no cover - defensivo
                 logging.info("Ejecución interrumpida manualmente.")
 
-    async def close_all(self) -> Dict[str, Any] | bool:
+    async def close_all(self, reason: str | None = None) -> Dict[str, Any] | bool:
         """Cierra SOLO la posición del BOT (reduceOnly) y devuelve un resumen del cierre."""
         try:
             symbol = (self.config or {}).get("symbol", "BTC/USDT")
             symbol_norm = str(symbol).replace("/", "").upper()
+            reason_norm = str(reason or "").strip().lower()
 
             def _find_open_snapshot(state_obj: Dict[str, Any]) -> Optional[Dict[str, Any]]:
                 open_positions = state_obj.get("open_positions", {}) if isinstance(state_obj, dict) else {}
@@ -2021,6 +2125,17 @@ class TradingApp:
                             return dict(pos)
                 return None
 
+            def _to_float(value: Any) -> Optional[float]:
+                if value in (None, "", False):
+                    return None
+                try:
+                    number = float(value)
+                except Exception:
+                    return None
+                if math.isnan(number) or math.isinf(number):
+                    return None
+                return number
+
             def _latest_closed(state_obj: Dict[str, Any]) -> Optional[Dict[str, Any]]:
                 closed = state_obj.get("closed_positions", []) if isinstance(state_obj, dict) else []
                 if not isinstance(closed, list):
@@ -2035,6 +2150,8 @@ class TradingApp:
 
             state_before = load_state()
             snapshot_before = _find_open_snapshot(state_before)
+            sl_before: Optional[float] = None
+            tp_before: Optional[float] = None
 
             service = getattr(trading, "POSITION_SERVICE", None)
             status_before: Optional[Dict[str, Any]] = None
@@ -2063,6 +2180,10 @@ class TradingApp:
                 _set_if_missing("entry_price", snapshot_before.get("entry_price"))
                 _set_if_missing("leverage", snapshot_before.get("leverage"))
                 _set_if_missing("opened_at", snapshot_before.get("opened_at"))
+                if sl_before is None:
+                    sl_before = _to_float(snapshot_before.get("sl"))
+                if tp_before is None:
+                    tp_before = _to_float(snapshot_before.get("tp"))
 
             if isinstance(status_before, dict):
                 side_now = status_before.get("side") or status_before.get("positionSide")
@@ -2196,6 +2317,47 @@ class TradingApp:
                     self._register_close_R(now_ts, float(trade_pnl))
             except Exception:
                 pass
+
+            metrics = getattr(self, "metrics", None)
+            if metrics is not None:
+                try:
+                    realized_val = summary.get("realized_pnl")
+                    if realized_val is None:
+                        realized_val = summary.get("pnl_balance_delta")
+                    if realized_val is not None:
+                        metrics.add_realized(float(realized_val))
+
+                    exit_price = _to_float(summary.get("exit_price") or summary.get("close_price"))
+                    side_summary = str(summary.get("side", "LONG")).upper()
+                    triggered_tp = False
+                    triggered_sl = False
+
+                    if reason_norm in {"tp_equity_pct", "tp", "take_profit"}:
+                        triggered_tp = True
+                    if reason_norm in {"sl_equity_pct", "sl", "stop_loss"}:
+                        triggered_sl = True
+
+                    tol = 0.001
+                    allow_infer = reason_norm in {"", "auto"}
+
+                    if allow_infer and not triggered_sl and sl_before is not None and exit_price is not None:
+                        if side_summary == "LONG" and exit_price <= sl_before * (1 + tol):
+                            triggered_sl = True
+                        elif side_summary == "SHORT" and exit_price >= sl_before * (1 - tol):
+                            triggered_sl = True
+
+                    if allow_infer and not triggered_tp and exit_price is not None and tp_before is not None:
+                        if side_summary == "LONG" and exit_price >= tp_before * (1 - tol):
+                            triggered_tp = True
+                        elif side_summary == "SHORT" and exit_price <= tp_before * (1 + tol):
+                            triggered_tp = True
+
+                    if triggered_tp:
+                        metrics.record_tp_triggered()
+                    if triggered_sl:
+                        metrics.record_sl_triggered()
+                except Exception:
+                    self.logger.debug("No se pudieron actualizar métricas de cierre", exc_info=True)
 
             self._entry_ts = None
             self._eq_on_open = 0.0
