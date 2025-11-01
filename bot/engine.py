@@ -267,6 +267,25 @@ class TradingApp:
 
         self._start_reanudar_listener()
 
+        # Blindaje: en REAL, ignorar cualquier set_position si la cuenta está FLAT.
+        try:
+            _orig_set_position = self.trader.set_position
+
+            async def _guard_set_position(pos):
+                if runtime_get_mode() == "real":
+                    try:
+                        live_has = await asyncio.to_thread(self.sync_live_position)
+                    except Exception:
+                        live_has = False
+                    if not live_has:
+                        logging.warning("[GUARD] REAL: cuenta FLAT -> ignoro set_position externo (%s)", pos)
+                        pos = None
+                return await _orig_set_position(pos)
+
+            self.trader.set_position = _guard_set_position  # type: ignore
+        except Exception:
+            logging.debug("No pude blindar trader.set_position", exc_info=True)
+
     @property
     def active_mode(self) -> str:
         return str(trading.ACTIVE_MODE).lower()
@@ -562,6 +581,22 @@ class TradingApp:
                 self.connection_lost = False
 
             logging.info("Iniciando ciclo de análisis de mercado...")
+            # --- HARD-FLAT: si en REAL la cuenta está plana, salimos del ciclo sin rehidratar nada ---
+            if runtime_get_mode() == "real":
+                try:
+                    live_has = await asyncio.to_thread(self.sync_live_position)
+                except Exception:
+                    live_has = False
+                if not live_has:
+                    # limpiar cualquier rastro local y NO seguir (evita que otro módulo "reviva" posición)
+                    try:
+                        if hasattr(self.trader, "_open_position"):
+                            self.trader._open_position = None
+                    except Exception:
+                        pass
+                    self.position_open = False
+                    logging.debug("[HARD-FLAT] REAL: cuenta plana -> fin de ciclo (no rehidrato).")
+                    return
             symbol_cfg = self.config.get("symbol", "BTC/USDT")
             try:
                 await reconcile_bot_store_with_account(
@@ -772,17 +807,19 @@ class TradingApp:
                     return None
                 return f if math.isfinite(f) else None
 
-            # --- GUARD RAILS: en REAL no aceptamos posiciones "sintéticas" ---
             if position:
+                # Guardas extra: si la posición no cumple mínimos de una posición real, la ignoramos.
                 try:
-                    mode = getattr(self, "mode", None) or getattr(self, "config", {}).get("mode")
+                    qty_chk = float(position.get('contracts') or position.get('size') or 0.0)
                 except Exception:
-                    mode = None
-                qty_guard = position.get("contracts") or position.get("size") or 0.0
-                entry_guard = float(position.get("entryPrice") or 0.0)
-                # Si estamos en REAL y (qty ~ 0 o entryPrice == 0), es FLAT -> ignorar posición local
-                if (str(mode).upper() == "REAL") and (abs(float(qty_guard)) <= 1e-12 or entry_guard == 0.0):
-                    logging.warning("[GUARD] REAL: exchange FLAT (qty<=0 o entryPrice=0) -> ignoramos posición local")
+                    qty_chk = 0.0
+                try:
+                    entry_chk = float(position.get('entryPrice') or 0.0)
+                except Exception:
+                    entry_chk = 0.0
+                # En REAL exigimos qty > 0 y entry > 0; además, si qty < 0.005 (BTC) la tratamos como ruido.
+                if runtime_get_mode() == "real" and (qty_chk <= 0.0 or entry_chk <= 0.0 or qty_chk < 0.005):
+                    logging.warning("[GUARD] REAL: posición inválida/sintética (qty=%.6f, entry=%.2f) -> ignorada", qty_chk, entry_chk)
                     position = None
 
             if position:
