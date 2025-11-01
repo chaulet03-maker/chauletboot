@@ -10,6 +10,7 @@ from typing import Iterable, Optional, Tuple
 
 import requests
 from telegram.constants import ParseMode
+from bot.logger import _warn
 
 logger = logging.getLogger(__name__)
 
@@ -116,11 +117,10 @@ def notify(
                     continue
                 ok_all = False
             except requests.RequestException as exc:
-                logger.warning(
-                    "Notifier: error de red (intento %d/%d): %s",
-                    attempt,
-                    retries,
-                    exc,
+                _warn(
+                    "NOTIFIER",
+                    f"Notifier: error de red (intento {attempt}/{retries})",
+                    exc=exc,
                 )
                 if attempt < retries:
                     time.sleep(delay)
@@ -172,5 +172,5 @@ class Notifier:
                 )
                 return
             except Exception as exc:
-                logger.warning("Notifier: Telegram error: %s", exc, exc_info=True)
+                _warn("NOTIFIER", "Notifier: Telegram error", exc=exc)
         notify(safe, parse_mode=ParseMode.HTML, disable_preview=disable_preview)

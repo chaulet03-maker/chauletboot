@@ -9,6 +9,7 @@ from risk_guards import dyn_leverage_from_adx
 
 from anchor_freezer import Side
 from deps import FREEZER
+from bot.logger import _warn
 
 class Strategy:
     def __init__(self, cfg):
@@ -430,8 +431,9 @@ class Strategy:
             rsi4h = float(row.get("rsi4h", float("nan")))
             atr = float(row.get("atr", float("nan")))
             adx = float(row.get("adx", float("nan")))
-        except Exception:
-            log.info("SIGNAL DEBUG: fila inválida."); return
+        except Exception as exc:
+            _warn("STRATEGY", "SIGNAL DEBUG: fila inválida.", exc=exc, level="info")
+            return
 
         # Lado preferido por tendencia
         side_pref = None

@@ -16,6 +16,7 @@ from paper_store import PaperStore
 from state_store import on_close_filled, on_open_filled
 from bot.runtime_state import get_mode as runtime_get_mode
 from paths import get_data_dir, get_paper_store_path
+from bot.logger import _warn
 
 logger = logging.getLogger(__name__)
 
@@ -412,8 +413,13 @@ def bootstrap_real_state(
         if active_store is not None:
             try:
                 active_store.save(pos_qty=float(signed_qty), avg_price=avg_price)
-            except Exception:
-                logger.debug("bootstrap_real_state: no se pudo actualizar el store", exc_info=True)
+            except Exception as exc:
+                _warn(
+                    "TRADING",
+                    "bootstrap_real_state: no se pudo actualizar el store",
+                    exc=exc,
+                    level="debug",
+                )
 
         try:
             on_open_filled(
@@ -424,8 +430,13 @@ def bootstrap_real_state(
                 lev,
                 mode="live",
             )
-        except Exception:
-            logger.debug("bootstrap_real_state: no se pudo persistir posición live", exc_info=True)
+        except Exception as exc:
+            _warn(
+                "TRADING",
+                "bootstrap_real_state: no se pudo persistir posición live",
+                exc=exc,
+                level="debug",
+            )
 
         logger.info(
             "Sincronizado estado REAL con exchange: qty=%.6f, avg=%.2f",
@@ -436,8 +447,13 @@ def bootstrap_real_state(
         if active_store is not None:
             try:
                 active_store.save(pos_qty=0.0, avg_price=0.0)
-            except Exception:
-                logger.debug("bootstrap_real_state: no se pudo limpiar el store", exc_info=True)
+            except Exception as exc:
+                _warn(
+                    "TRADING",
+                    "bootstrap_real_state: no se pudo limpiar el store",
+                    exc=exc,
+                    level="debug",
+                )
         logger.info("Sincronizado estado REAL con exchange: sin posición abierta.")
 
 
@@ -492,8 +508,13 @@ def _build_public_ccxt() -> Optional[Any]:
                         os.environ[env_var] = cert_path
             else:  # pragma: no cover - defensive log
                 logger.debug("Certifi path not found: %s", cert_path)
-        except ImportError:
-            logger.debug("certifi no está disponible; se usa la configuración TLS por defecto")
+        except ImportError as exc:
+            _warn(
+                "TRADING",
+                "certifi no está disponible; se usa la configuración TLS por defecto",
+                exc=exc,
+                level="debug",
+            )
 
         options: dict[str, Any] = {"defaultType": "future"}
         if _config_uses_hedge(RAW_CONFIG):
@@ -522,7 +543,7 @@ def force_refresh_clients():
     try:
         PUBLIC_CCXT_CLIENT = _build_public_ccxt()
     except Exception as exc:  # pragma: no cover - defensive
-        logger.debug('No se pudo recrear ccxt: %s', exc)
+        _warn("TRADING", "No se pudo recrear ccxt", exc=exc, level="debug")
 
 
 def _sync_settings_mode(mode: Mode) -> None:
@@ -583,8 +604,8 @@ def rebuild(mode: Mode) -> None:
     if mode != "simulado":
         try:
             bootstrap_real_state(symbol=getattr(POSITION_SERVICE, "symbol", None))
-        except Exception:
-            logger.debug("bootstrap_real_state falló durante rebuild", exc_info=True)
+        except Exception as exc:
+            _warn("TRADING", "bootstrap_real_state falló durante rebuild", exc=exc, level="debug")
     logger.info(
         "Trading stack reconstruido para modo %s (data_dir=%s, store=%s)",
         mode.upper(),
@@ -613,7 +634,7 @@ def position_status() -> dict[str, Any]:
     try:
         return POSITION_SERVICE.get_status()
     except Exception as exc:
-        logger.debug("position_status falló: %s", exc)
+        _warn("TRADING", "position_status falló", exc=exc, level="debug")
         return {"side": "FLAT"}
 
 
@@ -710,8 +731,8 @@ def place_order_safe(side: str, qty: float, price: float | None = None, **kwargs
                 try:
                     POSITION_SERVICE.refresh()
                     logging.info("paper refresh -> %s", POSITION_SERVICE.get_status())
-                except Exception:
-                    logging.warning("paper refresh falló (store)", exc_info=True)
+                except Exception as exc:
+                    _warn("TRADING", "paper refresh falló (store)", exc=exc)
             else:
                 fill_price = _infer_fill_price(result, price)
                 if fill_price is not None:
@@ -739,16 +760,18 @@ def place_order_safe(side: str, qty: float, price: float | None = None, **kwargs
                             mode=mode_label,
                             fee=fee_paid,
                         )
-                    except Exception:
-                        logger.debug(
+                    except Exception as exc:
+                        _warn(
+                            "TRADING",
                             "No se pudo persistir estado en state_store al abrir.",
-                            exc_info=True,
+                            exc=exc,
+                            level="debug",
                         )
-    except Exception:
+    except Exception as exc:
         if isinstance(result, dict) and result.get("sim"):
-            logger.warning("PAPER: no se pudo reflejar estado tras abrir.", exc_info=True)
+            _warn("TRADING", "PAPER: no se pudo reflejar estado tras abrir.", exc=exc)
         else:
-            logger.debug("No se pudo reflejar fill en store tras abrir.", exc_info=True)
+            _warn("TRADING", "No se pudo reflejar fill en store tras abrir.", exc=exc, level="debug")
     return result
 
 
@@ -808,8 +831,8 @@ def close_now(symbol: str | None = None):
             if is_sim:
                 try:
                     POSITION_SERVICE.refresh()
-                except Exception:
-                    logger.warning("PAPER: refresh tras cierre falló", exc_info=True)
+                except Exception as exc:
+                    _warn("TRADING", "PAPER: refresh tras cierre falló", exc=exc)
             elif close_price is not None:
                 bot_side = "SHORT" if side == "LONG" else "LONG"
                 POSITION_SERVICE.apply_fill(
@@ -821,10 +844,10 @@ def close_now(symbol: str | None = None):
         if close_price is not None:
             try:
                 on_close_filled(str(target_symbol), float(close_price), fee=fee_paid)
-            except Exception:
-                logger.debug("No se pudo persistir cierre en state_store.", exc_info=True)
-    except Exception:
-        logger.debug("No se pudo reflejar cierre en store.", exc_info=True)
+            except Exception as exc:
+                _warn("TRADING", "No se pudo persistir cierre en state_store.", exc=exc, level="debug")
+    except Exception as exc:
+        _warn("TRADING", "No se pudo reflejar cierre en store.", exc=exc, level="debug")
 
     summary: dict[str, Any] = {
         "status": "ok",
