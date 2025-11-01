@@ -109,6 +109,12 @@ def _quantize_amount(
                 ceil_qty = math.ceil(target_units) * step
                 if ceil_qty > 0 and ceil_qty <= raw_qty_val * 1.10:
                     qty = ceil_qty
+                    logging.info(
+                        "Qty ajustada por minNotional: %.6f (step=%.6f, raw=%.6f, tolerancia=+10%%)",
+                        qty,
+                        step,
+                        raw_qty_val,
+                    )
 
     if min_qty > 0 and qty < min_qty:
         return 0.0
@@ -142,6 +148,12 @@ def _quantize_amount(
                         and ceil_qty <= raw_qty_val * 1.10
                     ):
                         qty = ceil_qty
+                        logging.info(
+                            "Qty ajustada por minNotional: %.6f (step=%.6f, raw=%.6f, tolerancia=+10%%)",
+                            qty,
+                            step,
+                            raw_qty_val,
+                        )
                         current_notional = qty * price_val
                         if current_notional >= min_notional:
                             if min_qty > 0 and qty < min_qty:
@@ -1016,6 +1028,11 @@ class TradingApp:
                     sign = 1.0
                 elif side == "SHORT":
                     sign = -1.0
+
+                # ⚠️ Si el side no es válido, lo avisamos (pero no calculamos PnL)
+                if sign == 0.0:
+                    logging.warning("PnL no calculado: side inválido/ausente (%s)", side)
+
                 pnl_now = (mark_px - entry_px) * qty * sign
                 if metrics is not None:
                     try:
