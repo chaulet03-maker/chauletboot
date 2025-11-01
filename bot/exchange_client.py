@@ -78,3 +78,20 @@ def ensure_position_mode(exchange: Any, hedge: bool = False) -> None:
         _ = exchange.id
     except Exception:
         pass
+
+
+def normalize_symbol(symbol: str) -> str:
+    """Normaliza un símbolo a formato "BASE/QUOTE:QUOTE" (ej. BTC/USDT:USDT)."""
+
+    value = str(symbol or "").strip()
+    if not value:
+        return ""
+    value = value.upper()
+    if value.endswith(":USDT"):
+        return value
+    if value.endswith("/USDT"):
+        return f"{value}:USDT"
+    if value.endswith("USDT") and "/" not in value:
+        base = value[:-4]
+        return f"{base}/USDT:USDT"
+    return value

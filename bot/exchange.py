@@ -10,7 +10,7 @@ import ccxt
 from ccxt.base.errors import ExchangeError, NetworkError
 
 from bot.exchanges.binance_filters import build_filters
-from bot.exchange_client import ensure_position_mode, get_ccxt, reset_ccxt_client
+from bot.exchange_client import ensure_position_mode, get_ccxt, reset_ccxt_client, normalize_symbol
 from bot.runtime_state import get_mode as runtime_get_mode
 from bot.price_ws import PriceStream
 
@@ -223,7 +223,7 @@ class Exchange:
                 except Exception:
                     mark_st = entry_st
                 return {
-                    "symbol": sym_key,
+                    "symbol": normalize_symbol(sym_key) or sym_key,
                     "side": side_st,
                     "contracts": abs(qty_st),
                     "entryPrice": entry_st,
@@ -254,7 +254,7 @@ class Exchange:
                 or entry.get("markPrice") or entry.get("markprice") or 0.0
             )
             return {
-                "symbol": sym,
+                "symbol": normalize_symbol(sym),
                 "side": side,
                 "contracts": abs(amt_f),
                 "entryPrice": entry_price,
@@ -278,7 +278,7 @@ class Exchange:
                     entry = float(pos.get("entryPrice") or 0.0)
                     mark = float(pos.get("markPrice") or 0.0)
                     return {
-                        "symbol": sym,
+                        "symbol": normalize_symbol(sym),
                         "side": side,
                         "contracts": abs(amt),
                         "entryPrice": entry,
@@ -320,12 +320,11 @@ class Exchange:
                     side = "LONG" if amt_f > 0 else "SHORT"
                     sym_raw = str(info.get("symbol") or entry.get("symbol") or "")
 
-                    def fmt(s: str) -> str:
-                        return s if "/" in s else (s[:-4] + "/USDT" if s.endswith("USDT") else s)
+                    symbol_fmt = normalize_symbol(sym_raw) or sym_raw
 
                     out.append(
                         {
-                            "symbol": fmt(sym_raw),
+                            "symbol": symbol_fmt,
                             "side": side,
                             "contracts": abs(amt_f),
                             "entryPrice": float(
@@ -360,11 +359,7 @@ class Exchange:
                     side = "LONG" if amt > 0 else "SHORT"
                     entry = float(pos.get("entryPrice") or 0.0)
                     mark = float(pos.get("markPrice") or 0.0)
-                    symbol_fmt = (
-                        sym
-                        if "/" in sym
-                        else (sym[:-4] + "/USDT" if sym.endswith("USDT") else sym)
-                    )
+                    symbol_fmt = normalize_symbol(sym) or sym
                     out.append(
                         {
                             "symbol": symbol_fmt,
