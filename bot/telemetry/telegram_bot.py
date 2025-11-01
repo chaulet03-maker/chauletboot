@@ -1793,7 +1793,7 @@ async def cerrar_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     try:
-        result = await app.close_all()
+        result = await app.close_all(reason="manual")
     except Exception as exc:
         await message.reply_text(f"⚠️ Error al cerrar la posición: {exc}")
         return
@@ -2268,7 +2268,7 @@ async def killswitch_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
     close_error: Optional[str] = None
     try:
-        await engine.close_all()  # solo la del BOT
+        await engine.close_all(reason="killswitch")  # solo la del BOT
     except Exception as exc:  # pragma: no cover - defensivo
         close_error = str(exc)
     _set_killswitch(engine, True)

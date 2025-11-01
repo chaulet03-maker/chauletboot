@@ -14,6 +14,7 @@ from binance_client import client_factory
 from position_service import PositionService, EPS_QTY
 from paper_store import PaperStore
 from state_store import on_close_filled, on_open_filled
+from bot.telemetry.metrics import get_metrics
 from bot.runtime_state import get_mode as runtime_get_mode
 from paths import get_data_dir, get_paper_store_path
 from bot.logger import _warn
@@ -30,6 +31,7 @@ LAST_MODE_CHANGE_SOURCE: str = "startup"
 _INITIALIZED: bool = False
 
 _SYMBOL_RULE_CACHE: dict[tuple[int, str], dict[str, float]] = {}
+_METRICS = get_metrics()
 
 
 def _normalize_symbol(symbol: str | None) -> str:
@@ -680,6 +682,50 @@ def switch_mode(new_mode: Mode) -> ModeResult:
     return set_trading_mode(new_mode, source="legacy")
 
 
+def _extract_filled_qty(order_result: Any) -> float:
+    if not isinstance(order_result, dict):
+        return 0.0
+    for key in (
+        "executedQty",
+        "filled",
+        "size",
+        "qty",
+        "quantity",
+        "amount",
+    ):
+        value = order_result.get(key)
+        if value in (None, ""):
+            continue
+        try:
+            qty_val = float(value)
+        except Exception:
+            continue
+        if qty_val > 0:
+            return qty_val
+    fills = order_result.get("fills")
+    if isinstance(fills, list):
+        total = 0.0
+        for fill in fills:
+            if not isinstance(fill, dict):
+                continue
+            raw = (
+                fill.get("qty")
+                or fill.get("quantity")
+                or fill.get("size")
+                or fill.get("amount")
+                or fill.get("executedQty")
+            )
+            if raw in (None, ""):
+                continue
+            try:
+                total += float(raw)
+            except Exception:
+                continue
+        if total > 0:
+            return total
+    return 0.0
+
+
 def place_order_safe(side: str, qty: float, price: float | None = None, **kwargs):
     ensure_initialized()
     try:
@@ -772,6 +818,12 @@ def place_order_safe(side: str, qty: float, price: float | None = None, **kwargs
             _warn("TRADING", "PAPER: no se pudo reflejar estado tras abrir.", exc=exc)
         else:
             _warn("TRADING", "No se pudo reflejar fill en store tras abrir.", exc=exc, level="debug")
+    metrics = _METRICS
+    if metrics is not None:
+        metrics.record_order_sent()
+        filled_qty = _extract_filled_qty(result)
+        if filled_qty > 0:
+            metrics.record_order_filled(filled_qty)
     return result
 
 
