@@ -338,8 +338,14 @@ class TradingApp:
             logging.debug("No pude blindar trader.set_position", exc_info=True)
 
         # Throttle del sync live y cache de estado live (para logs)
+        try:
+            interval_cfg = float(self.config.get("live_sync_interval_seconds", 150.0))
+        except Exception:
+            interval_cfg = 150.0
+        self._live_sync_interval = max(interval_cfg, 60.0)
         self._live_sync_next_ts = 0.0
         self._live_open_cached = None  # None/True/False
+        self._live_flat_logged_state: Optional[bool] = None
 
     @property
     def active_mode(self) -> str:
@@ -638,7 +644,7 @@ class TradingApp:
             logging.info("Iniciando ciclo de análisis de mercado...")
             # --- HARD-FLAT: si en REAL la cuenta está plana, limpiamos estado local y seguimos analizando ---
             if runtime_get_mode() == "real":
-                # Throttle: sincronizar como máximo cada 120s
+                # Throttle: sincronizar como máximo cada self._live_sync_interval segundos
                 now_ts = time.time()
                 do_sync = now_ts >= float(getattr(self, "_live_sync_next_ts", 0.0))
                 live_has = bool(getattr(self, "_live_open_cached", False))
@@ -647,7 +653,7 @@ class TradingApp:
                         live_has = await asyncio.to_thread(self.sync_live_position)
                     except Exception:
                         live_has = False
-                    self._live_sync_next_ts = now_ts + 120.0
+                    self._live_sync_next_ts = now_ts + self._live_sync_interval
                     self._live_open_cached = live_has
                 if not live_has:
                     # limpiar cualquier rastro local para no “revivir” posiciones
@@ -657,10 +663,14 @@ class TradingApp:
                     except Exception:
                         pass
                     self.position_open = False
-                    logging.debug(
-                        "[HARD-FLAT] REAL: cuenta plana -> limpio estado local y SIGO analizando."
-                    )
+                    if getattr(self, "_live_flat_logged_state", None) is not False:
+                        logging.debug(
+                            "[HARD-FLAT] REAL: cuenta plana -> limpio estado local y SIGO analizando."
+                        )
+                    self._live_flat_logged_state = False
                     # **IMPORTANTE**: NO hacemos return.
+                else:
+                    self._live_flat_logged_state = True
 
             symbol_cfg = self.config.get("symbol", "BTC/USDT")
             try:
@@ -730,7 +740,7 @@ class TradingApp:
                             live_has_open = await asyncio.to_thread(self.sync_live_position)
                         except Exception:
                             live_has_open = False
-                        self._live_sync_next_ts = now_ts + 120.0
+                        self._live_sync_next_ts = now_ts + self._live_sync_interval
                         self._live_open_cached = live_has_open
 
                     if not live_has_open:
@@ -742,8 +752,10 @@ class TradingApp:
                                 self.trader._open_position = None
                         except Exception:
                             pass
+                        self._live_flat_logged_state = False
                     else:
                         # Hay posición LIVE: la volvemos a consultar (solo para armar el dict de trabajo)
+                        self._live_flat_logged_state = True
                         try:
                             ex_pos = await self.exchange.get_open_position(self.config.get("symbol"))
                         except Exception:
