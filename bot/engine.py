@@ -267,6 +267,30 @@ class TradingApp:
 
         self._start_reanudar_listener()
 
+        # --- MONKEY-PATCH: blindaje de set_position en REAL ---
+        # Si algún módulo intenta setear una posición local en REAL pero la CUENTA está FLAT,
+        # ignoramos ese set_position para evitar el loop de "posición fantasma".
+        try:
+            _orig_set_position = self.trader.set_position
+
+            async def _safe_set_position_guard(pos):
+                try:
+                    runtime_mode = (runtime_get_mode() or "paper").lower()
+                    if runtime_mode in {"real", "live"}:
+                        # Confirmamos contra la cuenta live. Si está FLAT, ignoramos cualquier pos local.
+                        live_has_pos = await asyncio.to_thread(self.sync_live_position)
+                        if not live_has_pos:
+                            logging.warning("[GUARD] REAL: cuenta FLAT → ignoro set_position externo (%s)", pos)
+                            pos = None
+                except Exception:
+                    # Ante duda, no dejamos rehidratar nada en REAL
+                    pos = None
+                return await _orig_set_position(pos)
+
+            self.trader.set_position = _safe_set_position_guard  # type: ignore[assignment]
+        except Exception:
+            logging.debug("No se pudo instalar guardia de set_position", exc_info=True)
+
     @property
     def active_mode(self) -> str:
         return str(trading.ACTIVE_MODE).lower()
@@ -621,21 +645,14 @@ class TradingApp:
 
                 # --- En REAL nunca confiar en local si el exchange no reporta abierta ---
                 if runtime_get_mode() == "real":
+                    # Primero confirmamos el estado LIVE desde el cliente real.
                     try:
-                        ex_pos = await self.exchange.get_open_position(self.config.get("symbol"))
-                        ex_qty = float(
-                            (ex_pos or {}).get("contracts")
-                            or (ex_pos or {}).get("positionAmt")
-                            or (ex_pos or {}).get("size")
-                            or 0.0
-                        )
-                        live_has_open = abs(ex_qty) > 0.0
+                        live_has_open = await asyncio.to_thread(self.sync_live_position)
                     except Exception:
-                        ex_pos = None
                         live_has_open = False
 
                     if not live_has_open:
-                        # limpiar cualquier rastro local para no “revivir” posiciones
+                        # Cuenta FLAT → limpiamos y NO permitimos que nada rehidrate localmente
                         bot_has_open = False
                         position = None
                         try:
@@ -644,17 +661,41 @@ class TradingApp:
                         except Exception:
                             pass
                     else:
-                        # si hay en el exchange, mapear a la cache local coherente
-                        bot_has_open = True
-                        side = ((ex_pos or {}).get("side") or side or "FLAT").upper()
-                        position = {
-                            "symbol": (ex_pos or {}).get("symbol", self.config.get("symbol")),
-                            "side": side,
-                            "contracts": ex_qty,
-                            "entryPrice": float((ex_pos or {}).get("entryPrice") or 0.0),
-                            "markPrice": float((ex_pos or {}).get("markPrice") or 0.0),
-                        }
-                        await self.trader.set_position(position)
+                        # Hay posición LIVE: la volvemos a consultar (solo para armar el dict de trabajo)
+                        try:
+                            ex_pos = await self.exchange.get_open_position(self.config.get("symbol"))
+                        except Exception:
+                            ex_pos = None
+                        ex_qty = 0.0
+                        entry_px = 0.0
+                        mark_px = 0.0
+                        side_live = side
+                        try:
+                            ex_qty = float(
+                                (ex_pos or {}).get("contracts")
+                                or (ex_pos or {}).get("positionAmt")
+                                or (ex_pos or {}).get("size")
+                                or 0.0
+                            )
+                            entry_px = float((ex_pos or {}).get("entryPrice") or 0.0)
+                            mark_px = float((ex_pos or {}).get("markPrice") or 0.0)
+                            side_live = ((ex_pos or {}).get("side") or side or "FLAT").upper()
+                        except Exception:
+                            pass
+                        bot_has_open = abs(ex_qty) > 0.0
+                        if bot_has_open and entry_px > 0.0:
+                            position = {
+                                "symbol": (ex_pos or {}).get("symbol", self.config.get("symbol")),
+                                "side": side_live,
+                                "contracts": ex_qty,
+                                "entryPrice": entry_px,
+                                "markPrice": mark_px,
+                            }
+                            # set_position queda blindado por el guard del __init__
+                            await self.trader.set_position(position)
+                        else:
+                            position = None
+                            bot_has_open = False
                 else:
                     # SIM: sólo si qty_local > 0 (|qty| > 1e-12) y side != FLAT
                     if bot_has_open:
@@ -772,7 +813,7 @@ class TradingApp:
                     return None
                 return f if math.isfinite(f) else None
 
-            # --- GUARD RAILS: en REAL no aceptamos posiciones "sintéticas" ---
+            # --- GUARD RAILS extra: en REAL no aceptamos posiciones "sintéticas" ---
             if position:
                 try:
                     mode = getattr(self, "mode", None) or getattr(self, "config", {}).get("mode")
