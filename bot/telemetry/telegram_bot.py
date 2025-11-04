@@ -1299,7 +1299,7 @@ async def ayuda_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     lines = ["📋 *Lista de Comandos*"]
     for name, desc in REGISTRY.help_lines():
-        lines.append(f"- *{name}*: {desc}")
+        lines.append(f"- `{name}`: {desc}")
     text = "\n".join(lines)
     message = update.effective_message
     if message is None:
