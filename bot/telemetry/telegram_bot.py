@@ -11,7 +11,8 @@ from collections import deque
 from datetime import datetime, timedelta, time as dtime, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Union
+from html import escape as html_escape
 
 import pandas as pd
 import yaml
@@ -78,6 +79,30 @@ def _fmt_money(v: float) -> str:
         return f"{float(v):,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
     except Exception:
         return str(v)
+
+
+def _fmt_usd(x, dp: int = 2) -> str:
+    try:
+        return f"{float(x):,.{dp}f}"
+    except Exception:
+        return "—"
+
+
+def _fmt_pct_8h(x, dp: int = 4) -> str:
+    """Convierte 8.949e-05 -> '0.0089% cada 8h'"""
+
+    try:
+        v = float(x) * 100.0
+        return f"{v:.{dp}f}% cada 8h"
+    except Exception:
+        return "—"
+
+
+def _fmt_age_seconds(s, dp: int = 1) -> str:
+    try:
+        return f"{float(s):.{dp}f} s"
+    except Exception:
+        return "—"
 
 
 def _fmt_sign_money(v: float) -> str:
@@ -376,66 +401,112 @@ async def estado_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if app is None or message is None:
         return
 
-    sym = app.config.get("symbol", "BTC/USDT") if getattr(app, "config", None) else "BTC/USDT"
-    mode_txt = "REAL" if getattr(app, "is_live", False) else "SIMULADO"
+    exchange = getattr(app, "exchange", None)
+    market = getattr(app, "market", None)
+    trading = getattr(app, "trading", None)
+    symbols = getattr(app, "symbols", None)
 
     try:
-        bal = await app.exchange.fetch_balance_usdt()
-    except Exception:
-        bal = 0.0
+        if trading and hasattr(trading, "get_mode"):
+            mode_raw = await trading.get_mode()
+        else:
+            mode_raw = "real" if getattr(app, "is_live", False) else "simulado"
+        mode = str(mode_raw or "").upper()
 
-    try:
-        fr = await app.exchange.fetch_current_funding_rate(sym)
-    except Exception:
-        fr = None
-
-    day_stats = week_stats = None
-    if hasattr(app, "get_period_stats"):
-        try:
-            day_stats = app.get_period_stats(days=1)
-        except Exception:
-            day_stats = None
-        try:
-            week_stats = app.get_period_stats(days=7)
-        except Exception:
-            week_stats = None
-
-    def _fmt_stats(stats):
-        if not stats:
-            return "—"
-        eq0 = float(stats.get("equity_ini") or 0.0)
-        pnl = float(stats.get("pnl") or 0.0)
-        pct = (pnl / eq0 * 100.0) if eq0 else 0.0
-        sign = "+" if pnl >= 0 else ""
-        return f"{sign}{pnl:,.2f} ({sign}{pct:.2f}%)"
-
-    text = (
-        "<b>🩺 Diagnóstico</b>\n"
-        f"• Modo: <b>{mode_txt}</b>\n"
-        f"• Símbolo: {sym.replace('/', '')}\n"
-        f"• CCXT: {'AUTENTICADO' if getattr(app, 'is_live', False) else 'PÚBLICO'}\n"
-        f"• Funding rate: {fr if fr is not None else '—'}\n"
-        f"• Saldo: {bal:,.2f}\n"
-        f"• PnL 24h: {_fmt_stats(day_stats)}\n"
-        f"• PnL 7d:  {_fmt_stats(week_stats)}"
-    )
-
-    try:
-        split_info, _, _ = await _compute_position_split(app)
-    except Exception:
-        split_info = None
-    if isinstance(split_info, dict):
-        bot_qty = _safe_float((split_info.get("bot") or {}).get("qty"))
-        manual_qty = _safe_float((split_info.get("manual") or {}).get("qty"))
-        if bot_qty > 0 or manual_qty > 0:
-            bot_pnl = _safe_float((split_info.get("bot") or {}).get("pnl"))
-            total_pnl = _safe_float((split_info.get("total") or {}).get("pnl"))
-            text += (
-                f"\n• PnL BOT: {bot_pnl:+,.2f}"
-                f"\n• PnL TOTAL: {total_pnl:+,.2f}"
+        if symbols and hasattr(symbols, "get_active_symbol"):
+            symbol = await symbols.get_active_symbol()
+        else:
+            symbol = (
+                app.config.get("symbol", "BTC/USDT")
+                if getattr(app, "config", None)
+                else "BTC/USDT"
             )
 
-    await message.reply_html(text)
+        ccxt_ok = False
+        if exchange and hasattr(exchange, "is_authenticated"):
+            try:
+                ccxt_ok = bool(await exchange.is_authenticated())
+            except TypeError:
+                ccxt_ok = bool(exchange.is_authenticated())
+
+        price = None
+        if market and hasattr(market, "get_last_price"):
+            try:
+                price = await market.get_last_price(symbol)
+            except TypeError:
+                price = await market.get_last_price()
+        elif exchange and hasattr(exchange, "get_current_price"):
+            try:
+                price = await exchange.get_current_price(symbol)
+            except TypeError:
+                price = await exchange.get_current_price()
+
+        bal: Union[Dict[str, Any], float, None] = None
+        if exchange and hasattr(exchange, "fetch_balance_usdt"):
+            try:
+                bal = await exchange.fetch_balance_usdt(account_type="future")
+            except TypeError:
+                bal = await exchange.fetch_balance_usdt()
+        equity = 0.0
+        if isinstance(bal, dict):
+            equity = float(bal.get("equity") or bal.get("total") or 0.0)
+        elif bal is not None:
+            equity = float(bal)
+
+        fr_raw = None
+        if market and hasattr(market, "get_last_funding_rate"):
+            try:
+                fr_raw = await market.get_last_funding_rate(symbol)
+            except TypeError:
+                fr_raw = await market.get_last_funding_rate()
+        elif exchange and hasattr(exchange, "fetch_current_funding_rate"):
+            try:
+                fr_raw = await exchange.fetch_current_funding_rate(symbol)
+            except TypeError:
+                fr_raw = await exchange.fetch_current_funding_rate()
+        fr_txt = _fmt_pct_8h(fr_raw)
+
+        split, mark_px, _ = await _compute_position_split(app)
+        total = (split or {}).get("total") or {}
+        try:
+            qty = float(total.get("qty") or 0.0)
+        except Exception:
+            qty = 0.0
+
+        lines = ["<b>🩺 Estado</b>"]
+        lines.append(f"• Modo: <b>{html_escape(mode)}</b>")
+        lines.append(f"• Símbolo: {html_escape(str(symbol or ''))}")
+        lines.append(f"• CCXT: {'AUTENTICADO' if ccxt_ok else 'NO AUTENTICADO'}")
+        lines.append(f"• Precio: {_fmt_usd(price, dp=1)}")
+        lines.append(f"• Equity: {_fmt_usd(equity, dp=2)} USDT")
+        lines.append(f"• Funding: {fr_txt}")
+
+        if qty <= 0:
+            lines.append("• Posición: <i>No hay posiciones abiertas.</i>")
+        else:
+            side = str(total.get("side") or "FLAT").upper()
+            entry = float(total.get("entry_price") or 0.0)
+            mark = float(mark_px or 0.0)
+            pnl = float(total.get("pnl") or 0.0)
+            try:
+                roe_val = float(total.get("roe"))
+            except Exception:
+                roe_val = None
+            lev = total.get("leverage")
+            lines.append(f"• Posición: <b>{html_escape(str(symbol or ''))} {side}</b>")
+            lines.append(
+                f"  Qty: {qty:.6f} | Entrada: {_fmt_usd(entry)} | Mark: {_fmt_usd(mark)}"
+            )
+            if lev:
+                lines.append(f"  Lev: x{lev}")
+            pnl_prefix = "+" if pnl >= 0 else ""
+            pnl_text = f"{pnl_prefix}{_fmt_usd(pnl)}"
+            roe_text = f" | ROE: {roe_val:.2f}%" if roe_val is not None else ""
+            lines.append(f"  PnL: {pnl_text}{roe_text}")
+
+        await message.reply_html("\n".join(lines))
+    except Exception as exc:
+        await message.reply_text(f"No pude armar el estado: {exc}")
 
 
 async def posicion_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2493,69 +2564,95 @@ async def equity_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def diag_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Diagnóstico rápido del estado del bot."""
-    engine = _get_engine_from_context(context)
-    if engine is None:
-        await _reply_chunks(update, "Engine no disponible.")
+    app = _get_app_from_context(context)
+    message = update.effective_message
+    if app is None or message is None:
         return
 
-    lines = ["🧪 *Diagnóstico*"]
+    exchange = getattr(app, "exchange", None)
+    market = getattr(app, "market", None)
+    trading = getattr(app, "trading", None)
+    symbols = getattr(app, "symbols", None)
 
     try:
-        mode = str(get_mode()).upper()
-    except Exception:
-        mode = "DESCONOCIDO"
-    lines.append(f"• Modo: `{mode}`")
-
-    ex = getattr(engine, "exchange", None)
-    if ex:
-        try:
-            authed = bool(getattr(ex, "is_authenticated", False))
-            client = getattr(ex, "client", None)
-            if authed and client is not None:
-                authed = bool(getattr(client, "apiKey", None))
-            lines.append(f"• CCXT: {'AUTENTICADO' if authed else 'PÚBLICO'}")
-        except Exception:
-            lines.append("• CCXT: (estado desconocido)")
-
-        try:
-            px = await ex.get_current_price()
-            lines.append(f"• Precio cache: {px if px is not None else 'N/D'}")
-            try:
-                age = ex.get_price_age_sec()
-            except Exception:
-                age = None
-            if age is not None and age != float("inf"):
-                lines.append(f"• Edad precio WS: {age:.1f}s")
-                if age > 10:
-                    lines.append("⚠️ WS frío (>10s sin precio). Revisa conexión.")
-        except Exception:
-            lines.append("• Precio cache: error")
-
-        try:
-            symbol = engine.config.get("symbol", "BTC/USDT") if getattr(engine, "config", None) else "BTC/USDT"
-            if getattr(ex, "public_client", None):
-                fr = await asyncio.to_thread(ex.public_client.fetchFundingRate, symbol)
-                val = float(fr.get("fundingRate")) if fr else None
-            else:
-                val = None
-            lines.append(f"• Funding rate: {val if val is not None else 'N/D'}")
-        except Exception:
-            lines.append("• Funding rate: error")
-    else:
-        lines.append("• Exchange: N/D")
-
-    try:
-        trader = getattr(engine, "trader", None)
-        if trader is not None:
-            eq = await trader.get_balance(ex)
+        if trading and hasattr(trading, "get_mode"):
+            mode_raw = await trading.get_mode()
         else:
-            eq = None
-        lines.append(f"• Equity: {eq if eq is not None else 'N/D'}")
-    except Exception:
-        lines.append("• Equity: error")
+            mode_raw = get_mode()
+        mode = str(mode_raw or "").upper()
 
-    await _reply_chunks(update, "\n".join(lines), parse_mode="Markdown")
+        ccxt_ok = False
+        if exchange and hasattr(exchange, "is_authenticated"):
+            try:
+                ccxt_ok = bool(await exchange.is_authenticated())
+            except TypeError:
+                ccxt_ok = bool(exchange.is_authenticated())
+
+        if symbols and hasattr(symbols, "get_active_symbol"):
+            symbol = await symbols.get_active_symbol()
+        else:
+            symbol = (
+                app.config.get("symbol", "BTC/USDT")
+                if getattr(app, "config", None)
+                else "BTC/USDT"
+            )
+
+        price_cache = None
+        if market and hasattr(market, "get_last_price_from_cache"):
+            try:
+                price_cache = await market.get_last_price_from_cache(symbol)
+            except TypeError:
+                price_cache = await market.get_last_price_from_cache()
+        elif exchange and hasattr(exchange, "get_current_price"):
+            try:
+                price_cache = await exchange.get_current_price(symbol)
+            except TypeError:
+                price_cache = await exchange.get_current_price()
+
+        ws_age = None
+        if market and hasattr(market, "get_ws_price_age_seconds"):
+            ws_age = await market.get_ws_price_age_seconds()
+        elif exchange and hasattr(exchange, "get_price_age_sec"):
+            ws_age = exchange.get_price_age_sec()
+
+        fr_raw = None
+        if market and hasattr(market, "get_last_funding_rate"):
+            try:
+                fr_raw = await market.get_last_funding_rate(symbol)
+            except TypeError:
+                fr_raw = await market.get_last_funding_rate()
+        elif exchange and hasattr(exchange, "fetch_current_funding_rate"):
+            try:
+                fr_raw = await exchange.fetch_current_funding_rate(symbol)
+            except TypeError:
+                fr_raw = await exchange.fetch_current_funding_rate()
+        fr_pct = _fmt_pct_8h(fr_raw)
+        fr_raw_txt = html_escape(str(fr_raw)) if fr_raw is not None else "—"
+
+        bal: Union[Dict[str, Any], float, None] = None
+        if exchange and hasattr(exchange, "fetch_balance_usdt"):
+            try:
+                bal = await exchange.fetch_balance_usdt(account_type="future")
+            except TypeError:
+                bal = await exchange.fetch_balance_usdt()
+        equity = 0.0
+        if isinstance(bal, dict):
+            equity = float(bal.get("equity") or bal.get("total") or 0.0)
+        elif bal is not None:
+            equity = float(bal)
+
+        lines = ["<b>🧪 Diagnóstico</b>"]
+        lines.append(f"• Modo: <b>{html_escape(mode)}</b>")
+        lines.append(f"• CCXT: {'AUTENTICADO' if ccxt_ok else 'NO AUTENTICADO'}")
+        lines.append(f"• Precio cache: {_fmt_usd(price_cache, dp=1)}")
+        lines.append(f"• Edad precio WS: {_fmt_age_seconds(ws_age)}")
+        lines.append(f"• Funding rate (raw): {fr_raw_txt}")
+        lines.append(f"• Funding rate: {fr_pct}")
+        lines.append(f"• Equity: {_fmt_usd(equity)}")
+
+        await message.reply_html("\n".join(lines))
+    except Exception as exc:
+        await message.reply_text(f"No pude armar el diagnóstico: {exc}")
 
 
 async def motivos_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
