@@ -1924,7 +1924,7 @@ async def control_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     result = trading.set_trading_mode("real", source="telegram/control")
     if not result.ok:
-        await message.reply_text(f"❌ No pude activar modo REAL: {result.msg}", parse_mode="Markdown")
+        await message.reply_text(f"❌ No pude activar modo REAL: {result.msg}")
         return
 
     extra = result.msg or ""
@@ -1934,7 +1934,7 @@ async def control_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if line.strip() and "Modo cambiado" not in line
     ]
     if warn_lines:
-        await message.reply_text("\n".join(warn_lines), parse_mode="Markdown")
+        await message.reply_text("\n".join(warn_lines))
 
     try:
         if hasattr(engine, "exchange") and engine.exchange:
