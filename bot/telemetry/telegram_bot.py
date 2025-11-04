@@ -341,7 +341,7 @@ async def open_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await message.reply_text(
         "Uso manual: `open long x10` o `open short x5`."
-        " El bot calculará el tamaño usando MANUAL_OPEN_RISK_PCT.",
+        " El bot calculará el tamaño usando `MANUAL_OPEN_RISK_PCT`.",
         parse_mode="Markdown",
     )
 
@@ -445,13 +445,30 @@ async def posicion_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     try:
-        split_data, mark_price, _ = await _compute_position_split(app)
+        split_data, mark_price, symbol_cfg = await _compute_position_split(app)
     except Exception as exc:
         await message.reply_text(f"No pude obtener la información de posiciones: {exc}")
         return
 
-    summary_text = _format_split_summary(split_data, mark_price)
-    await message.reply_html(summary_text)
+    total = (split_data or {}).get("total") or {}
+    qty = _safe_float(total.get("qty"))
+    if qty <= 0:
+        await message.reply_text("No hay posiciones abiertas.")
+        return
+
+    side = str(total.get("side") or "FLAT").upper()
+    entry_px = _safe_float(total.get("entry_price"))
+    entry_txt = f"{entry_px:,.2f}" if entry_px > 0 else "—"
+    mark_txt = f"{_safe_float(mark_price):,.2f}" if _safe_float(mark_price) > 0 else "—"
+    pnl = _safe_float(total.get("pnl"))
+
+    text = (
+        f"<b>📍 {symbol_cfg} {side}</b>\n"
+        f"• Qty: {qty:.6f}\n"
+        f"• Entrada: {entry_txt} | Mark: {mark_txt}\n"
+        f"• PnL: {pnl:+,.2f}"
+    )
+    await message.reply_html(text)
 
 
 async def posiciones_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -466,7 +483,22 @@ async def posiciones_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await message.reply_text(f"No pude obtener la información de posiciones: {exc}")
         return
 
-    sections: List[str] = [_format_split_summary(split_data, mark_price)]
+    sections: List[str] = []
+    # Bloque principal (símbolo configurado) si hay posición abierta
+    total = (split_data or {}).get("total") or {}
+    total_qty = _safe_float(total.get("qty"))
+    if total_qty > 0:
+        side = str(total.get("side") or "FLAT").upper()
+        entry_px = _safe_float(total.get("entry_price"))
+        entry_txt = f"{entry_px:,.2f}" if entry_px > 0 else "—"
+        mark_txt = f"{_safe_float(mark_price):,.2f}" if _safe_float(mark_price) > 0 else "—"
+        pnl = _safe_float(total.get("pnl"))
+        sections.append(
+            f"<b>📍 {symbol_cfg} {side}</b>\n"
+            f"• Qty: {total_qty:.6f}\n"
+            f"• Entrada: {entry_txt} | Mark: {mark_txt}\n"
+            f"• PnL: {pnl:+,.2f}"
+        )
 
     try:
         allpos = await app.exchange.list_open_positions()
@@ -511,6 +543,11 @@ async def posiciones_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if other_sections:
         sections.append("<b>📈 Otras posiciones</b>")
         sections.append("\n\n".join(other_sections))
+
+    # Si no hay sección principal ni otras, no hay posiciones
+    if not sections:
+        await message.reply_text("No hay posiciones abiertas.")
+        return
 
     await message.reply_html("\n\n".join(sections))
 
