@@ -52,6 +52,21 @@ logger = logging.getLogger("telegram")
 REGISTRY = CommandRegistry()
 
 
+async def _is_auth(exchange) -> bool:
+    """
+    Devuelve True/False sin romper si `is_authenticated`
+    es atributo bool, función sync o coroutine.
+    """
+
+    val = getattr(exchange, "is_authenticated", None)
+    if callable(val):
+        res = val()
+        if inspect.isawaitable(res):
+            return bool(await res)
+        return bool(res)
+    return bool(val)
+
+
 async def reply_markdown_safe(message, text: str):
     """Reply using Markdown but fallback to plain text if formatting fails."""
 
@@ -422,12 +437,7 @@ async def estado_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 else "BTC/USDT"
             )
 
-        ccxt_ok = False
-        if exchange and hasattr(exchange, "is_authenticated"):
-            try:
-                ccxt_ok = bool(await exchange.is_authenticated())
-            except TypeError:
-                ccxt_ok = bool(exchange.is_authenticated())
+        ccxt_ok = await _is_auth(exchange)
 
         price = None
         if market and hasattr(market, "get_last_price"):
@@ -2581,12 +2591,7 @@ async def diag_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             mode_raw = get_mode()
         mode = str(mode_raw or "").upper()
 
-        ccxt_ok = False
-        if exchange and hasattr(exchange, "is_authenticated"):
-            try:
-                ccxt_ok = bool(await exchange.is_authenticated())
-            except TypeError:
-                ccxt_ok = bool(exchange.is_authenticated())
+        ccxt_ok = await _is_auth(exchange)
 
         if symbols and hasattr(symbols, "get_active_symbol"):
             symbol = await symbols.get_active_symbol()
