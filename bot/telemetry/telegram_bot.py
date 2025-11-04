@@ -16,6 +16,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 import pandas as pd
 import yaml
 from telegram import Update
+from telegram.error import BadRequest
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 from telegram.request import HTTPXRequest
 
@@ -48,6 +49,17 @@ from position_service import (
 logger = logging.getLogger("telegram")
 
 REGISTRY = CommandRegistry()
+
+
+async def reply_markdown_safe(message, text: str):
+    """Reply using Markdown but fallback to plain text if formatting fails."""
+
+    try:
+        return await message.reply_text(text, parse_mode="Markdown")
+    except BadRequest as exc:
+        if "Can't parse entities" in str(exc):
+            return await message.reply_text(text)
+        raise
 
 
 CLOSE_TEXT_RE_PATTERN = r"(?i)^(cerrar(?: posicion| posición)?|close)$"
@@ -2194,19 +2206,22 @@ async def _cmd_modo_simulado(engine, reply):
 
 async def _cmd_modo_real(engine, reply):
     if _get_mode_from_engine(engine) == "live":
-        return await reply("✅ El bot ya está en *MODO REAL*.")
+        await reply("✅ El bot ya está en *MODO REAL*.")
+        return True
 
     try:
         engine.set_mode("live", source="telegram")
     except Exception as e:
-        return await reply(f"⚠️ No pude cambiar a REAL: {e}")
+        await reply(f"⚠️ No pude cambiar a REAL: {e}")
+        return False
 
     ex = getattr(engine, "exchange", None)
     if ex and hasattr(ex, "upgrade_to_real_if_needed"):
         try:
             await ex.upgrade_to_real_if_needed()
         except Exception as e:
-            return await reply(f"⚠️ No pude autenticar el exchange: {e}")
+            await reply(f"⚠️ No pude autenticar el exchange: {e}")
+            return False
 
     # Verificaciones
     authed = False
@@ -2227,10 +2242,48 @@ async def _cmd_modo_real(engine, reply):
         bal_txt = " | saldo: N/D"
 
     if not authed:
-        return await reply("⚠️ MODO REAL activado pero *no veo auth en CCXT*. "
-                            "Verificá API/SECRET, permisos de Futuros y `defaultType=future` en el cliente.")
+        await reply(
+            "⚠️ MODO REAL activado pero *no veo auth en CCXT*. "
+            "Verificá API/SECRET, permisos de Futuros y `defaultType=future` en el cliente."
+        )
+        return False
 
-    return await reply(f"✅ MODO REAL activado{bal_txt}")
+    await reply(f"✅ MODO REAL activado{bal_txt}")
+    return True
+
+
+def _schedule_live_sync_after_mode_real(engine, message, context):
+    if engine is None or message is None:
+        return
+
+    application = getattr(context, "application", None)
+    if application is None or not hasattr(application, "create_task"):
+        return
+
+    if not hasattr(engine, "sync_live_position"):
+        return
+
+    async def _run_sync():
+        try:
+            synced = await asyncio.to_thread(engine.sync_live_position)
+        except Exception as exc:
+            try:
+                await reply_markdown_safe(
+                    message, f"❌ Error al sincronizar posición LIVE automáticamente: {exc}"
+                )
+            except Exception:
+                logger.debug("modo_real: no se pudo avisar error de sync.", exc_info=True)
+            return
+
+        text = "✅ Posición LIVE sincronizada automáticamente."
+        if not synced:
+            text = "ℹ️ No encontré posición LIVE en el exchange."
+        try:
+            await reply_markdown_safe(message, text)
+        except Exception:
+            logger.debug("modo_real: no se pudo avisar resultado de sync.", exc_info=True)
+
+    application.create_task(_run_sync())
 
 
 async def modo_simulado_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2243,7 +2296,7 @@ async def modo_simulado_command(update: Update, context: ContextTypes.DEFAULT_TY
         await _reply_chunks(update, "No pude acceder al engine.")
         return
 
-    reply_md = lambda txt: message.reply_text(txt, parse_mode="Markdown")
+    reply_md = lambda txt: reply_markdown_safe(message, txt)
     await _cmd_modo_simulado(engine, reply_md)
 
 
@@ -2257,8 +2310,10 @@ async def modo_real_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _reply_chunks(update, "No pude acceder al engine.")
         return
 
-    reply_md = lambda txt: message.reply_text(txt, parse_mode="Markdown")
-    await _cmd_modo_real(engine, reply_md)
+    reply_md = lambda txt: reply_markdown_safe(message, txt)
+    should_sync = await _cmd_modo_real(engine, reply_md)
+    if should_sync:
+        _schedule_live_sync_after_mode_real(engine, message, context)
 
 
 async def killswitch_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2674,7 +2729,7 @@ async def _dispatch_command(
 
     reply_md = None
     if engine is not None and message is not None:
-        reply_md = lambda txt: message.reply_text(txt, parse_mode="Markdown")
+        reply_md = lambda txt: reply_markdown_safe(message, txt)
         if await _handle_position_controls(engine, reply_md, text):
             return
         for candidate in candidates:
@@ -2686,7 +2741,9 @@ async def _dispatch_command(
                 await _cmd_modo_simulado(engine, reply_md)
                 return
             if candidate in ("modo real", "real", "live") or candidate.startswith("modo real "):
-                await _cmd_modo_real(engine, reply_md)
+                should_sync = await _cmd_modo_real(engine, reply_md)
+                if should_sync:
+                    _schedule_live_sync_after_mode_real(engine, message, context)
                 return
     chat = update.effective_chat
     notifier = None
@@ -2702,14 +2759,12 @@ async def _dispatch_command(
     logger.debug("Resolve: '%s' -> %s", text, command)
     if not command:
         if message is not None:
-            await message.reply_text(unknown_message, parse_mode="Markdown")
+            await reply_markdown_safe(message, unknown_message)
         return
     handler = REGISTRY.handler_for(command)
     if handler is None:
         if message is not None:
-            await message.reply_text(
-                "Comando no disponible. Escribí *ayuda*.", parse_mode="Markdown"
-            )
+            await reply_markdown_safe(message, "Comando no disponible. Escribí *ayuda*.")
         return
     await handler(update, context)
 
