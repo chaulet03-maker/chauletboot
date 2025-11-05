@@ -150,7 +150,12 @@ def main(argv: list[str] | None = None):
     logging.info("DATA_DIR=%s", get_data_dir())
 
     app = TradingApp(cfg, mode_source=mode_source)
-    app.run()
+
+    try:
+        app.run()
+    except Exception:
+        logging.exception("Error ejecutando el bot")
+        raise
 
 
 if __name__ == "__main__":
@@ -158,3 +163,6 @@ if __name__ == "__main__":
         main()
     except KeyboardInterrupt:
         logging.info("Bot detenido manualmente.")
+    except Exception:
+        logging.exception("Error fatal en el bot")
+        sys.exit(1)
