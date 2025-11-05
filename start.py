@@ -4,6 +4,8 @@ import os
 import sys
 import logging
 import atexit
+from pathlib import Path
+
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -20,29 +22,101 @@ from bot.mode_manager import ensure_startup_mode
 from paths import get_data_dir
 
 
-def main(argv: list[str] | None = None):
-    # --- SINGLE INSTANCE LOCK ---
-    import os, sys
-    LOCK_PATH = "/tmp/chauletbot.lock"
-    if os.path.exists(LOCK_PATH):
+LOCK_PATH = Path("/tmp/chauletbot.lock")
+
+
+def _read_lock_pid(lock_path: Path) -> int | None:
+    try:
+        with lock_path.open("r", encoding="utf-8") as lock_file:
+            content = lock_file.read().strip()
+    except OSError:
+        return None
+
+    if not content:
+        return None
+
+    try:
+        return int(content)
+    except ValueError:
+        return None
+
+
+def _pid_is_running(pid: int) -> bool:
+    if pid <= 0:
+        return False
+
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        # The process exists but belongs to another user.
+        return True
+    except OSError:
+        return False
+    else:
+        return True
+
+
+def _acquire_single_instance_lock() -> None:
+    current_pid = os.getpid()
+
+    if LOCK_PATH.exists():
+        existing_pid = _read_lock_pid(LOCK_PATH)
+
+        if existing_pid and existing_pid != current_pid and _pid_is_running(existing_pid):
+            print(
+                f"[LOCK] Ya hay un bot ejecutándose (PID={existing_pid}). Cerralo antes de iniciar otro.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+        # El lock es inválido o huérfano, intentamos eliminarlo.
         try:
-            with open(LOCK_PATH, "r") as f:
-                pid = int(f.read().strip() or "0")
-            if pid and pid != os.getpid():
-                print(f"[LOCK] Ya hay un bot ejecutándose (PID={pid}). Cerralo antes de iniciar otro.")
-                sys.exit(1)
-        except Exception:
+            LOCK_PATH.unlink()
+            logging.warning("Lock huérfano eliminado: %s", LOCK_PATH)
+        except FileNotFoundError:
             pass
-    with open(LOCK_PATH, "w") as f:
-        f.write(str(os.getpid()))
+        except PermissionError as exc:
+            print(
+                f"[LOCK] No se pudo limpiar el lock obsoleto ({LOCK_PATH}): {exc}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        except OSError as exc:
+            logging.exception("No se pudo limpiar el lock huérfano")
+            print(
+                f"[LOCK] Error eliminando lock obsoleto ({LOCK_PATH}): {exc}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+    try:
+        LOCK_PATH.write_text(str(current_pid), encoding="utf-8")
+    except OSError as exc:
+        logging.exception("No se pudo crear el archivo de lock")
+        print(
+            f"[LOCK] No se pudo crear el archivo de lock ({LOCK_PATH}): {exc}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
     @atexit.register
-    def _cleanup_lock():
+    def _cleanup_lock() -> None:
         try:
-            if os.path.exists(LOCK_PATH):
-                os.remove(LOCK_PATH)
-        except Exception:
+            if LOCK_PATH.exists():
+                existing_pid = _read_lock_pid(LOCK_PATH)
+                if existing_pid == current_pid:
+                    LOCK_PATH.unlink()
+        except FileNotFoundError:
             pass
+        except OSError:
+            logging.exception("No se pudo eliminar el archivo de lock al finalizar")
+
+
+def main(argv: list[str] | None = None):
+    # --- SINGLE INSTANCE LOCK ---
+    _acquire_single_instance_lock()
 
     parser = argparse.ArgumentParser(description="Inicia el bot de trading")
     parser.add_argument(
