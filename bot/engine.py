@@ -1155,6 +1155,12 @@ class TradingApp:
                 _emit_motive({"reasons": ["bot en pausa"]})
                 return
 
+            # Gate manual (killswitch/allow_new_entries) seteado desde Telegram
+            if not bool(getattr(self, "allow_new_entries", True)):
+                logging.info("Entradas deshabilitadas (allow_new_entries=false).")
+                _emit_motive({"reasons": ["entradas deshabilitadas"]})
+                return
+
             ban_hours_cfg = self.config.get("ban_hours", "")
             if isinstance(ban_hours_cfg, (list, tuple, set)):
                 try:
@@ -1494,17 +1500,32 @@ class TradingApp:
                 _emit_motive({"reasons": ["exchange_error: precio de entrada no disponible"]}, side_value=signal)
                 return
             entry_price = float(entry_price)
+            # --- Tamaño por equity ---
+            # Acepta:
+            #  - equity: 1..100 (porcentaje de equity a usar en esta entrada)
+            #  - risk_pct: puede venir como 0..1 (fracción) o 0..100 (porcentaje)
+            #  - size_mode: "full_equity" usa 100% del equity
+            size_mode = str(self.config.get("size_mode", "") or "").lower()
+            risk_cfg = self.config.get("equity", self.config.get("risk_pct", 2.0))
             try:
-                risk_pct = float(self.config.get("risk_pct", 0.02))
+                risk_val = float(risk_cfg)
             except Exception:
-                risk_pct = 0.02
-            if risk_pct <= 0:
-                risk_pct = 0.02
+                risk_val = 2.0
+
+            if size_mode == "full_equity":
+                risk_frac = 1.0
+            else:
+                # Si el usuario puso 98 (porcentaje), se normaliza a 0.98
+                risk_frac = (risk_val / 100.0) if risk_val > 1.0 else risk_val
+
+            # límites sanos
+            risk_frac = min(max(risk_frac, 0.0001), 1.0)
+
             raw_qty = _compute_order_qty_from_equity(
                 eq_on_open,
                 entry_price,
                 leverage,
-                risk_pct,
+                risk_frac,
             )
 
             raw_filters = await self.exchange.get_symbol_filters(symbol_conf)
