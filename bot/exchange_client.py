@@ -24,44 +24,42 @@ def get_ccxt() -> ccxt.Exchange:
     except Exception:
         pass
 
-    use_testnet = (os.getenv("BINANCE_UMFUTURES_TESTNET", "false").lower() == "true")
+    use_testnet = str(os.getenv("USE_TESTNET", "0")).lower() in ("1", "true")
 
-    # Pares de variables admitidas (en orden de preferencia según testnet)
-    candidates = [
-        ("BINANCE_API_KEY_TEST", "BINANCE_API_SECRET_TEST"),
-        ("BINANCE_API_KEY_REAL", "BINANCE_API_SECRET_REAL"),
-        ("BINANCE_API_KEY", "BINANCE_API_SECRET"),
-        ("BINANCE_KEY", "BINANCE_SECRET"),
-    ]
-    ordered = (
-        [candidates[0], candidates[1], candidates[2], candidates[3]] if use_testnet
-        else [candidates[1], candidates[2], candidates[3], candidates[0]]
-    )
-
-    api_key = api_secret = None
-    for k, s in ordered:
-        ak = os.getenv(k) or os.getenv(k.lower())
-        sk = os.getenv(s) or os.getenv(s.lower())
-        if ak and sk:
-            api_key, api_secret = ak, sk
-            break
+    api_key = (
+        os.getenv("BINANCE_API_KEY", "")
+        or os.getenv("BINANCE_API_KEY_REAL", "")
+        or (os.getenv("BINANCE_API_KEY_TEST", "") if use_testnet else "")
+    ).strip()
+    api_secret = (
+        os.getenv("BINANCE_API_SECRET", "")
+        or os.getenv("BINANCE_API_SECRET_REAL", "")
+        or (os.getenv("BINANCE_API_SECRET_TEST", "") if use_testnet else "")
+    ).strip()
 
     if not api_key or not api_secret:
-        raise RuntimeError("Faltan credenciales Binance USDM: definí BINANCE_API_KEY/_SECRET (o *_REAL / *_TEST).")
+        raise RuntimeError(
+            "Faltan credenciales Binance USDM: definí BINANCE_API_KEY/_SECRET (o *_REAL / *_TEST)."
+        )
 
-    params = {
-        "apiKey": api_key,
-        "secret": api_secret,
-        "enableRateLimit": True,
-        "options": {"defaultType": "future", "adjustForTimeDifference": True},
-        "recvWindow": 10000,
-    }
-    ex = ccxt.binanceusdm(params)
-    try:
-        if use_testnet and hasattr(ex, "set_sandbox_mode"):
+    ex = ccxt.binanceusdm(
+        {
+            "apiKey": api_key,
+            "secret": api_secret,
+            "enableRateLimit": True,
+            "options": {
+                "defaultType": "future",
+                "adjustForTimeDifference": True,
+                "fetchCurrencies": False,
+            },
+        }
+    )
+
+    if use_testnet:
+        try:
             ex.set_sandbox_mode(True)
-    except Exception:
-        pass
+        except Exception:
+            pass
 
     _CCXT = ex
     return ex
