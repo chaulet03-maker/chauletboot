@@ -456,15 +456,27 @@ class Exchange:
 
         # 1) CCXT en Futuros USD-M
         try:
-            bal = await asyncio.to_thread(self.client.fetch_balance, {"type": "future"})
-            usdt = bal.get("USDT") or (bal.get("total", {}) or {}).get("USDT")
-            if isinstance(usdt, dict):
-                # En CCXT para futures, 'total' refleja wallet; si no, suma free+used
-                total = usdt.get("total")
+            def _fetch_ccxt_balance() -> Optional[float]:
+                ccxt_client = get_ccxt()
+                if ccxt_client is None:
+                    return None
+
+                bal = ccxt_client.fetch_balance({"type": "future"})
+                total = (bal.get("total") or {}).get("USDT")
                 if total is not None:
                     return float(total)
-                return float((usdt.get("free", 0.0) or 0.0) + (usdt.get("used", 0.0) or 0.0))
-            return float(usdt or 0.0)
+
+                usdt = bal.get("USDT") or bal.get("USDT:USDT") or {}
+                if isinstance(usdt, dict):
+                    t = usdt.get("total")
+                    if t is not None:
+                        return float(t)
+                    return float((usdt.get("free", 0.0) or 0.0) + (usdt.get("used", 0.0) or 0.0))
+                return float(usdt or 0.0)
+
+            balance = await asyncio.to_thread(_fetch_ccxt_balance)
+            if balance is not None:
+                return float(balance)
         except Exception:
             pass
 
