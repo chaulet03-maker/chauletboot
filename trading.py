@@ -731,7 +731,6 @@ def _extract_filled_qty(order_result: Any) -> float:
 
 def place_order_safe(side: str, qty: float, price: float | None = None, **kwargs):
     ensure_initialized()
-    # Serializamos la ventana crítica para evitar doble entrada simultánea
     with _ENTRY_MUTEX:
         try:
             status = POSITION_SERVICE.get_status() if POSITION_SERVICE else None
@@ -825,13 +824,13 @@ def place_order_safe(side: str, qty: float, price: float | None = None, **kwargs
                 _warn(
                     "TRADING", "No se pudo reflejar fill en store tras abrir.", exc=exc, level="debug"
                 )
-    metrics = _METRICS
-    if metrics is not None:
-        metrics.record_order_sent()
-        filled_qty = _extract_filled_qty(result)
-        if filled_qty > 0:
-            metrics.record_order_filled(filled_qty)
-    return result
+        metrics = _METRICS
+        if metrics is not None:
+            metrics.record_order_sent()
+            filled_qty = _extract_filled_qty(result)
+            if filled_qty > 0:
+                metrics.record_order_filled(filled_qty)
+        return result
 
 
 def close_now(symbol: str | None = None):
