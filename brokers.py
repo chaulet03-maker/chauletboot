@@ -748,7 +748,8 @@ def _build_paper_store(start_equity: float) -> PaperStore:
 
 def build_broker(settings, client_factory: Callable[..., Any]):
     global ACTIVE_PAPER_STORE, ACTIVE_LIVE_CLIENT
-    is_paper = (runtime_get_mode() == "paper")
+    runtime_mode = (runtime_get_mode() or "simulado").lower()
+    is_paper = runtime_mode not in {"real", "live"}
     if is_paper:
         ACTIVE_PAPER_STORE = _build_paper_store(settings.start_equity)
         logger.warning(

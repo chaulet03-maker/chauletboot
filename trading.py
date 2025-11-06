@@ -4,6 +4,7 @@ import logging
 import math
 import os
 import time
+from threading import Lock
 from pathlib import Path
 from typing import Any, Dict, Mapping, Optional
 
@@ -32,6 +33,8 @@ _INITIALIZED: bool = False
 
 _SYMBOL_RULE_CACHE: dict[tuple[int, str], dict[str, float]] = {}
 _METRICS = get_metrics()
+
+_ENTRY_MUTEX = Lock()
 
 
 def _normalize_symbol(symbol: str | None) -> str:
@@ -728,96 +731,100 @@ def _extract_filled_qty(order_result: Any) -> float:
 
 def place_order_safe(side: str, qty: float, price: float | None = None, **kwargs):
     ensure_initialized()
-    try:
-        status = POSITION_SERVICE.get_status() if POSITION_SERVICE else None
-    except Exception:
-        status = None
-    if status and str(status.get("side", "FLAT")).upper() != "FLAT":
-        raise RuntimeError(
-            "Bloqueado: ya hay una posición abierta por el bot. Cerrá antes de abrir otra."
+    # Serializamos la ventana crítica para evitar doble entrada simultánea
+    with _ENTRY_MUTEX:
+        try:
+            status = POSITION_SERVICE.get_status() if POSITION_SERVICE else None
+        except Exception:
+            status = None
+        if status and str(status.get("side", "FLAT")).upper() != "FLAT":
+            raise RuntimeError(
+                "Bloqueado: ya hay una posición abierta por el bot. Cerrá antes de abrir otra."
+            )
+        logger.info(
+            "ORDER PATH: %s",
+            "PAPER/SimBroker" if ACTIVE_MODE == "simulado" else "LIVE/Binance",
         )
-    logger.info(
-        "ORDER PATH: %s",
-        "PAPER/SimBroker" if ACTIVE_MODE == "simulado" else "LIVE/Binance",
-    )
-    if BROKER is None:
-        raise RuntimeError("Broker no inicializado")
+        if BROKER is None:
+            raise RuntimeError("Broker no inicializado")
 
-    desired_type = kwargs.get("order_type")
-    if desired_type is not None:
-        desired_type = str(desired_type).upper()
-        kwargs["order_type"] = desired_type
-        if desired_type == "MARKET":
+        desired_type = kwargs.get("order_type")
+        if desired_type is not None:
+            desired_type = str(desired_type).upper()
+            kwargs["order_type"] = desired_type
+            if desired_type == "MARKET":
+                price = None
+        elif price in (None, 0, "0"):
+            kwargs["order_type"] = "MARKET"
             price = None
-    elif price in (None, 0, "0"):
-        kwargs["order_type"] = "MARKET"
-        price = None
 
-    result = BROKER.place_order(side, qty, price, **kwargs)
-    inferred_price = _infer_fill_price(result, price)
-    symbol = kwargs.get("symbol") or getattr(S, "symbol", None) or "BTC/USDT"
-    try:
-        lev_source = (
-            kwargs.get("leverage")
-            or kwargs.get("lev")
-            or getattr(S, "leverage", None)
-            or getattr(S, "default_leverage", None)
-            or getattr(S, "leverage_default", None)
-            or 1.0
-        )
-        lev_value = float(lev_source)
-    except Exception:
-        lev_value = 1.0
-    tp_value = kwargs.get("tp")
-    sl_value = kwargs.get("sl")
-    mode_label = "live" if str(ACTIVE_MODE).lower() == "real" else "paper"
-    try:
-        if POSITION_SERVICE is not None and getattr(POSITION_SERVICE, "store", None):
-            if isinstance(result, dict) and result.get("sim"):
-                try:
-                    POSITION_SERVICE.refresh()
-                    logging.info("paper refresh -> %s", POSITION_SERVICE.get_status())
-                except Exception as exc:
-                    _warn("TRADING", "paper refresh falló (store)", exc=exc)
-            else:
-                fill_price = _infer_fill_price(result, price)
-                if fill_price is not None:
-                    fill_side = "LONG" if str(side).upper() in {"BUY", "LONG"} else "SHORT"
-                    POSITION_SERVICE.apply_fill(fill_side, float(qty), float(fill_price))
-                    logging.info(
-                        "apply_fill(open): side=%s qty=%.6f price=%.2f -> %s",
-                        fill_side,
-                        float(qty),
-                        float(fill_price),
-                        POSITION_SERVICE.get_status(),
-                    )
-                    inferred_price = fill_price
-                if inferred_price is not None:
-                    fee_paid = _extract_order_fee(result)
+        result = BROKER.place_order(side, qty, price, **kwargs)
+        inferred_price = _infer_fill_price(result, price)
+        symbol = kwargs.get("symbol") or getattr(S, "symbol", None) or "BTC/USDT"
+        try:
+            lev_source = (
+                kwargs.get("leverage")
+                or kwargs.get("lev")
+                or getattr(S, "leverage", None)
+                or getattr(S, "default_leverage", None)
+                or getattr(S, "leverage_default", None)
+                or 1.0
+            )
+            lev_value = float(lev_source)
+        except Exception:
+            lev_value = 1.0
+        tp_value = kwargs.get("tp")
+        sl_value = kwargs.get("sl")
+        mode_label = "live" if str(ACTIVE_MODE).lower() == "real" else "paper"
+        try:
+            if POSITION_SERVICE is not None and getattr(POSITION_SERVICE, "store", None):
+                if isinstance(result, dict) and result.get("sim"):
                     try:
-                        on_open_filled(
-                            symbol,
-                            "LONG" if str(side).upper() in {"BUY", "LONG"} else "SHORT",
-                            float(qty),
-                            float(inferred_price),
-                            lev_value,
-                            tp=tp_value,
-                            sl=sl_value,
-                            mode=mode_label,
-                            fee=fee_paid,
-                        )
+                        POSITION_SERVICE.refresh()
+                        logging.info("paper refresh -> %s", POSITION_SERVICE.get_status())
                     except Exception as exc:
-                        _warn(
-                            "TRADING",
-                            "No se pudo persistir estado en state_store al abrir.",
-                            exc=exc,
-                            level="debug",
+                        _warn("TRADING", "paper refresh falló (store)", exc=exc)
+                else:
+                    fill_price = _infer_fill_price(result, price)
+                    if fill_price is not None:
+                        fill_side = "LONG" if str(side).upper() in {"BUY", "LONG"} else "SHORT"
+                        POSITION_SERVICE.apply_fill(fill_side, float(qty), float(fill_price))
+                        logging.info(
+                            "apply_fill(open): side=%s qty=%.6f price=%.2f -> %s",
+                            fill_side,
+                            float(qty),
+                            float(fill_price),
+                            POSITION_SERVICE.get_status(),
                         )
-    except Exception as exc:
-        if isinstance(result, dict) and result.get("sim"):
-            _warn("TRADING", "PAPER: no se pudo reflejar estado tras abrir.", exc=exc)
-        else:
-            _warn("TRADING", "No se pudo reflejar fill en store tras abrir.", exc=exc, level="debug")
+                        inferred_price = fill_price
+                    if inferred_price is not None:
+                        fee_paid = _extract_order_fee(result)
+                        try:
+                            on_open_filled(
+                                symbol,
+                                "LONG" if str(side).upper() in {"BUY", "LONG"} else "SHORT",
+                                float(qty),
+                                float(inferred_price),
+                                lev_value,
+                                tp=tp_value,
+                                sl=sl_value,
+                                mode=mode_label,
+                                fee=fee_paid,
+                            )
+                        except Exception as exc:
+                            _warn(
+                                "TRADING",
+                                "No se pudo persistir estado en state_store al abrir.",
+                                exc=exc,
+                                level="debug",
+                            )
+        except Exception as exc:
+            if isinstance(result, dict) and result.get("sim"):
+                _warn("TRADING", "PAPER: no se pudo reflejar estado tras abrir.", exc=exc)
+            else:
+                _warn(
+                    "TRADING", "No se pudo reflejar fill en store tras abrir.", exc=exc, level="debug"
+                )
     metrics = _METRICS
     if metrics is not None:
         metrics.record_order_sent()
