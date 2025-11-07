@@ -176,6 +176,38 @@ class Exchange:
         return self._is_paper_runtime()
 
     # --------- NUEVO: posiciones abiertas (CCXT) ---------
+    def _maybe_persist_live_position(self, symbol: str, position: Dict[str, Any]) -> None:
+        try:
+            from state_store import create_position, persist_open  # import lazy para evitar ciclos
+
+            qty = float(position.get("contracts") or 0.0)
+            if qty <= 0:
+                return
+            entry = float(position.get("entryPrice") or 0.0)
+            side = str(position.get("side") or "").upper()
+            if not side:
+                return
+            leverage_cfg = self.config.get("leverage")
+            try:
+                leverage_val = float(leverage_cfg) if leverage_cfg is not None else 1.0
+            except Exception:
+                leverage_val = 1.0
+            leverage_val = leverage_val if leverage_val > 0 else 1.0
+            pos = create_position(
+                symbol=position.get("symbol") or symbol,
+                side=side,
+                qty=qty,
+                entry_price=entry,
+                leverage=leverage_val,
+                mode="live",
+            )
+            persist_open(pos)
+        except Exception:
+            logger.debug(
+                "No se pudo persistir posición live detectada automáticamente.",
+                exc_info=True,
+            )
+
     async def get_open_position(self, symbol: Optional[str] = None) -> Optional[Dict[str, Any]]:
         """
         Devuelve una sola posición (la del símbolo configurado), o None si no hay.
@@ -205,15 +237,16 @@ class Exchange:
         sym = symbol or self.config.get("symbol", "BTC/USDT")
         target = sym.replace("/", "").upper()
         ccxt_client = getattr(self, "client", None)
-        # --- LIVE mode: no te apropies de posiciones manuales ---
-        # Si el bot NO abrió posición (no está en state_store), devolvé None.
+        store_has_position = False
+        sym_key = symbol or self.config.get("symbol", "BTC/USDT")
         try:
             from state_store import load_state  # import local para evitar ciclos
-            sym_key = symbol or self.config.get("symbol", "BTC/USDT")
+
             st = load_state() or {}
             open_pos = (st.get("open_positions") or {}).get(sym_key)
             qty_st = float((open_pos or {}).get("qty") or 0.0)
             if open_pos and abs(qty_st) > 0.0:
+                store_has_position = True
                 side_st = str(open_pos.get("side", "")).upper()
                 entry_st = float(open_pos.get("entry_price") or 0.0)
                 try:
@@ -228,7 +261,7 @@ class Exchange:
                     "markPrice": float(mark_st or entry_st),
                 }
         except Exception:
-            pass
+            store_has_position = False
 
         pos_list: Optional[List[Dict[str, Any]]] = None
         if ccxt_client is not None and hasattr(ccxt_client, "fetch_positions"):
@@ -253,13 +286,16 @@ class Exchange:
                 info.get("markPrice") or info.get("markprice")
                 or entry.get("markPrice") or entry.get("markprice") or 0.0
             )
-            return {
+            position = {
                 "symbol": normalize_symbol(sym),
                 "side": side,
                 "contracts": abs(amt_f),
                 "entryPrice": entry_price,
                 "markPrice": mark_price,
             }
+            if not store_has_position:
+                self._maybe_persist_live_position(sym_key, position)
+            return position
         # Fallback nativo (python-binance)
         try:
             brokers = _get_brokers_module()
@@ -277,13 +313,16 @@ class Exchange:
                     side = "LONG" if amt > 0 else "SHORT"
                     entry = float(pos.get("entryPrice") or 0.0)
                     mark = float(pos.get("markPrice") or 0.0)
-                    return {
+                    position = {
                         "symbol": normalize_symbol(sym),
                         "side": side,
                         "contracts": abs(amt),
                         "entryPrice": entry,
                         "markPrice": mark,
                     }
+                    if not store_has_position:
+                        self._maybe_persist_live_position(sym_key, position)
+                    return position
         except Exception as exc:
             logger.debug("Fallback python-binance fallo: %s", exc)
         return None
