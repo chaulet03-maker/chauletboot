@@ -205,8 +205,6 @@ class Exchange:
         sym = symbol or self.config.get("symbol", "BTC/USDT")
         target = sym.replace("/", "").upper()
         ccxt_client = getattr(self, "client", None)
-        if ccxt_client is None or not hasattr(ccxt_client, "fetch_positions"):
-            return None
         # --- LIVE mode: no te apropies de posiciones manuales ---
         # Si el bot NO abrió posición (no está en state_store), devolvé None.
         try:
@@ -232,10 +230,12 @@ class Exchange:
         except Exception:
             pass
 
-        try:
-            pos_list = await asyncio.to_thread(ccxt_client.fetch_positions, [sym])
-        except Exception:
-            return None
+        pos_list: Optional[List[Dict[str, Any]]] = None
+        if ccxt_client is not None and hasattr(ccxt_client, "fetch_positions"):
+            try:
+                pos_list = await asyncio.to_thread(ccxt_client.fetch_positions, [sym])
+            except Exception as exc:
+                logger.debug("fetch_positions fallo, intento fallback: %s", exc)
         for entry in pos_list or []:
             info = entry.get("info") or {}
             exch_sym = str(info.get("symbol") or entry.get("symbol") or "").upper()
@@ -246,7 +246,7 @@ class Exchange:
                 raw_amt = entry.get("contracts") or entry.get("size") or 0
             amt_f = float(raw_amt or "0")
             if abs(amt_f) == 0.0:
-                return None
+                continue
             side = "LONG" if amt_f > 0 else "SHORT"
             entry_price = float(info.get("entryPrice") or entry.get("entryPrice") or 0.0)
             mark_price = float(
@@ -284,8 +284,8 @@ class Exchange:
                         "entryPrice": entry,
                         "markPrice": mark,
                     }
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("Fallback python-binance fallo: %s", exc)
         return None
 
     async def list_open_positions(self) -> List[Dict[str, Any]]:
