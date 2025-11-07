@@ -11,7 +11,7 @@ from collections import deque
 from datetime import datetime, timedelta, time as dtime, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 from html import escape as html_escape
 
 import pandas as pd
@@ -31,6 +31,7 @@ from bot.ledger import bot_position
 from bot.pnl import pnl_summary_bot
 from bot.runtime_state import (
     get_equity_sim,
+    get_mode as runtime_get_mode,
     get_protection_defaults,
     set_equity_sim,
     update_protection_defaults,
@@ -130,6 +131,34 @@ def _fmt_sign_money(v: float) -> str:
 def _safe_float(value: Any) -> float:
     try:
         return float(value)
+    except Exception:
+        return 0.0
+
+
+async def _resolve_equity_usdt(exchange: Any) -> float:
+    """Obtiene el equity USDT respetando el modo runtime (REAL vs SIM)."""
+
+    mode = (runtime_get_mode() or "paper").lower()
+    if mode in {"real", "live"}:
+        if exchange and hasattr(exchange, "fetch_balance_usdt"):
+            try:
+                bal = await exchange.fetch_balance_usdt()
+            except Exception:
+                logger.debug("No se pudo obtener equity live vía fetch_balance_usdt.", exc_info=True)
+            else:
+                if isinstance(bal, dict):
+                    eq = bal.get("equity") or bal.get("total")
+                    if eq is not None:
+                        try:
+                            return float(eq)
+                        except Exception:
+                            logger.debug("Equity dict inválido en fetch_balance_usdt", exc_info=True)
+                try:
+                    return float(bal)
+                except Exception:
+                    logger.debug("Respuesta inválida de fetch_balance_usdt", exc_info=True)
+    try:
+        return float(get_equity_sim())
     except Exception:
         return 0.0
 
@@ -451,17 +480,7 @@ async def estado_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except TypeError:
                 price = await exchange.get_current_price()
 
-        bal: Union[Dict[str, Any], float, None] = None
-        if exchange and hasattr(exchange, "fetch_balance_usdt"):
-            try:
-                bal = await exchange.fetch_balance_usdt(account_type="future")
-            except TypeError:
-                bal = await exchange.fetch_balance_usdt()
-        equity = 0.0
-        if isinstance(bal, dict):
-            equity = float(bal.get("equity") or bal.get("total") or 0.0)
-        elif bal is not None:
-            equity = float(bal)
+        equity = await _resolve_equity_usdt(exchange)
 
         fr_raw = None
         if market and hasattr(market, "get_last_funding_rate"):
@@ -2634,17 +2653,7 @@ async def diag_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         fr_pct = _fmt_pct_8h(fr_raw)
         fr_raw_txt = html_escape(str(fr_raw)) if fr_raw is not None else "—"
 
-        bal: Union[Dict[str, Any], float, None] = None
-        if exchange and hasattr(exchange, "fetch_balance_usdt"):
-            try:
-                bal = await exchange.fetch_balance_usdt(account_type="future")
-            except TypeError:
-                bal = await exchange.fetch_balance_usdt()
-        equity = 0.0
-        if isinstance(bal, dict):
-            equity = float(bal.get("equity") or bal.get("total") or 0.0)
-        elif bal is not None:
-            equity = float(bal)
+        equity = await _resolve_equity_usdt(exchange)
 
         lines = ["<b>🧪 Diagnóstico</b>"]
         lines.append(f"• Modo: <b>{html_escape(mode)}</b>")
