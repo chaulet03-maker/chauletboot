@@ -1640,6 +1640,38 @@ class TradingApp:
                 )
                 return
 
+            try:
+                symbol_cfg = str(self.config.get("symbol", "BTC/USDT"))
+            except Exception:
+                symbol_cfg = "BTC/USDT"
+
+            filled_qty = abs(float(filled))
+
+            try:
+                entry_from_result = float(
+                    (order_result or {}).get("avgPrice")
+                    or (order_result or {}).get("avg_price")
+                    or (order_result or {}).get("price")
+                    or entry_price
+                )
+            except Exception:
+                entry_from_result = float(entry_price)
+
+            try:
+                pos = create_position(
+                    symbol=symbol_cfg,
+                    side=signal,
+                    qty=filled_qty,
+                    entry_price=entry_from_result,
+                    leverage=float(leverage),
+                    mode="paper" if _runtime_is_paper() else "live",
+                    tp=tp_price,
+                    sl=sl_price,
+                )
+                persist_open(pos)
+            except Exception as exc:
+                logging.debug("No se pudo persistir posición abierta tras fill: %s", exc)
+
             # 2) Esperar a que el store (POSITION_SERVICE) deje de estar FLAT
             st = None
             if trading.POSITION_SERVICE is not None:
