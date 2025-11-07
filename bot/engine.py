@@ -85,81 +85,45 @@ def _quantize_amount(
     min_qty = float(filters.get("minQty", 0.0) or 0.0)
     min_notional = float(filters.get("minNotional", 0.0) or 0.0)
 
-    if step > 0:
+    price_val: Optional[float]
+    price_val = None
+    if price is not None:
+        try:
+            candidate_price = float(price)
+        except Exception:
+            candidate_price = float("nan")
+        if math.isfinite(candidate_price) and candidate_price > 0:
+            price_val = candidate_price
+
+    # 1) align to step
+    if step > 0 and math.isfinite(step):
         qty = math.floor(qty / step) * step
 
+    # 2) ensure minNotional by rounding up
     if (
-        qty <= 0
-        and step > 0
+        price_val is not None
         and min_notional > 0
-        and price is not None
+        and step > 0
         and math.isfinite(step)
+        and qty * price_val < min_notional
     ):
-        try:
-            price_val = float(price)
-        except Exception:
-            price_val = 0.0
-        try:
-            raw_qty_val = float(raw_qty)
-        except Exception:
-            raw_qty_val = 0.0
-        if price_val > 0 and raw_qty_val > 0 and math.isfinite(raw_qty_val):
-            target_units = (min_notional / price_val) / step
-            if math.isfinite(target_units):
-                ceil_qty = math.ceil(target_units) * step
-                if ceil_qty > 0 and ceil_qty <= raw_qty_val * 1.10:
-                    qty = ceil_qty
-                    logging.info(
-                        "Qty ajustada por minNotional: %.6f (step=%.6f, raw=%.6f, tolerancia=+10%%)",
-                        qty,
-                        step,
-                        raw_qty_val,
-                    )
+        target_units = (min_notional / price_val) / step
+        if math.isfinite(target_units):
+            qty = math.ceil(target_units) * step
+    elif price_val is not None and min_notional > 0 and qty * price_val < min_notional:
+        qty = min_notional / price_val
 
+    # 3) ensure minQty by rounding up
     if min_qty > 0 and qty < min_qty:
-        return 0.0
+        if step > 0 and math.isfinite(step):
+            target_units = min_qty / step
+            if math.isfinite(target_units):
+                qty = math.ceil(target_units) * step
+        else:
+            qty = min_qty
 
-    if min_notional > 0 and price is not None:
-        try:
-            price_val = float(price)
-        except Exception:
-            return 0.0
-        if price_val <= 0:
-            return 0.0
-        try:
-            current_notional = qty * price_val
-        except Exception:
-            return 0.0
-        if not math.isfinite(current_notional):
-            return 0.0
-        if current_notional < min_notional:
-            if step > 0 and price_val > 0:
-                target_units = (min_notional / price_val) / step
-                if math.isfinite(target_units):
-                    ceil_qty = math.ceil(target_units) * step
-                    try:
-                        raw_qty_val = float(raw_qty)
-                    except Exception:
-                        raw_qty_val = 0.0
-                    if (
-                        ceil_qty > 0
-                        and raw_qty_val > 0
-                        and math.isfinite(raw_qty_val)
-                        and ceil_qty <= raw_qty_val * 1.10
-                    ):
-                        qty = ceil_qty
-                        logging.info(
-                            "Qty ajustada por minNotional: %.6f (step=%.6f, raw=%.6f, tolerancia=+10%%)",
-                            qty,
-                            step,
-                            raw_qty_val,
-                        )
-                        current_notional = qty * price_val
-                        if current_notional >= min_notional:
-                            if min_qty > 0 and qty < min_qty:
-                                return 0.0
-                            return qty
-            return 0.0
+    if qty <= 0 or not math.isfinite(qty):
+        return 0.0
 
     return qty
 
