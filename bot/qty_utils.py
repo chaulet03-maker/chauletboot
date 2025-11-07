@@ -19,12 +19,8 @@ async def round_and_validate_qty(exchange, symbol: str, qty: float):
 
     price = await exchange.get_current_price(symbol)
 
-    raw_qty = qty
-
     if step > 0:
         qty = math.floor(qty / step) * step
-
-    risk_cap = raw_qty * 1.10 if raw_qty > 0 else None
 
     if (
         qty <= 0
@@ -32,12 +28,10 @@ async def round_and_validate_qty(exchange, symbol: str, qty: float):
         and price is not None
         and price > 0
         and min_notional > 0
-        and risk_cap is not None
     ):
         target = min_notional / price
         ceil_qty = math.ceil(target / step) * step
-        if ceil_qty <= risk_cap:
-            qty = ceil_qty
+        qty = ceil_qty
 
     if min_qty > 0 and qty < min_qty:
         return 0.0
@@ -47,8 +41,5 @@ async def round_and_validate_qty(exchange, symbol: str, qty: float):
             candidate = math.ceil(target / step) * step
         else:
             candidate = target
-        if risk_cap is not None and candidate <= risk_cap:
-            qty = candidate
-        else:
-            return 0.0
+        qty = candidate
     return max(qty, 0.0)
