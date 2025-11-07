@@ -1465,23 +1465,37 @@ class TradingApp:
                 return
             entry_price = float(entry_price)
             # --- Tamaño por equity ---
-            # Prioriza 'equity' (1..100); si no está, acepta 'risk_pct' en fracción (0..1) o porcentaje (0..100).
-            equity_cfg = self.config.get("equity", None)
-            if equity_cfg is not None:
-                # equity manda: 98 -> 0.98, 0.98 -> 0.98 (sin gate_bps)
-                try:
-                    risk_frac = float(equity_cfg)
-                except Exception:
-                    risk_frac = 2.0
-                risk_frac = (risk_frac / 100.0) if risk_frac > 1.0 else risk_frac
-            else:
-                # sin equity -> fallback a risk_pct y (opcional) gate_bps
-                try:
-                    risk_val = float(self.config.get("risk_pct", 0.02))
-                except Exception:
-                    risk_val = 0.02
-                risk_frac = risk_val if risk_val <= 1.0 else risk_val / 100.0
+            # Prioridad: config["equity"] -> config["order_sizing"]["default_pct"] -> ENV EQUITY_PCT -> risk_pct
 
+            def _parse_pct_like(x) -> float:
+                if x is None:
+                    raise ValueError("empty")
+                s = str(x).strip().replace(",", ".")
+                s = s.replace("%", "")
+                val = float(s)
+                return val / 100.0 if val > 1.0 else val
+
+            equity_sources = [
+                self.config.get("equity", None),
+                (self.config.get("order_sizing", {}) or {}).get("default_pct", None),
+                os.getenv("EQUITY_PCT", None),
+            ]
+
+            risk_frac = None
+            for src in equity_sources:
+                try:
+                    risk_frac = _parse_pct_like(src)
+                    break
+                except Exception:
+                    continue
+
+            if risk_frac is None:
+                # fallback legacy: risk_pct (acepta 0.02 o 2)
+                try:
+                    rv = float(self.config.get("risk_pct", 0.02))
+                except Exception:
+                    rv = 0.02
+                risk_frac = rv if rv <= 1.0 else rv / 100.0
                 try:
                     gate_bps = int(self.config.get("gate_bps", 0))
                 except Exception:
@@ -1500,6 +1514,16 @@ class TradingApp:
             )
 
             raw_filters = await self.exchange.get_symbol_filters(symbol_conf)
+            min_notional = float((raw_filters or {}).get("minNotional") or 0.0)
+            if min_notional > 0 and (entry_price * raw_qty) < min_notional:
+                self.logger.warning(
+                    "Notional < minNotional, escalando: eq=%.2f risk=%.4f lev=%.1f -> notional=%.2f < minNotional=%.2f",
+                    eq_on_open,
+                    risk_frac,
+                    leverage,
+                    entry_price * raw_qty,
+                    min_notional,
+                )
 
             def _coerce_float(value: Any) -> float:
                 try:
@@ -1964,23 +1988,19 @@ class TradingApp:
                 leverage=float(leverage_i),
                 mode="live",
             )
-            # En REAL no persistimos posición del bot
-            if _runtime_is_paper():
-                persist_open(pos)
+            persist_open(pos)
         except Exception:
             self.logger.debug("No se pudo persistir la posición live en state_store.", exc_info=True)
 
         try:
-            # En REAL no seteamos cache local de posición
-            if _runtime_is_paper():
-                if hasattr(self.trader, "_open_position"):
-                    self.trader._open_position = {
-                        "symbol": sym,
-                        "side": side_bot,
-                        "contracts": qty_abs,
-                        "entryPrice": avg_bot_f,
-                        "markPrice": mark_val,
-                    }
+            if hasattr(self.trader, "_open_position"):
+                self.trader._open_position = {
+                    "symbol": sym,
+                    "side": side_bot,
+                    "contracts": qty_abs,
+                    "entryPrice": avg_bot_f,
+                    "markPrice": mark_val,
+                }
         except Exception:
             self.logger.debug("No se pudo actualizar la cache del trader con la posición live.", exc_info=True)
 
