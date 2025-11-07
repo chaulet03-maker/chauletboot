@@ -11,6 +11,9 @@ from bot.runtime_state import get_mode as runtime_get_mode
 from bot.logger import _warn
 
 
+logger = logging.getLogger(__name__)
+
+
 def _runtime_is_paper() -> bool:
     try:
         return (runtime_get_mode() or "paper").lower() not in {"real", "live"}
@@ -198,6 +201,77 @@ class Trader:
 
                 self._open_position = None
                 return self._open_position
+
+        if exchange is None:
+            exchange = getattr(self, "exchange", None)
+
+        if exchange is not None:
+            pos_data: Optional[Dict[str, Any]] = None
+
+            if hasattr(exchange, "get_open_position"):
+                try:
+                    pos_data = await exchange.get_open_position(symbol_cfg)
+                except Exception:
+                    pos_data = None
+
+            if not pos_data and hasattr(exchange, "fetch_positions"):
+                try:
+                    fetched = await exchange.fetch_positions([symbol_cfg])
+                    if fetched:
+                        pos_data = fetched[0]
+                except Exception as exc:
+                    logger.warning("No se pudo sincronizar posición: %s", exc)
+
+            if pos_data:
+                side_raw = (
+                    pos_data.get("side")
+                    or pos_data.get("positionSide")
+                    or pos_data.get("position_side")
+                    or ""
+                )
+                side = str(side_raw).upper() if side_raw else ""
+                try:
+                    signed_qty = float(
+                        pos_data.get("contracts")
+                        or pos_data.get("positionAmt")
+                        or pos_data.get("position_amt")
+                        or pos_data.get("size")
+                        or pos_data.get("qty")
+                        or 0.0
+                    )
+                except Exception:
+                    signed_qty = 0.0
+                qty_val = abs(signed_qty)
+                if not side:
+                    if signed_qty > 0:
+                        side = "LONG"
+                    elif signed_qty < 0:
+                        side = "SHORT"
+                if not side:
+                    side = "FLAT"
+                if side != "FLAT" and qty_val > 0.0:
+                    entry_px = (
+                        pos_data.get("entryPrice")
+                        or pos_data.get("entry_price")
+                        or pos_data.get("avgPrice")
+                        or pos_data.get("avg_price")
+                        or 0.0
+                    )
+                    mark_px = (
+                        pos_data.get("markPrice")
+                        or pos_data.get("mark_price")
+                        or pos_data.get("mark")
+                        or entry_px
+                        or 0.0
+                    )
+                    self._open_position = {
+                        "symbol": pos_data.get("symbol", symbol_cfg),
+                        "side": side,
+                        "contracts": float(qty_val),
+                        "entryPrice": float(entry_px or 0.0),
+                        "markPrice": float(mark_px or 0.0),
+                    }
+                    return self._open_position
 
         # IMPORTANTE:
         # La posición del BOT vive en el store (self._open_position).

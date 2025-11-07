@@ -2531,7 +2531,14 @@ async def equity_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not match:
         fraction = float(_get_equity_fraction(engine))
         pct = round(fraction * 100.0, 2)
-        base_equity = get_equity_sim()
+        if hasattr(engine, "exchange") and engine.exchange is not None:
+            try:
+                balance_info = await engine.exchange.fetch_balance()
+                base_equity = float(balance_info["USDT"]["total"])
+            except Exception:
+                base_equity = get_equity_sim()
+        else:
+            base_equity = get_equity_sim()
         await message.reply_text(
             "Equity base actual: {:.2f}\nEquity % actual: {:.2f}% (frac={:.4f})".format(
                 float(base_equity or 0.0), pct, fraction
