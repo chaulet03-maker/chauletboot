@@ -1468,17 +1468,26 @@ class TradingApp:
             # Prioriza 'equity' (1..100); si no está, acepta 'risk_pct' en fracción (0..1) o porcentaje (0..100).
             equity_cfg = self.config.get("equity", None)
             if equity_cfg is not None:
+                # equity manda: 98 -> 0.98, 0.98 -> 0.98 (sin gate_bps)
                 try:
                     risk_frac = float(equity_cfg)
                 except Exception:
                     risk_frac = 2.0
                 risk_frac = (risk_frac / 100.0) if risk_frac > 1.0 else risk_frac
             else:
+                # sin equity -> fallback a risk_pct y (opcional) gate_bps
                 try:
                     risk_val = float(self.config.get("risk_pct", 0.02))
                 except Exception:
                     risk_val = 0.02
                 risk_frac = risk_val if risk_val <= 1.0 else risk_val / 100.0
+
+                try:
+                    gate_bps = int(self.config.get("gate_bps", 0))
+                except Exception:
+                    gate_bps = 0
+                if gate_bps > 0:
+                    risk_frac = min(risk_frac, gate_bps / 10_000)
 
             if risk_frac <= 0:
                 risk_frac = 0.02
