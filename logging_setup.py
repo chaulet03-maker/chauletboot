@@ -11,10 +11,6 @@ LOG_DIR = os.getenv("LOG_DIR", "/app/logs")
 LOG_FILE = os.path.join(LOG_DIR, "bot.log")
 os.makedirs(LOG_DIR, exist_ok=True)
 
-# 🚨 AÑADE ESTA LÍNEA CLAVE PARA SILENCIAR EL TRÁFICO HTTP DE TELEGRAM
-# Silencia las solicitudes HTTP exitosas (código 200) de la librería Telegram
-logging.getLogger("telegram.http").setLevel(logging.WARNING)
-
 
 class RingBufferHandler(logging.Handler):
     """Simple ring-buffer handler to keep recent log records in memory."""
@@ -91,6 +87,28 @@ LOG_RING: RingBufferHandler | None = None
 def setup_logging() -> logging.Logger:
     global LOG_RING
     logger = logging.getLogger()
+
+    # Silenciar tráfico HTTP/WS y cháchara de PTB/APScheduler
+    for name in (
+        "httpx",
+        "httpcore",
+        "urllib3",
+        "telegram",
+        "telegram.http",
+        "telegram.request",
+        "telegram.ext._application",
+    ):
+        logging.getLogger(name).setLevel(logging.WARNING)
+
+    logging.getLogger("apscheduler").setLevel(logging.ERROR)
+    logging.getLogger("apscheduler.scheduler").setLevel(logging.ERROR)
+    logging.getLogger("apscheduler.executors.default").setLevel(logging.ERROR)
+    logging.getLogger("apscheduler.jobstores").setLevel(logging.ERROR)
+    logging.getLogger("apscheduler.executors").setLevel(logging.ERROR)
+
+    # Por si algún paquete trae handlers preconfigurados, evitamos que se duplique salida
+    logging.captureWarnings(True)
+
     if logger.handlers:
         if LOG_RING is None:
             for handler in logger.handlers:
@@ -130,12 +148,4 @@ def setup_logging() -> logging.Logger:
     logger.addFilter(RateLimitFilter())
 
     logger.info("Logger inicializado. Archivo: %s", LOG_FILE)
-    for name in ["httpx", "httpcore", "urllib3", "telegram"]:
-        logging.getLogger(name).setLevel(logging.WARNING)
-    logging.getLogger("apscheduler").setLevel(logging.ERROR)
-    logging.getLogger("apscheduler.scheduler").setLevel(logging.ERROR)
-    logging.getLogger("apscheduler.executors.default").setLevel(logging.ERROR)
-    logging.getLogger("apscheduler.jobstores").setLevel(logging.ERROR)
-    logging.getLogger("apscheduler.executors").setLevel(logging.ERROR)
-    logging.captureWarnings(True)
     return logger
