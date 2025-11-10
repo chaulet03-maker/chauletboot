@@ -26,7 +26,7 @@ from bot.exchange_client import ensure_position_mode
 from bot.trader import Trader
 from bot.storage import Storage
 from bot.telemetry.notifier import Notifier
-from bot.telemetry.telegram_bot import setup_telegram_bot
+from bot.telemetry.telegram_bot import collect_status_snapshot, setup_telegram_bot
 from bot.telemetry.metrics import get_metrics
 from bot.health.endpoint import attach_to_application
 from brokers import ACTIVE_LIVE_CLIENT
@@ -48,6 +48,7 @@ from risk_guards import (
 from reanudar_listener import listen_reanudar
 from bot.runtime_state import get_mode as runtime_get_mode
 from paths import get_data_dir
+from app.state_cache import StateCache
 
 
 def _compute_order_qty_from_equity(
@@ -329,6 +330,14 @@ class TradingApp:
         self._live_open_cached = None  # None/True/False
         self._live_flat_logged_state: Optional[bool] = None
         self._loop_sem = asyncio.Semaphore(1)
+        cache_ttl_raw = None
+        if isinstance(cfg, dict):
+            cache_ttl_raw = cfg.get("state_cache_ttl_seconds") or cfg.get("status_cache_ttl_seconds")
+        try:
+            cache_ttl = float(cache_ttl_raw) if cache_ttl_raw is not None else 5.0
+        except Exception:
+            cache_ttl = 5.0
+        self.state_cache = StateCache(ttl=cache_ttl)
 
     @property
     def active_mode(self) -> str:
@@ -341,6 +350,17 @@ class TradingApp:
     @property
     def is_paper(self) -> bool:
         return not self.is_live
+
+    async def refresh_state_cache(self) -> None:
+        cache = getattr(self, "state_cache", None)
+        if cache is None:
+            return
+        try:
+            snapshot = await collect_status_snapshot(self)
+        except Exception:
+            self.logger.debug("No se pudo refrescar la cache de estado.", exc_info=True)
+            return
+        cache.put(snapshot)
 
     def set_mode(self, mode: str, *, source: str = "engine") -> str:
         """
@@ -1764,6 +1784,10 @@ class TradingApp:
                 for s in ("LONG", "SHORT"):
                     FREEZER.clear(symbol, cast(Side, s))
             _emit_motive({}, side_value=signal)
+            try:
+                await self.refresh_state_cache()
+            except Exception:
+                self.logger.debug("No se pudo refrescar state_cache tras apertura.", exc_info=True)
             return
 
         except Exception as e:
@@ -1807,6 +1831,15 @@ class TradingApp:
 
                 if px is not None:
                     self.price_cache[sym] = float(px)
+            cache = getattr(self, "state_cache", None)
+            if cache is not None and cache.is_stale():
+                try:
+                    await self.refresh_state_cache()
+                except Exception:
+                    self.logger.debug(
+                        "No se pudo refrescar la cache de estado desde update_price_cache_job.",
+                        exc_info=True,
+                    )
         except Exception as e:
             logging.warning(f"No pude actualizar la cache de precios: {e}")
 
@@ -2399,6 +2432,10 @@ class TradingApp:
                     self.position_open = False
                 except Exception:
                     pass
+                try:
+                    await self.refresh_state_cache()
+                except Exception:
+                    self.logger.debug("No se pudo refrescar state_cache tras cierre noop.", exc_info=True)
                 return {"status": "noop", "reason": reason}
 
             bal_after = await _safe_fetch_balance()
@@ -2534,6 +2571,11 @@ class TradingApp:
                 self.position_open = False
             except Exception:
                 pass
+
+            try:
+                await self.refresh_state_cache()
+            except Exception:
+                self.logger.debug("No se pudo refrescar state_cache tras cierre.", exc_info=True)
 
             return {"status": "closed", "summary": summary, "order": close_result.get("order")}
         except Exception as exc:

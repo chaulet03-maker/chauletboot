@@ -7,6 +7,7 @@ import time
 import re
 import inspect
 import signal
+from copy import deepcopy
 from collections import deque
 from datetime import datetime, timedelta, time as dtime, timezone
 from pathlib import Path
@@ -133,6 +134,274 @@ def _safe_float(value: Any) -> float:
         return float(value)
     except Exception:
         return 0.0
+
+
+DEFAULT_STATUS_SNAPSHOT: Dict[str, Any] = {
+    "mode_display": "…",
+    "symbol": "…",
+    "ccxt_auth": None,
+    "price": None,
+    "equity": None,
+    "funding_rate": None,
+    "position": {
+        "has_position": False,
+        "symbol": None,
+        "side": "FLAT",
+        "qty": 0.0,
+        "entry_price": None,
+        "mark_price": None,
+        "pnl": None,
+        "roe": None,
+        "leverage": None,
+    },
+    "collected_at": None,
+    "mark_price": None,
+    "split": None,
+    "split_summary": None,
+}
+
+
+async def collect_status_snapshot(app) -> Dict[str, Any]:
+    """Build a lightweight status snapshot for Telegram responses."""
+
+    snapshot = deepcopy(DEFAULT_STATUS_SNAPSHOT)
+    snapshot["collected_at"] = time.time()
+
+    cfg = getattr(app, "config", {}) or {}
+    symbol_cfg = cfg.get("symbol", "BTC/USDT") if isinstance(cfg, dict) else "BTC/USDT"
+    snapshot["symbol"] = symbol_cfg
+
+    try:
+        mode_value = getattr(app, "mode", None)
+        if mode_value:
+            snapshot["mode_display"] = str(mode_value).upper()
+        else:
+            runtime_mode = runtime_get_mode()
+            snapshot["mode_display"] = (
+                "LIVE" if str(runtime_mode or "paper").lower() in {"real", "live"} else "PAPER"
+            )
+    except Exception:
+        snapshot["mode_display"] = None
+
+    exchange = getattr(app, "exchange", None)
+    market = getattr(app, "market", None)
+
+    ccxt_auth = None
+    if exchange is not None:
+        try:
+            ccxt_auth = await _is_auth(exchange)
+        except Exception:
+            logger.debug("No se pudo determinar si CCXT está autenticado.", exc_info=True)
+            ccxt_auth = None
+    snapshot["ccxt_auth"] = ccxt_auth
+
+    price_val = None
+    try:
+        if market and hasattr(market, "get_last_price"):
+            try:
+                price_val = await market.get_last_price(symbol_cfg)
+            except TypeError:
+                price_val = await market.get_last_price()
+        elif exchange and hasattr(exchange, "get_current_price"):
+            try:
+                price_val = await exchange.get_current_price(symbol_cfg)
+            except TypeError:
+                price_val = await exchange.get_current_price()
+    except Exception:
+        logger.debug("No se pudo obtener precio para snapshot.", exc_info=True)
+        price_val = None
+    try:
+        snapshot["price"] = float(price_val) if price_val is not None else None
+    except Exception:
+        snapshot["price"] = None
+
+    try:
+        equity_val = await _resolve_equity_usdt(exchange)
+        snapshot["equity"] = float(equity_val)
+    except Exception:
+        snapshot["equity"] = None
+
+    funding_rate = None
+    try:
+        if market and hasattr(market, "get_last_funding_rate"):
+            try:
+                funding_rate = await market.get_last_funding_rate(symbol_cfg)
+            except TypeError:
+                funding_rate = await market.get_last_funding_rate()
+        elif exchange and hasattr(exchange, "fetch_current_funding_rate"):
+            try:
+                funding_rate = await exchange.fetch_current_funding_rate(symbol_cfg)
+            except TypeError:
+                funding_rate = await exchange.fetch_current_funding_rate()
+    except Exception:
+        logger.debug("No se pudo obtener funding rate.", exc_info=True)
+        funding_rate = None
+    try:
+        snapshot["funding_rate"] = float(funding_rate)
+    except Exception:
+        snapshot["funding_rate"] = None
+
+    split: Dict[str, Any] | None = None
+    mark_price: float | None = None
+    effective_symbol = symbol_cfg
+    try:
+        split, mark_price, effective_symbol = await _compute_position_split(app)
+    except Exception:
+        logger.debug("No se pudo calcular el split de posición para snapshot.", exc_info=True)
+        split = None
+        mark_price = None
+    snapshot["split"] = split
+    if effective_symbol:
+        snapshot["symbol"] = effective_symbol
+    try:
+        snapshot["mark_price"] = float(mark_price) if mark_price is not None else None
+    except Exception:
+        snapshot["mark_price"] = None
+
+    position_data = deepcopy(DEFAULT_STATUS_SNAPSHOT["position"])
+    total = (split or {}).get("total") if isinstance(split, dict) else {}
+    total = total or {}
+    qty = _safe_float(total.get("qty"))
+    side = str(total.get("side") or position_data.get("side", "FLAT")).upper()
+    entry_price = _safe_float(total.get("entry_price"))
+    mark_candidate = snapshot.get("mark_price")
+    if not mark_candidate:
+        bot_part = (split or {}).get("bot") if isinstance(split, dict) else {}
+        if isinstance(bot_part, dict):
+            alt_mark = bot_part.get("mark") or bot_part.get("markPrice")
+            if alt_mark not in (None, ""):
+                mark_candidate = _safe_float(alt_mark)
+    if not mark_candidate and snapshot.get("price") is not None:
+        try:
+            mark_candidate = float(snapshot["price"])
+        except Exception:
+            mark_candidate = None
+
+    pnl_val = _safe_float(total.get("pnl"))
+    leverage_val = total.get("leverage")
+    roe_val = total.get("roe")
+    if roe_val in (None, ""):
+        try:
+            lev_float = float(leverage_val) if leverage_val not in (None, "") else None
+            if entry_price > 0 and mark_candidate and lev_float:
+                delta = (float(mark_candidate) - float(entry_price)) / float(entry_price)
+                if side == "SHORT":
+                    delta = -delta
+                roe_val = delta * float(lev_float) * 100.0
+        except Exception:
+            roe_val = None
+
+    position_data.update(
+        {
+            "has_position": qty > EPS_QTY,
+            "symbol": effective_symbol,
+            "side": side,
+            "qty": qty,
+            "entry_price": entry_price if entry_price > 0 else None,
+            "mark_price": float(mark_candidate) if mark_candidate not in (None, 0.0) else None,
+            "pnl": pnl_val,
+            "leverage": leverage_val,
+            "roe": roe_val,
+        }
+    )
+    snapshot["position"] = position_data
+    if position_data["has_position"] and not snapshot["mark_price"] and position_data.get("mark_price") is not None:
+        snapshot["mark_price"] = position_data["mark_price"]
+
+    try:
+        summary_txt = _format_split_summary(split or {}, snapshot.get("mark_price") or 0.0)
+    except Exception:
+        summary_txt = ""
+    snapshot["split_summary"] = summary_txt or None
+
+    return snapshot
+
+
+def render_status(snapshot: Dict[str, Any]) -> str:
+    """Render a snapshot dict into the HTML payload for Telegram."""
+
+    base = deepcopy(DEFAULT_STATUS_SNAPSHOT)
+    if isinstance(snapshot, dict):
+        base.update({k: v for k, v in snapshot.items() if k != "position"})
+        if isinstance(snapshot.get("position"), dict):
+            pos = deepcopy(DEFAULT_STATUS_SNAPSHOT["position"])
+            pos.update(snapshot["position"])
+            base["position"] = pos
+
+    lines = ["<b>🩺 Estado</b>"]
+
+    mode_txt = base.get("mode_display") or base.get("mode") or "—"
+    lines.append(f"• Modo: <b>{html_escape(str(mode_txt))}</b>")
+
+    symbol_txt = base.get("symbol") or "—"
+    lines.append(f"• Símbolo: {html_escape(str(symbol_txt))}")
+
+    ccxt_auth = base.get("ccxt_auth")
+    if ccxt_auth is True:
+        ccxt_txt = "AUTENTICADO"
+    elif ccxt_auth is False:
+        ccxt_txt = "NO AUTENTICADO"
+    else:
+        ccxt_txt = "—"
+    lines.append(f"• CCXT: {ccxt_txt}")
+
+    price_val = base.get("price")
+    price_text = _fmt_usd(price_val, dp=1) if price_val not in (None, "") else "—"
+    lines.append(f"• Precio: {price_text}")
+
+    equity_val = base.get("equity")
+    equity_text = f"{_fmt_usd(equity_val, dp=2)} USDT" if equity_val not in (None, "") else "—"
+    lines.append(f"• Equity: {equity_text}")
+
+    funding_rate = base.get("funding_rate")
+    funding_text = _fmt_pct_8h(funding_rate) if funding_rate not in (None, "") else "—"
+    lines.append(f"• Funding: {funding_text}")
+
+    position = base.get("position") or {}
+    qty_val = _safe_float(position.get("qty"))
+    has_position = bool(position.get("has_position")) or qty_val > EPS_QTY
+
+    if has_position:
+        side_txt = str(position.get("side") or "FLAT").upper()
+        pos_symbol = position.get("symbol") or symbol_txt
+        lines.append(f"• Posición: <b>{html_escape(str(pos_symbol))} {side_txt}</b>")
+        qty_display = f"{qty_val:.6f}" if qty_val > 0 else "0.000000"
+        entry_txt = _fmt_usd(position.get("entry_price"))
+        mark_txt = _fmt_usd(position.get("mark_price"))
+        lines.append(f"  Qty: {qty_display} | Entrada: {entry_txt} | Mark: {mark_txt}")
+        leverage = position.get("leverage")
+        if leverage not in (None, ""):
+            lines.append(f"  Lev: x{leverage}")
+        pnl_val = _safe_float(position.get("pnl"))
+        pnl_prefix = "+" if pnl_val >= 0 else ""
+        pnl_txt = f"{pnl_prefix}{_fmt_usd(pnl_val)}"
+        roe_val = position.get("roe")
+        roe_txt = ""
+        try:
+            if roe_val not in (None, ""):
+                roe_txt = f" | ROE: {float(roe_val):.2f}%"
+        except Exception:
+            roe_txt = ""
+        lines.append(f"  PnL: {pnl_txt}{roe_txt}")
+    else:
+        lines.append("• Posición: <i>No hay posiciones abiertas.</i>")
+
+    split_summary = base.get("split_summary")
+    if split_summary:
+        lines.append("")
+        lines.append(split_summary)
+
+    ts = base.get("collected_at")
+    if ts:
+        try:
+            age = max(0.0, time.time() - float(ts))
+        except Exception:
+            age = None
+        if age is not None:
+            lines.append("")
+            lines.append(f"⏱️ Actualizado hace {_fmt_age_seconds(age)}")
+
+    return "\n".join(lines)
 
 
 async def _resolve_equity_usdt(exchange: Any) -> float:
@@ -445,97 +714,50 @@ async def estado_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if app is None or message is None:
         return
 
-    exchange = getattr(app, "exchange", None)
-    market = getattr(app, "market", None)
-    trading = getattr(app, "trading", None)
-    symbols = getattr(app, "symbols", None)
+    cache = getattr(app, "state_cache", None)
+    if cache is not None:
+        snapshot = cache.get_status_snapshot()
+        should_refresh = cache.is_stale()
+    else:
+        snapshot = deepcopy(DEFAULT_STATUS_SNAPSHOT)
+        should_refresh = True
+
+    text = render_status(snapshot)
+    display_text = text + "\n\n(actualizando…)" if should_refresh else text
 
     try:
-        if trading and hasattr(trading, "get_mode"):
-            mode_raw = await trading.get_mode()
-        else:
-            mode_raw = "real" if getattr(app, "is_live", False) else "simulado"
-        mode = str(mode_raw or "").upper()
+        await context.bot.send_chat_action(chat_id=message.chat_id, action="typing")
+    except Exception:
+        pass
 
-        if symbols and hasattr(symbols, "get_active_symbol"):
-            symbol = await symbols.get_active_symbol()
-        else:
-            symbol = (
-                app.config.get("symbol", "BTC/USDT")
-                if getattr(app, "config", None)
-                else "BTC/USDT"
-            )
+    sent_message = await message.reply_html(display_text)
 
-        ccxt_ok = await _is_auth(exchange)
+    if not should_refresh:
+        return
 
-        price = None
-        if market and hasattr(market, "get_last_price"):
-            try:
-                price = await market.get_last_price(symbol)
-            except TypeError:
-                price = await market.get_last_price()
-        elif exchange and hasattr(exchange, "get_current_price"):
-            try:
-                price = await exchange.get_current_price(symbol)
-            except TypeError:
-                price = await exchange.get_current_price()
-
-        equity = await _resolve_equity_usdt(exchange)
-
-        fr_raw = None
-        if market and hasattr(market, "get_last_funding_rate"):
-            try:
-                fr_raw = await market.get_last_funding_rate(symbol)
-            except TypeError:
-                fr_raw = await market.get_last_funding_rate()
-        elif exchange and hasattr(exchange, "fetch_current_funding_rate"):
-            try:
-                fr_raw = await exchange.fetch_current_funding_rate(symbol)
-            except TypeError:
-                fr_raw = await exchange.fetch_current_funding_rate()
-        fr_txt = _fmt_pct_8h(fr_raw)
-
-        split, mark_px, _ = await _compute_position_split(app)
-        total = (split or {}).get("total") or {}
+    async def _refresh_and_edit() -> None:
         try:
-            qty = float(total.get("qty") or 0.0)
+            fresh = await collect_status_snapshot(app)
+            if cache is not None:
+                cache.put(fresh)
+            new_text = render_status(fresh)
+            await sent_message.edit_text(new_text, parse_mode="HTML")
+        except BadRequest as exc:
+            if "message is not modified" in str(exc).lower():
+                return
+            logger.debug("No se pudo editar el estado: %s", exc)
         except Exception:
-            qty = 0.0
+            logger.debug("No se pudo refrescar el estado", exc_info=True)
 
-        lines = ["<b>🩺 Estado</b>"]
-        lines.append(f"• Modo: <b>{html_escape(mode)}</b>")
-        lines.append(f"• Símbolo: {html_escape(str(symbol or ''))}")
-        lines.append(f"• CCXT: {'AUTENTICADO' if ccxt_ok else 'NO AUTENTICADO'}")
-        lines.append(f"• Precio: {_fmt_usd(price, dp=1)}")
-        lines.append(f"• Equity: {_fmt_usd(equity, dp=2)} USDT")
-        lines.append(f"• Funding: {fr_txt}")
+    application = context.application if context else None
+    if application is not None:
+        try:
+            application.create_task(_refresh_and_edit())
+            return
+        except Exception:
+            logger.debug("No se pudo programar refresco de estado vía application.", exc_info=True)
 
-        if qty <= 0:
-            lines.append("• Posición: <i>No hay posiciones abiertas.</i>")
-        else:
-            side = str(total.get("side") or "FLAT").upper()
-            entry = float(total.get("entry_price") or 0.0)
-            mark = float(mark_px or 0.0)
-            pnl = float(total.get("pnl") or 0.0)
-            try:
-                roe_val = float(total.get("roe"))
-            except Exception:
-                roe_val = None
-            lev = total.get("leverage")
-            lines.append(f"• Posición: <b>{html_escape(str(symbol or ''))} {side}</b>")
-            lines.append(
-                f"  Qty: {qty:.6f} | Entrada: {_fmt_usd(entry)} | Mark: {_fmt_usd(mark)}"
-            )
-            if lev:
-                lines.append(f"  Lev: x{lev}")
-            pnl_prefix = "+" if pnl >= 0 else ""
-            pnl_text = f"{pnl_prefix}{_fmt_usd(pnl)}"
-            roe_text = f" | ROE: {roe_val:.2f}%" if roe_val is not None else ""
-            lines.append(f"  PnL: {pnl_text}{roe_text}")
-
-        await message.reply_html("\n".join(lines))
-    except Exception as exc:
-        await message.reply_text(f"No pude armar el estado: {exc}")
+    asyncio.create_task(_refresh_and_edit())
 
 
 async def posicion_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
