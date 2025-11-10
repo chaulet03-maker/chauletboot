@@ -395,6 +395,28 @@ async def _resolve_equity_usdt(exchange: Any) -> float:
                     return float(bal)
                 except Exception:
                     logger.debug("Respuesta inválida de fetch_balance_usdt", exc_info=True)
+
+        if exchange and hasattr(exchange, "fetch_balance"):
+            try:
+                # 🚨 CORRECCIÓN CRÍTICA: La llamada a la API (fetch_balance) es SÍNCRONA y debe
+                # ser ejecutada en un hilo para no bloquear el bot asíncrono.
+                balance = await asyncio.to_thread(exchange.fetch_balance)
+
+                # Intentar obtener el saldo total de la billetera o el saldo total de USDT
+                # (el campo exacto varía, pero estos son los más comunes en CCXT/Binance Futures)
+                return float(
+                    balance.get("totalWalletBalance")
+                    or balance.get("info", {}).get("totalWalletBalance")
+                    or balance["total"]["USDT"]
+                )
+            except Exception:
+                # ERROR EXPUESTO: Registramos el error COMPLETO para ver si es problema de API Key/Permisos
+                logger.error(
+                    "Error al obtener el saldo (Equity) de Binance Futures. Verifique API Keys/Permisos.",
+                    exc_info=True,
+                )
+                return 0.0
+        return 0.0
     try:
         return float(get_equity_sim())
     except Exception:
