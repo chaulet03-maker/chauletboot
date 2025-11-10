@@ -690,6 +690,9 @@ class Exchange:
             if isinstance(user_options, Mapping):
                 options.update(user_options)
 
+        if "timeout" not in params:
+            params["timeout"] = 15000
+
         default_type = str(options.get("defaultType") or options.get("default_type") or "").lower()
         if default_type not in {"future", "swap"}:
             default_type = "future"
@@ -698,10 +701,17 @@ class Exchange:
 
         params["options"] = options
 
+        requested_retries = params.get("retries")
+
         client = ccxt.binanceusdm(params)
         use_testnet = os.getenv("BINANCE_UMFUTURES_TESTNET", "false").lower() == "true"
         if use_testnet and hasattr(client, "set_sandbox_mode"):
             client.set_sandbox_mode(True)
+        try:
+            if requested_retries is None:
+                client.retries = 2
+        except Exception:
+            logger.debug("No se pudo fijar retries en cliente CCXT", exc_info=True)
         return client
 
     def _apply_client_options(self, client: Any) -> None:

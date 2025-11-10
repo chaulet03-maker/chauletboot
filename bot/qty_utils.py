@@ -32,7 +32,7 @@ async def round_and_validate_qty(exchange, symbol: str, qty: float):
     ):
         target = min_notional / price
         ceil_qty = math.ceil(target / step) * step
-        if original_qty <= 0 or original_qty < target * 0.9:
+        if original_qty <= 0:
             return 0.0
         qty = ceil_qty
 
@@ -44,7 +44,7 @@ async def round_and_validate_qty(exchange, symbol: str, qty: float):
             candidate = math.ceil(target / step) * step
         else:
             candidate = target
-        if original_qty <= 0 or original_qty < target * 0.9:
+        if original_qty <= 0:
             return 0.0
         qty = candidate
     return max(qty, 0.0)

@@ -328,6 +328,7 @@ class TradingApp:
         self._live_sync_next_ts = 0.0
         self._live_open_cached = None  # None/True/False
         self._live_flat_logged_state: Optional[bool] = None
+        self._loop_sem = asyncio.Semaphore(1)
 
     @property
     def active_mode(self) -> str:
@@ -673,7 +674,23 @@ class TradingApp:
         self._entry_locks[key] = now
         return True
 
-    async def trading_loop(self, context: ContextTypes.DEFAULT_TYPE):
+    async def trading_loop(self, context: ContextTypes.DEFAULT_TYPE | None = None):
+        """Bucle principal de trading ejecutado por la JobQueue de Telegram."""
+        if self._loop_sem.locked():
+            self.logger.warning("trading_loop saltado: ya hay una vuelta en curso")
+            return
+        async with self._loop_sem:
+            t0 = time.perf_counter()
+            try:
+                await asyncio.wait_for(self._trading_loop_body(), timeout=55)
+            except asyncio.TimeoutError:
+                self.logger.warning("trading_loop excedió 55s: cancelando cuerpo y continuando")
+            except Exception:
+                self.logger.exception("trading_loop error inesperado")
+            finally:
+                self.logger.info("<< trading_loop end (%.2fs)", time.perf_counter() - t0)
+
+    async def _trading_loop_body(self):
         """Bucle principal de trading ejecutado por la JobQueue de Telegram."""
         metrics = getattr(self, "metrics", None)
         tick_started = monotonic()
