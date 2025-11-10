@@ -83,13 +83,15 @@ async def reply_markdown_safe(message, text: str):
 
 CLOSE_TEXT_RE_PATTERN = r"(?i)^(cerrar(?: posicion| posición)?|close)$"
 OPEN_TEXT_RE_PATTERN = r"(?i)^open\s+(long|short)\s+x(\d+)$"
-POSITION_TEXT_RE_PATTERN = r"(?i)^(posicion|posición|position)$"
+POSITION_TEXT_RE_PATTERN_SINGULAR = r"(?i)^(posicion|posición|position)$"
+POSITION_TEXT_RE_PATTERN_PLURAL = r"(?i)^(posiciones|posiciónes|positions)$"
 
 LOGS_TEXT_RE_PATTERN = r"(?i)^(logs?|ver\s+logs|log\s+tail)$"
 
 CLOSE_TEXT_RE = re.compile(CLOSE_TEXT_RE_PATTERN)
 OPEN_TEXT_RE = re.compile(OPEN_TEXT_RE_PATTERN)
-POSITION_TEXT_RE = re.compile(POSITION_TEXT_RE_PATTERN)
+POSITION_TEXT_RE = re.compile(POSITION_TEXT_RE_PATTERN_SINGULAR)
+POSITIONS_TEXT_RE = re.compile(POSITION_TEXT_RE_PATTERN_PLURAL)
 
 # === util local para formateo ===
 
@@ -3319,12 +3321,16 @@ def register_commands(application: Application) -> None:
         MessageHandler(filters.Regex(OPEN_TEXT_RE_PATTERN), handle_open_manual) # CORRECCIÓN
     )
     application.add_handler(
-        MessageHandler(filters.Regex(POSITION_TEXT_RE_PATTERN), posicion_command) # CORRECCIÓN
+        MessageHandler(filters.Regex(POSITION_TEXT_RE_PATTERN_SINGULAR), posicion_command) # CORRECCIÓN
+    )
+    application.add_handler(
+        MessageHandler(filters.Regex(POSITION_TEXT_RE_PATTERN_PLURAL), posiciones_command)
     )
     generic_filter = filters.TEXT & (~filters.COMMAND)
     generic_filter = generic_filter & (~filters.Regex(CLOSE_TEXT_RE_PATTERN)) # CORRECCIÓN
     generic_filter = generic_filter & (~filters.Regex(OPEN_TEXT_RE_PATTERN)) # CORRECCIÓN
-    generic_filter = generic_filter & (~filters.Regex(POSITION_TEXT_RE_PATTERN)) # CORRECCIÓN
+    generic_filter = generic_filter & (~filters.Regex(POSITION_TEXT_RE_PATTERN_SINGULAR)) # CORRECCIÓN
+    generic_filter = generic_filter & (~filters.Regex(POSITION_TEXT_RE_PATTERN_PLURAL))
     generic_filter = generic_filter & (~filters.Regex(r"(?i)^(status|estado)$")) # CORRECCIÓN
     generic_filter = generic_filter & (~filters.Regex(LOGS_TEXT_RE_PATTERN))
     application.add_handler(MessageHandler(generic_filter, on_unknown_text))
