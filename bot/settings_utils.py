@@ -24,15 +24,41 @@ def _norm_key(key: str) -> str:
     return key
 
 
-def get_val(S: Any, raw_cfg: dict, *keys, default=None):
-    """Busca en S como atributo y en el YAML como clave normalizando nombres."""
+def get_val(settings: Any, config: dict, *keys, default: Any = None) -> Any:
+    """
+    Intenta obtener un valor usando una lista de posibles nombres de clave,
+    buscando en el objeto Settings (S) y luego en el diccionario de configuración (config).
+    Soporta rutas anidadas usando notación de puntos (ej: 'order_sizing.default_pct').
+    """
 
     for key in keys:
-        norm_key = _norm_key(key)
-        if hasattr(S, norm_key):
-            value = getattr(S, norm_key)
-            if value is not None:
-                return value
-        if norm_key in raw_cfg and raw_cfg[norm_key] is not None:
-            return raw_cfg[norm_key]
+        # 1. Buscar en el objeto Settings (S) cuando no es ruta anidada
+        if "." not in key:
+            attr_name = _norm_key(key)
+            if hasattr(settings, attr_name):
+                value = getattr(settings, attr_name)
+                if value is not None:
+                    return value
+
+        # 2. Buscar en el diccionario de configuración (config)
+        path = key.split(".")
+        current = config
+        found = True
+        for part in path:
+            if isinstance(current, dict):
+                if part in current:
+                    current = current[part]
+                    continue
+
+                norm_part = _norm_key(part)
+                if norm_part in current:
+                    current = current[norm_part]
+                    continue
+
+            found = False
+            break
+
+        if found and current is not None:
+            return current
+
     return default
