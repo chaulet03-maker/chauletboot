@@ -3136,7 +3136,17 @@ def register_commands(application: Application) -> None:
     if getattr(application, "_chaulet_router_registered", False):
         return
 
+    application.add_handler(CommandHandler("logs", logs_command), block=True)
     application.add_handler(MessageHandler(filters.COMMAND, _slash_router))
+    application.add_handler(
+        MessageHandler(
+            filters.TEXT
+            & (~filters.COMMAND)
+            & filters.Regex(LOGS_TEXT_RE_PATTERN),
+            logs_command,
+        ),
+        block=True,
+    )
     application.add_handler(
         MessageHandler(filters.Regex(r"(?i)^(status|estado)$"), _status_plaintext_handler) # CORRECCIÓN
     )
