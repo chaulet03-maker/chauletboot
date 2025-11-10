@@ -11,19 +11,16 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
-logging.Formatter.default_msec_format = "%s,%03d"
-
 # Asegurar import relativo al proyecto
 ROOT = os.path.dirname(os.path.abspath(__file__))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
 from logging_setup import setup_logging
+
+# Inicializamos logging de manera centralizada (rota archivos, filtra ruido, etc.)
+setup_logging()
+
 from config import load_raw_config, get_telegram_token, get_telegram_chat_id
 from bot.engine import TradingApp
 from bot.mode_manager import ensure_startup_mode
@@ -148,7 +145,6 @@ def main(argv: list[str] | None = None):
     cfg["telegram_token"] = get_telegram_token(cfg.get("telegram_token"))
     cfg["telegram_chat_id"] = get_telegram_chat_id(cfg.get("telegram_chat_id"))
 
-    setup_logging()
     logging.info(
         "Iniciando bot en modo: %s (fuente=%s, persistido=%s)",
         "REAL" if effective_mode == "real" else "SIMULADO",
