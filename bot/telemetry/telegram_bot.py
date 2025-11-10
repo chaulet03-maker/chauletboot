@@ -85,6 +85,8 @@ CLOSE_TEXT_RE_PATTERN = r"(?i)^(cerrar(?: posicion| posición)?|close)$"
 OPEN_TEXT_RE_PATTERN = r"(?i)^open\s+(long|short)\s+x(\d+)$"
 POSITION_TEXT_RE_PATTERN = r"(?i)^(posicion|posición|position)$"
 
+LOGS_TEXT_RE_PATTERN = r"(?i)^(logs?|ver\s+logs|log\s+tail)$"
+
 CLOSE_TEXT_RE = re.compile(CLOSE_TEXT_RE_PATTERN)
 OPEN_TEXT_RE = re.compile(OPEN_TEXT_RE_PATTERN)
 POSITION_TEXT_RE = re.compile(POSITION_TEXT_RE_PATTERN)
@@ -1490,7 +1492,7 @@ def _tail_log_file(path: str, limit: int) -> List[str]:
         ]
 
 
-def _tail_memory_logs(limit: int) -> List[str]:
+def _snapshot_log_buffer() -> List[str]:
     handler = LOG_RING
     if handler is None:
         handler = getattr(logging.getLogger(), "_memh", None)
@@ -1499,9 +1501,12 @@ def _tail_memory_logs(limit: int) -> List[str]:
     buf = getattr(handler, "buffer", None)
     if buf is None:
         buf = getattr(handler, "buf", None)
-    if buf:
-        return list(buf)[-limit:]
-    return []
+    if not buf:
+        return []
+    try:
+        return list(buf)
+    except TypeError:
+        return list(buf)
 
 
 def _format_local_timestamp(value) -> str:
@@ -1731,7 +1736,12 @@ async def _cmd_config(engine, reply):
 
 
 def _read_logs_text(engine, limit: int = 30) -> str:
-    def _apply_filters(lines: List[str], n: int) -> List[str]:
+    try:
+        n = max(int(limit or 30), 1)
+    except (TypeError, ValueError):
+        n = 30
+
+    def _select_tail(lines: List[str]) -> List[str]:
         if not lines:
             return []
         filtered = [
@@ -1742,32 +1752,25 @@ def _read_logs_text(engine, limit: int = 30) -> str:
         source = filtered if filtered else lines
         return source[-n:]
 
-    try:
-        n = max(int(limit or 30), 1)
-    except (TypeError, ValueError):
-        n = 30
+    snapshot = _snapshot_log_buffer()
+    tail = _select_tail(snapshot)
 
-    lines = _tail_memory_logs(max(n * 4, n))
-    lines = _apply_filters(lines, n)
-
-    if not lines:
+    if not tail:
         path = _engine_logs_path(engine)
         try:
+            file_lines: List[str] = []
             if os.path.exists(path):
                 file_lines = _tail_log_file(path, max(n * 4, n))
-            else:
-                file_lines = []
         except Exception as exc:
             return f"Error al leer logs: {exc}"
-        lines = _apply_filters(file_lines, n)
+        tail = _select_tail(file_lines)
 
-    if not lines:
+    if not tail:
         return "No hay logs aún."
 
-    text = "\n".join(lines)
-    if len(text) > 3900:
-        text = text[-3900:]
-        text = "…(recorte)\n" + text
+    text = "\n".join(tail) or "No hay logs aún."
+    if len(text) > 3800:
+        text = "…(recorte)\n" + text[-3800:]
     return text
 
 
@@ -2656,7 +2659,14 @@ async def logs_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     engine = _get_engine_from_context(context)
     limit = _extract_logs_limit(update, context, default=30)
     text = _read_logs_text(engine, limit)
-    await _reply_chunks(update, text)
+    chat = update.effective_chat
+    bot = getattr(context, "bot", None)
+    if bot is not None and chat is not None:
+        await bot.send_message(chat_id=chat.id, text=text)
+        return
+    message = update.effective_message
+    if message is not None:
+        await message.reply_text(text)
 
 
 async def equity_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3144,6 +3154,7 @@ def register_commands(application: Application) -> None:
     generic_filter = generic_filter & (~filters.Regex(OPEN_TEXT_RE_PATTERN)) # CORRECCIÓN
     generic_filter = generic_filter & (~filters.Regex(POSITION_TEXT_RE_PATTERN)) # CORRECCIÓN
     generic_filter = generic_filter & (~filters.Regex(r"(?i)^(status|estado)$")) # CORRECCIÓN
+    generic_filter = generic_filter & (~filters.Regex(LOGS_TEXT_RE_PATTERN))
     application.add_handler(MessageHandler(generic_filter, _text_router))
     setattr(application, "_chaulet_router_registered", True)
     logger.info(
