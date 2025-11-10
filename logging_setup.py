@@ -5,6 +5,8 @@ import time
 from collections import deque
 from logging.handlers import RotatingFileHandler
 
+logging.Formatter.default_msec_format = "%s,%03d"
+
 LOG_DIR = os.getenv("LOG_DIR", "/app/logs")
 LOG_FILE = os.path.join(LOG_DIR, "bot.log")
 os.makedirs(LOG_DIR, exist_ok=True)
@@ -64,7 +66,10 @@ def setup_logging() -> logging.Logger:
         return logger
 
     logger.setLevel(logging.INFO)
-    fmt = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
+    fmt = logging.Formatter(
+        "%(asctime)s - %(levelname)s - %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
 
     stream_handler = logging.StreamHandler()
     stream_handler.setFormatter(fmt)

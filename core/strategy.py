@@ -11,6 +11,46 @@ from anchor_freezer import Side
 from deps import FREEZER
 from bot.logger import _warn
 
+
+def _format_signal_debug(
+    ts,
+    side_pref,
+    price,
+    anchor_raw,
+    anchor,
+    step,
+    span,
+    atr,
+    atrp,
+    rsi4h,
+    adx,
+    ema200_4h,
+    ema200_1h,
+    grid_short,
+    in_short,
+    grid_long,
+    in_long,
+    long_allowed,
+    short_allowed,
+    funding_dec,
+    gate_bps,
+    reasons,
+):
+    return (
+        f"SIGNAL DEBUG ts={ts} "
+        f"side_pref={side_pref} price={price:.2f} "
+        f"anchor_raw={anchor_raw:.2f} anchor={anchor:.2f} "
+        f"step={step:.2f} span={span:.2f} "
+        f"atr={atr:.2f} atrp={atrp:.2f} "
+        f"rsi4h={rsi4h:.2f} adx={adx:.2f} "
+        f"ema200_4h={ema200_4h:.2f} ema200_1h={ema200_1h:.2f} "
+        f"grid_SHORT={list(map(lambda x: round(x, 2), grid_short))} in_short={in_short} "
+        f"grid_LONG={list(map(lambda x: round(x, 2), grid_long))} in_long={in_long} "
+        f"long_allowed={long_allowed} short_allowed={short_allowed} "
+        f"funding_dec={funding_dec:.6f} gate_bps={gate_bps} "
+        f"reasons={reasons}"
+    )
+
 class Strategy:
     def __init__(self, cfg):
         self.config = cfg
@@ -548,33 +588,31 @@ class Strategy:
             ok = (price > anchor_used) and ((price - anchor_used) >= step_used) and ((price - anchor_used) <= span_used)
             if not ok: reasons.append("grid SHORT: fuera de rango [step,span]")
 
-        log.debug(
-            "SIGNAL DEBUG ts=%s side_pref=%s price=%.2f anchor_raw=%.2f anchor=%.2f step=%.2f span=%.2f "
-            "atr=%.2f atrp=%.2f rsi4h=%.2f adx=%.2f ema200_4h=%.2f ema200_1h=%.2f "
-            "grid_SHORT=[%.2f,%.2f] in_short=%s grid_LONG=[%.2f,%.2f] in_long=%s "
-            "long_allowed=%s short_allowed=%s funding_dec=%s gate_bps=%s reasons=%s",
-            str(ts),
-            side_pref,
-            price,
-            anchor_raw if np.isfinite(anchor_raw) else float("nan"),
-            anchor_used if np.isfinite(anchor_used) else float("nan"),
-            step_used if np.isfinite(step_used) else 0.0,
-            span_used if np.isfinite(span_used) else 0.0,
-            atr if np.isfinite(atr) else float("nan"),
-            atrp if np.isfinite(atrp) else float("nan"),
-            rsi4h if np.isfinite(rsi4h) else float("nan"),
-            adx if np.isfinite(adx) else float("nan"),
-            ema200_4h if np.isfinite(ema200_4h) else float("nan"),
-            ema200_1h if np.isfinite(ema200_1h) else float("nan"),
-            short_lo,
-            short_hi,
-            in_short,
-            long_lo,
-            long_hi,
-            in_long,
-            long_allowed,
-            short_allowed,
-            ("%.6f" % r_dec) if (r_dec is not None) else "None",
-            str(gate_bps) if (gate_bps is not None) else "None",
-            reasons or ["OK (si no hay señal, probablemente grid no se activó)"]
+        grid_SHORT = [short_lo, short_hi]
+        grid_LONG = [long_lo, long_hi]
+        funding_dec_value = float(r_dec) if r_dec is not None else float("nan")
+        summary = _format_signal_debug(
+            ts=str(ts),
+            side_pref=side_pref,
+            price=price,
+            anchor_raw=anchor_raw if np.isfinite(anchor_raw) else float("nan"),
+            anchor=anchor_used if np.isfinite(anchor_used) else float("nan"),
+            step=step_used if np.isfinite(step_used) else 0.0,
+            span=span_used if np.isfinite(span_used) else 0.0,
+            atr=atr if np.isfinite(atr) else float("nan"),
+            atrp=atrp if np.isfinite(atrp) else float("nan"),
+            rsi4h=rsi4h if np.isfinite(rsi4h) else float("nan"),
+            adx=adx if np.isfinite(adx) else float("nan"),
+            ema200_4h=ema200_4h if np.isfinite(ema200_4h) else float("nan"),
+            ema200_1h=ema200_1h if np.isfinite(ema200_1h) else float("nan"),
+            grid_short=grid_SHORT,
+            in_short=in_short,
+            grid_long=grid_LONG,
+            in_long=in_long,
+            long_allowed=long_allowed,
+            short_allowed=short_allowed,
+            funding_dec=funding_dec_value,
+            gate_bps=gate_bps,
+            reasons=reasons or ["OK (si no hay señal, probablemente grid no se activó)"],
         )
+        log.info(summary)

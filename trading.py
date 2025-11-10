@@ -449,7 +449,7 @@ def bootstrap_real_state(
 
         current_sync = (abs(float(signed_qty)), avg_price)
         if _LAST_REAL_SYNC != current_sync:
-            logger.info(
+            logger.debug(
                 "Sincronizado estado REAL con exchange: qty=%.6f, avg=%.2f",
                 *current_sync,
             )
