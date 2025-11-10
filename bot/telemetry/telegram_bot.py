@@ -434,8 +434,8 @@ async def _resolve_equity_usdt(exchange: Any) -> float:
     # --- 1) Si tu wrapper tiene el método, úsalo:
     if hasattr(exchange, "fetch_balance_usdt"):
         try:
-            # si tu método acepta tipo, pasamos "future"; si no, igual funciona.
-            maybe_balance = await asyncio.to_thread(exchange.fetch_balance_usdt, "future")
+            # Llamamos sin argumentos adicionales para evitar incompatibilidades.
+            maybe_balance = await asyncio.to_thread(exchange.fetch_balance_usdt)
             # el wrapper puede devolver ya un float o un dict
             if isinstance(maybe_balance, (int, float)):
                 return float(maybe_balance)
