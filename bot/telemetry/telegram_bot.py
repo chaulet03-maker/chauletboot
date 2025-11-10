@@ -2,7 +2,6 @@ import os
 import math
 import logging
 import asyncio
-from asyncio import to_thread
 import sqlite3
 import time
 import re
@@ -3153,7 +3152,6 @@ def register_commands(application: Application) -> None:
     if getattr(application, "_chaulet_router_registered", False):
         return
 
-    application.add_handler(CommandHandler("logs", logs_command))
     application.add_handler(
         MessageHandler(
             filters.TEXT
@@ -3486,7 +3484,7 @@ async def _report_periodic(notifier: TelegramNotifier, days: int):
         now = pd.Timestamp.now(tz=_tz())
         since = now - pd.Timedelta(days=days)
         try:
-            df_eq = await to_thread(pd.read_csv, eq_csv, parse_dates=["ts"])
+            df_eq = await asyncio.to_thread(pd.read_csv, eq_csv, parse_dates=["ts"])
             df_eq["ts"] = pd.to_datetime(df_eq["ts"], utc=True)
             dfw = df_eq[df_eq["ts"] >= since.tz_convert("UTC")]
             if not dfw.empty:
@@ -3497,7 +3495,7 @@ async def _report_periodic(notifier: TelegramNotifier, days: int):
         except Exception:
             pass
         try:
-            df_tr = await to_thread(pd.read_csv, tr_csv, parse_dates=["ts"])
+            df_tr = await asyncio.to_thread(pd.read_csv, tr_csv, parse_dates=["ts"])
             df_tr["ts"] = pd.to_datetime(df_tr["ts"], utc=True)
             dft = df_tr[df_tr["ts"] >= since.tz_convert("UTC")]
             if not dft.empty:
