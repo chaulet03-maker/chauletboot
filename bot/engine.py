@@ -6,6 +6,7 @@ import threading
 import inspect
 import time
 from collections import deque
+from datetime import datetime, timedelta
 from typing import Any, Dict, Optional, cast
 from time import monotonic, time as _now
 
@@ -15,6 +16,7 @@ except Exception:  # pragma: no cover - fallback when zoneinfo is unavailable
     ZoneInfo = None  # type: ignore[assignment]
 import pandas as pd
 import schedule
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from telegram.ext import ContextTypes
 
 from anchor_freezer import Side
@@ -239,6 +241,7 @@ class TradingApp:
         self._entry_ts = None
         self._bars_in_position = 0
         self.manual_block_until = 0
+        self._internal_scheduler: Optional[AsyncIOScheduler] = None
         try:
             self.sl_equity_pct = float(
                 self.config.get(
@@ -2093,24 +2096,60 @@ class TradingApp:
     def _start_internal_scheduler(self, loop: asyncio.AbstractEventLoop) -> None:
         """Fallback scheduler when Telegram is disabled."""
 
-        async def _run_periodic(coro, interval: float, first: float = 0.0):
-            await asyncio.sleep(max(first, 0.0))
-            context = None
-            while True:
-                try:
-                    await coro(context)
-                except asyncio.CancelledError:
-                    raise
-                except Exception as exc:  # pragma: no cover - defensivo
-                    self.logger.exception("Error en tarea periódica interna: %s", exc)
-                await asyncio.sleep(max(interval, 0.0))
+        existing = getattr(self, "_internal_scheduler", None)
+        if existing is not None:
+            try:
+                existing.shutdown(wait=False)
+            except Exception:
+                self.logger.debug(
+                    "No se pudo detener scheduler interno anterior", exc_info=True
+                )
 
-        tasks = [
-            loop.create_task(_run_periodic(self._update_price_cache_job, interval=10, first=1)),
-            loop.create_task(_run_periodic(self.trading_loop, interval=60, first=5)),
-        ]
-        self._internal_jobs = getattr(self, "_internal_jobs", [])
-        self._internal_jobs.extend(tasks)
+        try:
+            scheduler = AsyncIOScheduler(
+                event_loop=loop,
+                job_defaults={
+                    "max_instances": 1,
+                    "coalesce": True,
+                    "misfire_grace_time": 60,
+                },
+            )
+        except Exception:
+            self.logger.exception("No se pudo iniciar AsyncIOScheduler interno")
+            return
+
+        start_time = datetime.now()
+
+        try:
+            scheduler.add_job(
+                self._update_price_cache_job,
+                "interval",
+                seconds=10,
+                id="update_price_cache",
+                replace_existing=True,
+                kwargs={"context": None},
+                next_run_time=start_time + timedelta(seconds=1),
+            )
+            scheduler.add_job(
+                self.trading_loop,
+                "interval",
+                minutes=1,
+                id="trading_loop",
+                replace_existing=True,
+                kwargs={"context": None},
+                next_run_time=start_time + timedelta(seconds=5),
+            )
+        except Exception:
+            self.logger.exception("No se pudieron registrar jobs en AsyncIOScheduler")
+            try:
+                scheduler.shutdown(wait=False)
+            except Exception:
+                self.logger.debug("Fallo al cerrar scheduler interno", exc_info=True)
+            return
+
+        scheduler.start()
+        self._internal_scheduler = scheduler
+        self.logger.info("Scheduler interno AsyncIO iniciado.")
 
     def run(self):
         loop = asyncio.get_event_loop()
@@ -2161,6 +2200,47 @@ class TradingApp:
                 loop.run_forever()
             except KeyboardInterrupt:  # pragma: no cover - defensivo
                 logging.info("Ejecución interrumpida manualmente.")
+
+    async def shutdown(self):
+        scheduler = getattr(self, "_internal_scheduler", None)
+        if scheduler is not None:
+            try:
+                scheduler.shutdown(wait=False)
+            except Exception:
+                self.logger.debug(
+                    "No se pudo detener el scheduler interno durante shutdown.",
+                    exc_info=True,
+                )
+            self._internal_scheduler = None
+
+        jobs = getattr(self, "_internal_jobs", None)
+        if jobs:
+            for task in jobs:
+                try:
+                    task.cancel()
+                except Exception:
+                    pass
+            self._internal_jobs = []
+
+        try:
+            stop_price_stream = getattr(self.exchange, "_stop_price_stream", None)
+            if callable(stop_price_stream):
+                stop_price_stream()
+            stream = getattr(self.exchange, "_price_stream", None)
+            stop = getattr(stream, "stop", None)
+            if callable(stop):
+                stop()
+        except Exception:
+            self.logger.debug("No se pudo detener PriceStream durante shutdown.", exc_info=True)
+
+        await asyncio.sleep(0)
+        try:
+            await asyncio.wait_for(self.close_all(reason="shutdown"), timeout=5)
+        except Exception:
+            self.logger.debug(
+                "No se pudo cerrar posiciones durante shutdown ordenado.",
+                exc_info=True,
+            )
 
     async def close_all(self, reason: str | None = None) -> Dict[str, Any] | bool:
         """Cierra SOLO la posición del BOT (reduceOnly) y devuelve un resumen del cierre."""

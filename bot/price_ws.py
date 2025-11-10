@@ -15,7 +15,12 @@ from dataclasses import dataclass
 from typing import Callable, Optional
 
 import websockets
-from websockets.exceptions import ConnectionClosed, InvalidStatusCode, WebSocketException
+from websockets.exceptions import (
+    ConnectionClosedError,
+    ConnectionClosedOK,
+    InvalidStatusCode,
+    WebSocketException,
+)
 
 
 CallbackType = Callable[[str, float, Optional[float]], None]
@@ -69,6 +74,7 @@ class PriceStream:
         self._thread: Optional[threading.Thread] = None
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._logger = logging.getLogger(__name__)
+        self._running = False
 
     # --------- API pública -------------------------------------------------
     def start(self) -> None:
@@ -78,6 +84,7 @@ class PriceStream:
             return
 
         self._stop_event.clear()
+        self._running = True
         self._thread = threading.Thread(
             target=self._run,
             name=f"PriceStream-{self._normalized_symbol().upper()}",
@@ -88,6 +95,7 @@ class PriceStream:
     def stop(self) -> None:
         """Detiene el stream y espera un cierre ordenado."""
 
+        self._running = False
         self._stop_event.set()
         loop = self._loop
         if loop and loop.is_running():
@@ -176,53 +184,75 @@ class PriceStream:
 
         return _ParsedMessage(symbol=symbol, price=price_value, event_ts=event_ts)
 
-    async def _connect_once(self) -> None:
-        url = f"{self.base_url}/{self._stream_path()}"
+    async def _connect_once(self, url: str, open_timeout: float = 10.0):
         self._logger.debug("Conectando PriceStream a %s", url)
-        try:
-            async with websockets.connect(
+        return await asyncio.wait_for(
+            websockets.connect(
                 url,
                 ping_interval=20,
                 ping_timeout=20,
-                close_timeout=5,
+                close_timeout=10,
+                max_queue=None,
                 max_size=2**20,
-            ) as ws:
-                self._logger.info("WS de precios conectado a %s", url)
-                while not self._stop_event.is_set():
-                    try:
-                        raw = await asyncio.wait_for(ws.recv(), timeout=20)
-                    except asyncio.TimeoutError:
-                        continue
-                    except ConnectionClosed:
-                        if not self._stop_event.is_set():
-                            raise
-                        return
-                    parsed = self._parse_message(raw)
-                    if not parsed:
-                        continue
-                    try:
-                        self._callback(parsed.symbol, parsed.price, parsed.event_ts)
-                    except Exception:  # pragma: no cover - defensivo
-                        self._logger.exception("Error al procesar tick de precio")
-        except (ConnectionClosed, InvalidStatusCode, WebSocketException) as exc:
-            if self._stop_event.is_set():
-                return
-            raise RuntimeError(f"WS desconectado: {exc}") from exc
+            ),
+            timeout=open_timeout,
+        )
+
+    async def _on_message(self, raw: object) -> None:
+        parsed = self._parse_message(raw)
+        if not parsed:
+            return
+        try:
+            self._callback(parsed.symbol, parsed.price, parsed.event_ts)
+        except Exception:  # pragma: no cover - defensivo
+            self._logger.exception("Error al procesar tick de precio")
 
     async def _run_forever(self) -> None:
         backoff = 1.0
-        while not self._stop_event.is_set():
+        url = f"{self.base_url}/{self._stream_path()}"
+        while self._running and not self._stop_event.is_set():
+            ws = None
             try:
-                await self._connect_once()
+                ws = await self._connect_once(url)
+                self._logger.info("WS de precios conectado a %s", url)
                 backoff = 1.0
+
+                async for raw in ws:
+                    if not self._running or self._stop_event.is_set():
+                        break
+                    await self._on_message(raw)
+
+            except (asyncio.TimeoutError, ConnectionClosedError, ConnectionClosedOK) as exc:
+                if self._stop_event.is_set() or not self._running:
+                    self._logger.debug("WS de precios cerrado: %s", exc)
+                else:
+                    self._logger.warning(
+                        "WS de precios desconectado (%s). Reintentando...",
+                        exc,
+                    )
             except asyncio.CancelledError:
+                self._logger.info("WS cancelado (shutdown).")
                 break
+            except (InvalidStatusCode, WebSocketException) as exc:
+                self._logger.warning("WS de precios falló al conectar: %s", exc)
             except Exception as exc:
-                if self._stop_event.is_set():
-                    break
-                self._logger.warning("Fallo en PriceStream: %s", exc, exc_info=True)
-                await asyncio.sleep(backoff)
-                backoff = min(backoff * 2, 30.0)
+                if self._stop_event.is_set() or not self._running:
+                    self._logger.debug("WS de precios detenido: %s", exc)
+                else:
+                    self._logger.exception("WS de precios error inesperado: %s", exc)
+            finally:
+                if ws is not None:
+                    try:
+                        await ws.close()
+                    except Exception:
+                        pass
+
+            if not self._running or self._stop_event.is_set():
+                break
+
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2.0, 30.0)
+
         self._logger.debug("Loop de PriceStream finalizado para %s", self.symbol)
 
     def _run(self) -> None:
@@ -231,6 +261,7 @@ class PriceStream:
         try:
             self._loop.run_until_complete(self._run_forever())
         finally:
+            self._running = False
             tasks = [t for t in asyncio.all_tasks(self._loop) if not t.done()]
             for task in tasks:
                 task.cancel()
