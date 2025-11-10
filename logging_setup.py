@@ -1,6 +1,7 @@
 import logging
 import os
 import re
+import time
 from collections import deque
 from logging.handlers import RotatingFileHandler
 
@@ -37,6 +38,26 @@ class RedactTokenFilter(logging.Filter):
         return True
 
 
+class RateLimitFilter(logging.Filter):
+    """Filter that throttles repeated INFO/WARNING records."""
+
+    def __init__(self, min_interval_sec: float = 300) -> None:
+        super().__init__()
+        self.min_interval = float(min_interval_sec)
+        self._last: dict[tuple[int, str], float] = {}
+
+    def filter(self, record: logging.LogRecord) -> bool:  # pragma: no cover - timing based
+        if not (logging.INFO <= record.levelno <= logging.WARNING):
+            return True
+        key = (record.levelno, record.msg)
+        now = time.time()
+        last = self._last.get(key, 0.0)
+        if now - last >= self.min_interval:
+            self._last[key] = now
+            return True
+        return False
+
+
 def setup_logging() -> logging.Logger:
     logger = logging.getLogger()
     if logger.handlers:
@@ -61,6 +82,8 @@ def setup_logging() -> logging.Logger:
     logger.addHandler(stream_handler)
     logger.addHandler(file_handler)
 
+    logger.addFilter(RateLimitFilter())
+
     class DequeHandler(logging.Handler):
         def __init__(self, maxlen: int = 5000) -> None:
             super().__init__()
@@ -74,8 +97,13 @@ def setup_logging() -> logging.Logger:
     logger.addHandler(mem_handler)
     logger._memh = mem_handler  # type: ignore[attr-defined]
     logger.info("Logger inicializado. Archivo: %s", LOG_FILE)
-    for name in ["httpx", "httpcore", "urllib3", "apscheduler", "telegram"]:
+    for name in ["httpx", "httpcore", "urllib3", "telegram"]:
         logging.getLogger(name).setLevel(logging.WARNING)
     logging.getLogger("telegram.http").setLevel(logging.INFO)
+    logging.getLogger("apscheduler").setLevel(logging.ERROR)
+    logging.getLogger("apscheduler.scheduler").setLevel(logging.ERROR)
+    logging.getLogger("apscheduler.executors.default").setLevel(logging.ERROR)
+    logging.getLogger("apscheduler.jobstores").setLevel(logging.ERROR)
+    logging.getLogger("apscheduler.executors").setLevel(logging.ERROR)
     logging.captureWarnings(True)
     return logger

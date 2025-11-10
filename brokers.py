@@ -47,6 +47,15 @@ PAPER_STORE_PATH = get_paper_store_path()
 
 ACTIVE_PAPER_STORE: PaperStore | None = None
 ACTIVE_LIVE_CLIENT: Any | None = None
+_LAST_MODE_STATUS: Optional[str] = None
+
+
+def _log_mode_status(status: str, level: int, message: str, *args) -> None:
+    global _LAST_MODE_STATUS
+    if _LAST_MODE_STATUS == status:
+        return
+    logger.log(level, message, *args)
+    _LAST_MODE_STATUS = status
 
 
 class SimBroker:
@@ -752,7 +761,9 @@ def build_broker(settings, client_factory: Callable[..., Any]):
     is_paper = runtime_mode not in {"real", "live"}
     if is_paper:
         ACTIVE_PAPER_STORE = _build_paper_store(settings.start_equity)
-        logger.warning(
+        _log_mode_status(
+            "SIM_READY",
+            logging.INFO,
             "MODO: 🧪 SIMULADO | equity inicial: %.2f USDT | store=%s",
             settings.start_equity,
             ACTIVE_PAPER_STORE.path,
@@ -766,9 +777,18 @@ def build_broker(settings, client_factory: Callable[..., Any]):
         raise RuntimeError("Falta BINANCE_API_SECRET (modo real).")
     # Siempre recrear el cliente al cambiar a REAL para evitar credenciales viejas
     ACTIVE_LIVE_CLIENT = None
-    client = client_factory(api_key=settings.binance_api_key, secret=settings.binance_api_secret)
+    try:
+        client = client_factory(api_key=settings.binance_api_key, secret=settings.binance_api_secret)
+    except Exception as exc:
+        _log_mode_status(
+            "REAL_DOWN",
+            logging.WARNING,
+            "MODO: 🔴 REAL | Binance desconectado: %s",
+            exc,
+        )
+        raise
     ACTIVE_LIVE_CLIENT = client
-    logger.warning("MODO: 🔴 REAL | Binance listo.")
+    _log_mode_status("REAL_READY", logging.INFO, "MODO: 🟢 REAL | Binance listo.")
     return BinanceBroker(client)
 
 

@@ -459,7 +459,7 @@ def bootstrap_real_state(
                     exc=exc,
                     level="debug",
                 )
-        logger.info("Sincronizado estado REAL con exchange: sin posición abierta.")
+        logger.debug("Sincronizado estado REAL con exchange: sin posición abierta.")
 
 
 def _config_uses_hedge(raw_config: Mapping[str, Any] | None) -> bool:
@@ -611,7 +611,7 @@ def rebuild(mode: Mode) -> None:
             bootstrap_real_state(symbol=getattr(POSITION_SERVICE, "symbol", None))
         except Exception as exc:
             _warn("TRADING", "bootstrap_real_state falló durante rebuild", exc=exc, level="debug")
-    logger.info(
+    logger.debug(
         "Trading stack reconstruido para modo %s (data_dir=%s, store=%s)",
         mode.upper(),
         ACTIVE_DATA_DIR,

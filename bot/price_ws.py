@@ -75,6 +75,7 @@ class PriceStream:
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._logger = logging.getLogger(__name__)
         self._running = False
+        self._ws_down = False
 
     # --------- API pública -------------------------------------------------
     def start(self) -> None:
@@ -214,7 +215,11 @@ class PriceStream:
             ws = None
             try:
                 ws = await self._connect_once(url)
-                self._logger.info("WS de precios conectado a %s", url)
+                if self._ws_down:
+                    self._logger.info("WS reconectado: %s", url)
+                else:
+                    self._logger.info("WS de precios conectado a %s", url)
+                self._ws_down = False
                 backoff = 1.0
 
                 async for raw in ws:
@@ -226,14 +231,14 @@ class PriceStream:
                 if self._stop_event.is_set() or not self._running:
                     self._logger.debug("WS de precios cerrado: %s", exc)
                 else:
-                    self._logger.warning(
-                        "WS de precios desconectado (%s). Reintentando...",
-                        exc,
-                    )
+                    if not self._ws_down:
+                        self._logger.info("WS desconectado (ping timeout). Reintentando…")
+                        self._ws_down = True
             except asyncio.CancelledError:
                 self._logger.info("WS cancelado (shutdown).")
                 break
             except (InvalidStatusCode, WebSocketException) as exc:
+                self._ws_down = True
                 self._logger.warning("WS de precios falló al conectar: %s", exc)
             except Exception as exc:
                 if self._stop_event.is_set() or not self._running:

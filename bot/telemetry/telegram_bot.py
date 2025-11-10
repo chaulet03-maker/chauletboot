@@ -1304,7 +1304,7 @@ class TelegramLoggingRequest(HTTPXRequest):
 
     def _log_response(self, method: str, status: int, elapsed_s: float) -> None:
         latency_ms = elapsed_s * 1000
-        if status == 200 and elapsed_s <= self._latency_warning_s:
+        if status == 200:
             self._log.debug(
                 "tg_api method=%s status=%s latency_ms=%.0f", method, status, latency_ms
             )
