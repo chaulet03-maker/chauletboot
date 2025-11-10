@@ -3403,6 +3403,9 @@ async def run_telegram_bot(token: str, engine) -> Application:
 
 
 async def start_telegram_bot(app, config):
+    logging.getLogger("telegram.http").setLevel(logging.WARNING)
+    logging.getLogger("telegram").setLevel(logging.WARNING)
+
     config_dict = config if isinstance(config, dict) else _app_config(app)
 
     application = getattr(app, "telegram_app", None)
