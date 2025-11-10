@@ -3149,6 +3149,8 @@ async def _status_plaintext_handler(
 
 def register_commands(application: Application) -> None:
     _populate_registry()
+    if not getattr(application, "_chaulet_bot_handlers_registered", False):
+        setattr(application, "_chaulet_bot_handlers_registered", True)
     if getattr(application, "_chaulet_router_registered", False):
         return
 
