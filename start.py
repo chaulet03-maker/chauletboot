@@ -1,5 +1,6 @@
 # start.py (reemplazar completo)
 import argparse
+import asyncio
 import os
 import sys
 import logging
@@ -156,6 +157,11 @@ def main(argv: list[str] | None = None):
     except Exception:
         logging.exception("Error ejecutando el bot")
         raise
+    finally:
+        try:
+            asyncio.run(app.shutdown())
+        except Exception:
+            logging.exception("Error durante el shutdown ordenado", exc_info=True)
 
 
 if __name__ == "__main__":
