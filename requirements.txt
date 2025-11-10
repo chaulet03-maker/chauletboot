@@ -1,7 +1,5 @@
 pydantic==2.11.1
-python-telegram-bot[job-queue]==20.7   # <- reemplaza la línea anterior sin [job-queue]
-# removed python-binance (WS opcional y fuente de fallas)
-# removed websockets (ya no se usa)
+python-telegram-bot[job-queue]==20.7
 ccxt>=4.3.0
 pandas==2.2.2
 numpy==1.26.4
@@ -10,9 +8,8 @@ python-dotenv==1.0.1
 PyYAML==6.0.2
 pytz==2024.1
 ta==0.11.0
-schedule==1.2.2                        # <- NUEVO: el bot lo importa
-APScheduler==3.10.4                    # <- opcional pero recomendado; lo usa el JobQueue
-# PTB 20.7 requiere httpx ~= 0.25.2
+schedule==1.2.2
+APScheduler==3.10.4
 httpx==0.25.2
 websockets==10.4
 binance-connector==3.6.*
