@@ -536,7 +536,7 @@ async def _compute_position_split(app) -> tuple[Dict[str, Dict[str, Any]], float
             try:
                 status = svc.get_status()
             except Exception:
-                logger.debug("No se pudo obtener status live desde PositionService.", exc_info=True)
+                logger.warning("No se pudo obtener status live desde PositionService.", exc_info=True)
 
         if not status and isinstance(acct_pos, dict):
             status = {
@@ -2428,12 +2428,8 @@ async def sl_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await message.reply_text("No se pudo actualizar el SL de la posición.")
         return
 
-    # Si no es precio, asumimos que es un % o un precio ABSOLUTO (para el DEFAULT)
-    await _handle_position_controls(
-        None,
-        lambda txt: reply_markdown_safe(message, txt),
-        f"sl {raw}",
-    )
+    # Si no es precio fijo (y hay posición), no hacemos nada más, evitando el router de defaults.
+    # Si queremos setear un % de riesgo, el usuario debe usar /ajustar o usar sl sin posición.
 
 
 async def tp_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
