@@ -22,7 +22,7 @@ from telegram.error import BadRequest
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 from telegram.request import HTTPXRequest
 
-from logging_setup import LOG_DIR, LOG_FILE
+from logging_setup import LOG_DIR, LOG_FILE, LOG_RING
 from time_fmt import fmt_ar
 from config import S, MANUAL_OPEN_RISK_PCT
 from bot.motives import MOTIVES
@@ -48,7 +48,7 @@ from position_service import (
     fetch_live_equity_usdm,
     split_total_vs_bot,
 )
-from core.reasons import render_logs_summary, render_reasons_simple
+from core.reasons import render_reasons_simple
 
 logger = logging.getLogger("telegram")
 
@@ -1491,10 +1491,16 @@ def _tail_log_file(path: str, limit: int) -> List[str]:
 
 
 def _tail_memory_logs(limit: int) -> List[str]:
-    root_logger = logging.getLogger()
-    buffer = getattr(root_logger, "_memh", None)
-    if buffer and getattr(buffer, "buf", None):
-        return list(buffer.buf)[-limit:]
+    handler = LOG_RING
+    if handler is None:
+        handler = getattr(logging.getLogger(), "_memh", None)
+    if handler is None:
+        return []
+    buf = getattr(handler, "buffer", None)
+    if buf is None:
+        buf = getattr(handler, "buf", None)
+    if buf:
+        return list(buf)[-limit:]
     return []
 
 
@@ -1724,32 +1730,45 @@ async def _cmd_config(engine, reply):
     return await reply("\n".join(text), parse_mode="Markdown")
 
 
-def _read_logs_text(engine, limit: int = 15) -> str:
-    events: List[Dict[str, Any]] = []
-    if engine is not None:
-        buffer = getattr(engine, "last_events", None)
-        if isinstance(buffer, deque):
-            events = list(buffer)
-        elif isinstance(buffer, (list, tuple)):
-            events = list(buffer)
-    if events:
-        return render_logs_summary(events)
+def _read_logs_text(engine, limit: int = 30) -> str:
+    def _apply_filters(lines: List[str], n: int) -> List[str]:
+        if not lines:
+            return []
+        filtered = [
+            line
+            for line in lines
+            if " - INFO - " in line or " - WARNING - " in line
+        ]
+        source = filtered if filtered else lines
+        return source[-n:]
 
     try:
-        n = max(int(limit or 15), 1)
+        n = max(int(limit or 30), 1)
     except (TypeError, ValueError):
-        n = 15
-    path = _engine_logs_path(engine)
-    try:
-        if os.path.exists(path):
-            lines = _tail_log_file(path, n)
-        else:
-            lines = _tail_memory_logs(n)
-        if not lines:
-            return "📄 Últimos logs:\n(sin logs disponibles)"
-        return "📄 Últimos logs:\n" + "\n".join(lines)
-    except Exception as exc:
-        return f"No pude leer los logs ({path}): {type(exc).__name__}: {exc}"
+        n = 30
+
+    lines = _tail_memory_logs(max(n * 4, n))
+    lines = _apply_filters(lines, n)
+
+    if not lines:
+        path = _engine_logs_path(engine)
+        try:
+            if os.path.exists(path):
+                file_lines = _tail_log_file(path, max(n * 4, n))
+            else:
+                file_lines = []
+        except Exception as exc:
+            return f"Error al leer logs: {exc}"
+        lines = _apply_filters(file_lines, n)
+
+    if not lines:
+        return "No hay logs aún."
+
+    text = "\n".join(lines)
+    if len(text) > 3900:
+        text = text[-3900:]
+        text = "…(recorte)\n" + text
+    return text
 
 
 def _set_killswitch(engine, enabled: bool) -> bool:
@@ -2635,7 +2654,7 @@ async def ajustar_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def logs_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     engine = _get_engine_from_context(context)
-    limit = _extract_logs_limit(update, context)
+    limit = _extract_logs_limit(update, context, default=30)
     text = _read_logs_text(engine, limit)
     await _reply_chunks(update, text)
 
