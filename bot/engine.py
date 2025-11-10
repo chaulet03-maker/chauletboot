@@ -2174,7 +2174,7 @@ class TradingApp:
             scheduler.add_job(
                 self._update_price_cache_job,
                 "interval",
-                seconds=10,
+                seconds=20,
                 id="update_price_cache",
                 replace_existing=True,
                 kwargs={"context": None},
@@ -2206,7 +2206,7 @@ class TradingApp:
 
         if self.telegram_app is not None:
             job_queue = self.telegram_app.job_queue
-            job_queue.run_repeating(self._update_price_cache_job, interval=10, first=1)
+            job_queue.run_repeating(self._update_price_cache_job, interval=20, first=1)
             job_queue.run_repeating(self.trading_loop, interval=60, first=5)
         else:
             logging.info(
