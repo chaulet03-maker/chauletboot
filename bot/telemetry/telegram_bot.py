@@ -2290,10 +2290,51 @@ async def sl_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if app is None or message is None:
         return
 
+    # 🚨 CRÍTICO: Usar el servicio de posición del bot para obtener la posición y el SL/TP
+    pos_info = _bot_position_info(app)
+    if not pos_info:
+        # Si no hay posición del bot, delegamos a la lógica de defaults
+        await _handle_position_controls(
+            None,
+            lambda txt: reply_markdown_safe(message, txt),
+            update.effective_message.text,
+        )
+        return
+
+    symbol_conf = pos_info["symbol_conf"]
+
     args = context.args or []
     if not args:
-        pct = float(getattr(app, "sl_equity_pct", 10.0) or 0.0)
-        await message.reply_text(f"SL predeterminado: -{pct:.2f}% del equity.")
+        # Mostrar SL actual del servicio (que contiene el SL de la posición abierta)
+        service = getattr(trading, "POSITION_SERVICE", None)
+        sl_price = None
+        if service is not None:
+            get_levels = getattr(service, "get_protection_levels", None)
+            if callable(get_levels):
+                levels = None
+                try:
+                    levels = get_levels(symbol_conf)
+                except TypeError:
+                    try:
+                        levels = get_levels()
+                    except Exception:
+                        logger.debug("get_protection_levels falló sin argumentos", exc_info=True)
+                        levels = None
+                except Exception:
+                    logger.debug("get_protection_levels falló", exc_info=True)
+                if isinstance(levels, dict):
+                    sl_price = levels.get("sl")
+                else:
+                    sl_price = getattr(levels, "sl", None)
+        if sl_price not in (None, ""):
+            try:
+                await message.reply_text(f"SL actual de la posición: {_num(sl_price)}")
+            except Exception:
+                await message.reply_text(f"SL actual de la posición: {sl_price}")
+        else:
+            defaults = get_protection_defaults(symbol_conf)
+            pct = float(defaults.get("sl_pct_equity") or 0.0)
+            await message.reply_text(f"SL predeterminado: -{abs(pct):.2f}% del precio.")
         return
 
     raw = " ".join(args).strip().replace(",", ".")
@@ -2301,32 +2342,51 @@ async def sl_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             px = float(raw.replace("$", "").strip())
         except Exception:
-            await message.reply_text("Formato inválido. Usá `sl 5` (equity %) o `sl $108000` (precio).")
+            await message.reply_text("Formato inválido. Usá `sl 5` (pct) o `sl $108000` (precio).")
             return
-        try:
-            pos = await app.exchange.get_open_position(app.config.get("symbol"))
-        except Exception:
-            pos = None
-        if pos:
-            await app.exchange.update_protections(
-                symbol=app.config.get("symbol"),
-                side=pos.get("side"),
-                qty=float(pos.get("contracts") or pos.get("positionAmt") or 0.0),
-                sl=px,
-            )
-            await message.reply_text(f"✅ SL actualizado a ${px:,.2f}")
+
+        # Actualizar la protección a través del Position Service (SOLO si hay posición del bot)
+        service = getattr(trading, "POSITION_SERVICE", None)
+        updated = False
+        if service is not None:
+            update_sl = getattr(service, "update_stop_loss", None)
+            if callable(update_sl):
+                try:
+                    update_sl(px)
+                    updated = True
+                except TypeError:
+                    try:
+                        update_sl(symbol_conf, px)
+                        updated = True
+                    except Exception:
+                        logger.debug("update_stop_loss falló con firma alternativa", exc_info=True)
+                except Exception:
+                    logger.debug("update_stop_loss falló", exc_info=True)
+        if not updated and getattr(app, "exchange", None) is not None:
+            try:
+                pos = await app.exchange.get_open_position(app.config.get("symbol"))
+            except Exception:
+                pos = None
+            if pos:
+                await app.exchange.update_protections(
+                    symbol=app.config.get("symbol"),
+                    side=pos.get("side"),
+                    qty=float(pos.get("contracts") or pos.get("positionAmt") or 0.0),
+                    sl=px,
+                )
+                updated = True
+        if updated:
+            await message.reply_text(f"✅ SL de la posición actualizado a {_num(px)}")
         else:
-            await message.reply_text("No hay posición del BOT abierta.")
+            await message.reply_text("No se pudo actualizar el SL de la posición.")
         return
 
-    try:
-        pct = float(raw)
-    except Exception:
-        await message.reply_text("Formato inválido. Usá `sl 5` (equity %) o `sl $108000` (precio).")
-        return
-    if hasattr(app, "set_sl_equity_pct"):
-        app.set_sl_equity_pct(pct)
-    await message.reply_text(f"✅ SL predeterminado guardado en -{pct:.2f}% del equity.")
+    # Si no es precio, asumimos que es un % o un precio ABSOLUTO (para el DEFAULT)
+    await _handle_position_controls(
+        None,
+        lambda txt: reply_markdown_safe(message, txt),
+        f"sl {raw}",
+    )
 
 
 async def tp_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2335,6 +2395,9 @@ async def tp_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if app is None or message is None:
         return
 
+    pos_info = _bot_position_info(app)
+
+    # Si se está seteando un default (sin args, o con el formato /tp xX Y)
     args = [arg.strip() for arg in (context.args or []) if arg.strip()]
     cfg = _engine_config(app)
     if not isinstance(cfg, dict):
@@ -2371,11 +2434,94 @@ async def tp_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parsed = _try_parse_tp_pct(raw_val, allow_zero=True)
         return parsed if parsed is not None else default_pct
 
+    # 1. Si hay posición abierta y se pide setear un PRECIO fijo (ej: tp 109000 o tp $109000)
+    if pos_info and len(args) == 1 and not args[0].lower().startswith("x"):
+        raw = args[0].replace(",", ".")
+        if raw.startswith("$"):
+            target = float(raw.replace("$", "").strip())
+        else:
+            try:
+                target = float(raw.strip())
+            except Exception:
+                # Si falla parseo, asumimos que es un TP por defecto si el bot no lo maneja
+                await _handle_position_controls(
+                    None,
+                    lambda txt: reply_markdown_safe(message, txt),
+                    update.effective_message.text,
+                )
+                return
+
+        # Actualizar la protección a través del Position Service
+        service = getattr(trading, "POSITION_SERVICE", None)
+        updated = False
+        if service is not None:
+            update_tp = getattr(service, "update_take_profit", None)
+            if callable(update_tp):
+                try:
+                    update_tp(target)
+                    updated = True
+                except TypeError:
+                    try:
+                        update_tp(pos_info["symbol_conf"], target)
+                        updated = True
+                    except Exception:
+                        logger.debug("update_take_profit falló con firma alternativa", exc_info=True)
+                except Exception:
+                    logger.debug("update_take_profit falló", exc_info=True)
+        if not updated and getattr(app, "exchange", None) is not None:
+            try:
+                pos = await app.exchange.get_open_position(app.config.get("symbol"))
+            except Exception:
+                pos = None
+            if pos:
+                await app.exchange.update_protections(
+                    symbol=app.config.get("symbol"),
+                    side=pos.get("side"),
+                    qty=float(pos.get("contracts") or pos.get("positionAmt") or 0.0),
+                    tp=target,
+                )
+                updated = True
+        if updated:
+            await message.reply_text(f"✅ TP de la posición actualizado a {_num(target)}")
+        else:
+            await message.reply_text("No se pudo actualizar el TP de la posición.")
+        return
+
     if not args:
+        # Si hay posición, mostrar TP actual; si no, mostrar defaults
+        if pos_info:
+            service = getattr(trading, "POSITION_SERVICE", None)
+            tp_price = None
+            if service is not None:
+                get_levels = getattr(service, "get_protection_levels", None)
+                if callable(get_levels):
+                    levels = None
+                    try:
+                        levels = get_levels(pos_info["symbol_conf"])
+                    except TypeError:
+                        try:
+                            levels = get_levels()
+                        except Exception:
+                            logger.debug("get_protection_levels falló sin argumentos", exc_info=True)
+                            levels = None
+                    except Exception:
+                        logger.debug("get_protection_levels falló", exc_info=True)
+                    if isinstance(levels, dict):
+                        tp_price = levels.get("tp")
+                    else:
+                        tp_price = getattr(levels, "tp", None)
+            if tp_price not in (None, ""):
+                try:
+                    await message.reply_text(f"TP actual de la posición: {_num(tp_price)}")
+                except Exception:
+                    await message.reply_text(f"TP actual de la posición: {tp_price}")
+                return
+
+        # Mostrar defaults por leverage
         tp5 = _current_pct_for(5)
         tp10 = _current_pct_for(10)
         await message.reply_text(
-            "TP actual:\n"
+            "TP predeterminado:\n"
             f"• x5: {tp5 * 100:.3f}%\n"
             f"• x10: {tp10 * 100:.3f}%\n"
             f"(default {default_pct * 100:.3f}%)"
