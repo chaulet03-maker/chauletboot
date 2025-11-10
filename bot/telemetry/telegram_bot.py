@@ -2117,6 +2117,39 @@ async def cerrar_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if app is None or message is None:
         return
 
+    svc = getattr(trading, "POSITION_SERVICE", None)
+    svc_status: Optional[Dict[str, Any]] = None
+    closing_in_progress = False
+    if svc is None:
+        logger.warning("/cerrar llamado sin POSITION_SERVICE inicializado")
+    else:
+        get_status = getattr(svc, "get_status", None)
+        if callable(get_status):
+            try:
+                raw_status = get_status() or {}
+                if isinstance(raw_status, dict):
+                    svc_status = dict(raw_status)
+            except Exception as exc:
+                logger.warning(
+                    "No se pudo obtener el estado del PositionService antes de cerrar.",
+                    exc_info=exc,
+                )
+        checker = getattr(svc, "is_closing", None)
+        if callable(checker):
+            try:
+                closing_in_progress = bool(checker())
+            except Exception as exc:
+                logger.warning(
+                    "PositionService.is_closing() falló al validar /cerrar.",
+                    exc_info=exc,
+                )
+        elif isinstance(svc_status, dict):
+            closing_in_progress = bool(svc_status.get("closing"))
+
+    if closing_in_progress:
+        await message.reply_text("⚠️ Ya hay una orden de cierre en curso. Esperá la confirmación.")
+        return
+
     try:
         result = await app.close_all(reason="manual")
     except Exception as exc:
@@ -2687,7 +2720,12 @@ async def _cmd_modo_real(engine, reply):
         try:
             await ex.upgrade_to_real_if_needed()
         except Exception as e:
-            await reply(f"⚠️ No pude autenticar el exchange: {e}")
+            logger.warning("Fallo upgrade_to_real_if_needed() al activar modo real", exc_info=e)
+            try:
+                engine.set_mode("paper", source="telegram/real_fail_revert")
+            except Exception:
+                logger.exception("No pude revertir a modo paper tras fallo de auth")
+            await reply("⚠️ No pude autenticar el exchange. Revertí a *SIMULADO*.")
             return False
 
     # Verificaciones
