@@ -11,6 +11,13 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+logging.Formatter.default_msec_format = "%s,%03d"
+
 # Asegurar import relativo al proyecto
 ROOT = os.path.dirname(os.path.abspath(__file__))
 if ROOT not in sys.path:

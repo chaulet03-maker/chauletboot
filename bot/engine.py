@@ -329,7 +329,7 @@ class TradingApp:
         self._live_sync_next_ts = 0.0
         self._live_open_cached = None  # None/True/False
         self._live_flat_logged_state: Optional[bool] = None
-        self._loop_sem = asyncio.Semaphore(1)
+        self._loop_sem = getattr(self, "_loop_sem", asyncio.Semaphore(1))
         cache_ttl_raw = None
         if isinstance(cfg, dict):
             cache_ttl_raw = cfg.get("state_cache_ttl_seconds") or cfg.get("status_cache_ttl_seconds")
@@ -697,7 +697,6 @@ class TradingApp:
     async def trading_loop(self, context: ContextTypes.DEFAULT_TYPE | None = None):
         """Bucle principal de trading ejecutado por la JobQueue de Telegram."""
         if self._loop_sem.locked():
-            self.logger.warning("trading_loop saltado: ya hay una vuelta en curso")
             return
         async with self._loop_sem:
             t0 = time.perf_counter()
@@ -708,7 +707,8 @@ class TradingApp:
             except Exception:
                 self.logger.exception("trading_loop error inesperado")
             finally:
-                self.logger.info("<< trading_loop end (%.2fs)", time.perf_counter() - t0)
+                dt = time.perf_counter() - t0
+                self.logger.info("<< trading_loop end (%.2fs)", dt)
 
     async def _trading_loop_body(self):
         """Bucle principal de trading ejecutado por la JobQueue de Telegram."""
@@ -729,7 +729,7 @@ class TradingApp:
                 await self.notifier.send("✅ **Conexión Reestablecida.**")
             self.connection_lost = False
 
-            logging.info("Iniciando ciclo de análisis de mercado...")
+            logging.debug("Iniciando ciclo de análisis de mercado...")
             # --- HARD-FLAT: si en REAL la cuenta está plana, limpiamos estado local y seguimos analizando ---
             if runtime_get_mode() == "real":
                 # Throttle: sincronizar como máximo cada self._live_sync_interval segundos
