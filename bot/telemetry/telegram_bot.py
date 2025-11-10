@@ -228,6 +228,10 @@ async def collect_status_snapshot(app) -> Dict[str, Any]:
     try:
         equity_val = await _resolve_equity_usdt(exchange)
         snapshot["equity"] = float(equity_val)
+
+        if snapshot["equity"] <= 0.0 and snapshot.get("mode_display") == "PAPER":
+            snapshot["equity"] = 1000.0
+            set_equity_sim(1000.0)
     except Exception:
         snapshot["equity"] = None
     if snapshot.get("equity") is not None:
@@ -362,7 +366,7 @@ def render_status(snapshot: Dict[str, Any]) -> str:
         f"• Símbolo: {base.get('symbol') or '—'}",
         f"• CCXT: {ccxt_txt}",
         f"• Precio: {base.get('price') or '—'}",
-        f"• Equity: {base.get('equity_usdt') or '—'}",
+        f"• Saldo USDT: {base.get('equity_usdt') or '—'}",
         f"• Funding: {base.get('funding_text') or '—'}",
         f"• Posición: {base.get('position_text') or '—'}",
     ]
@@ -2870,7 +2874,7 @@ async def equity_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             base_equity = get_equity_sim()
         await message.reply_text(
-            "Equity base actual: {:.2f}\nEquity % actual: {:.2f}% (frac={:.4f})".format(
+            "Saldo base actual: {:.2f} USDT\nEquity % (Riesgo): {:.2f}% (frac={:.4f})".format(
                 float(base_equity or 0.0), pct, fraction
             )
         )
@@ -2913,7 +2917,7 @@ async def equity_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 pass
 
         await message.reply_text(
-            f"✅ Porcentaje de equity seteado: {value:.2f}% (frac={frac})"
+            f"✅ Equity % (Riesgo) seteado: {value:.2f}% (frac={frac})"
         )
         return
 
@@ -2926,7 +2930,7 @@ async def equity_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         logger.debug("No se pudo actualizar trader.set_paper_equity", exc_info=True)
 
-    await message.reply_text(f"✅ Equity base seteado: {value:.2f} USDT")
+    await message.reply_text(f"✅ Saldo base de SIMULACIÓN seteado: {value:.2f} USDT")
 
 
 async def diag_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
