@@ -36,6 +36,8 @@ _METRICS = get_metrics()
 
 _ENTRY_MUTEX = Lock()
 
+_LAST_REAL_SYNC: tuple[float, float] | None = None
+
 
 def _normalize_symbol(symbol: str | None) -> str:
     if not symbol:
@@ -406,6 +408,8 @@ def bootstrap_real_state(
     if active_store is None and POSITION_SERVICE is not None:
         active_store = getattr(POSITION_SERVICE, "store", None)
 
+    global _LAST_REAL_SYNC
+
     if live:
         side_live = str(live.get("side") or "LONG").upper()
         qty_live = float(live.get("qty") or 0.0)
@@ -443,11 +447,15 @@ def bootstrap_real_state(
                 level="debug",
             )
 
-        logger.info(
-            "Sincronizado estado REAL con exchange: qty=%.6f, avg=%.2f",
-            abs(float(signed_qty)),
-            avg_price,
-        )
+        current_sync = (abs(float(signed_qty)), avg_price)
+        if _LAST_REAL_SYNC != current_sync:
+            logger.info(
+                "Sincronizado estado REAL con exchange: qty=%.6f, avg=%.2f",
+                *current_sync,
+            )
+            _LAST_REAL_SYNC = current_sync
+        else:
+            logger.debug("Sincronizado estado REAL con exchange: sin cambios")
     else:
         if active_store is not None:
             try:
@@ -459,6 +467,7 @@ def bootstrap_real_state(
                     exc=exc,
                     level="debug",
                 )
+        _LAST_REAL_SYNC = None
         logger.debug("Sincronizado estado REAL con exchange: sin posición abierta.")
 
 

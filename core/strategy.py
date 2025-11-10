@@ -420,7 +420,7 @@ class Strategy:
         """
         log = logging.getLogger(__name__)
         if len(data) == 0:
-            log.info("SIGNAL DEBUG: sin datos."); return
+            log.debug("SIGNAL DEBUG: sin datos."); return
         row = data.iloc[-1]
         ts = data.index[-1]
 
@@ -432,7 +432,7 @@ class Strategy:
             atr = float(row.get("atr", float("nan")))
             adx = float(row.get("adx", float("nan")))
         except Exception as exc:
-            _warn("STRATEGY", "SIGNAL DEBUG: fila inválida.", exc=exc, level="info")
+            _warn("STRATEGY", "SIGNAL DEBUG: fila inválida.", exc=exc, level="debug")
             return
 
         # Lado preferido por tendencia
@@ -548,7 +548,7 @@ class Strategy:
             ok = (price > anchor_used) and ((price - anchor_used) >= step_used) and ((price - anchor_used) <= span_used)
             if not ok: reasons.append("grid SHORT: fuera de rango [step,span]")
 
-        log.info(
+        log.debug(
             "SIGNAL DEBUG ts=%s side_pref=%s price=%.2f anchor_raw=%.2f anchor=%.2f step=%.2f span=%.2f "
             "atr=%.2f atrp=%.2f rsi4h=%.2f adx=%.2f ema200_4h=%.2f ema200_1h=%.2f "
             "grid_SHORT=[%.2f,%.2f] in_short=%s grid_LONG=[%.2f,%.2f] in_long=%s "
