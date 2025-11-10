@@ -6,7 +6,7 @@ import threading
 import inspect
 import time
 from collections import deque
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional, cast
 from time import monotonic, time as _now
 
@@ -243,6 +243,7 @@ class TradingApp:
         self._bars_in_position = 0
         self.manual_block_until = 0
         self._internal_scheduler: Optional[AsyncIOScheduler] = None
+        self.last_events: deque[dict[str, Any]] = deque(maxlen=100)
         try:
             self.sl_equity_pct = float(
                 self.config.get(
@@ -559,9 +560,10 @@ class TradingApp:
                 price_out = 0.0
 
             codes = compute_codes(ctx)
+            ts_now = _now()
             MOTIVES.add(
                 MotiveItem(
-                    ts=_now(),
+                    ts=ts_now,
                     symbol=self.config.get("symbol", "BTC/USDT"),
                     side_pref=str(getattr(self, "side_pref", None)) if getattr(self, "side_pref", None) is not None else None,
                     price=price_out,
@@ -569,6 +571,16 @@ class TradingApp:
                     ctx=ctx,
                 )
             )
+            try:
+                event_ctx: Dict[str, Any] = dict(ctx)
+                event_ctx.setdefault("symbol", self.config.get("symbol", "BTC/USDT"))
+                if getattr(self, "side_pref", None) is not None:
+                    event_ctx.setdefault("side_pref", str(self.side_pref))
+                event_ctx.setdefault("price", price_out)
+                event_ctx["ts"] = datetime.fromtimestamp(ts_now, tz=timezone.utc)
+                self.last_events.append(event_ctx)
+            except Exception:
+                self.logger.debug("No se pudo registrar contexto en last_events", exc_info=True)
             self.logger.debug("MOTIVES/REC %s", codes)
             return codes
         except Exception as e:

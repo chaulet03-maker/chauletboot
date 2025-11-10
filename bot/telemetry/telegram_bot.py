@@ -48,6 +48,7 @@ from position_service import (
     fetch_live_equity_usdm,
     split_total_vs_bot,
 )
+from core.reasons import render_logs_summary, render_reasons_simple
 
 logger = logging.getLogger("telegram")
 
@@ -138,11 +139,15 @@ def _safe_float(value: Any) -> float:
 
 DEFAULT_STATUS_SNAPSHOT: Dict[str, Any] = {
     "mode_display": "…",
+    "mode_human": "…",
     "symbol": "…",
     "ccxt_auth": None,
-    "price": None,
+    "price": "—",
+    "price_value": None,
     "equity": None,
+    "equity_usdt": "—",
     "funding_rate": None,
+    "funding_text": "—",
     "position": {
         "has_position": False,
         "symbol": None,
@@ -154,10 +159,9 @@ DEFAULT_STATUS_SNAPSHOT: Dict[str, Any] = {
         "roe": None,
         "leverage": None,
     },
+    "position_text": "No hay posiciones abiertas.",
     "collected_at": None,
     "mark_price": None,
-    "split": None,
-    "split_summary": None,
 }
 
 
@@ -182,6 +186,7 @@ async def collect_status_snapshot(app) -> Dict[str, Any]:
             )
     except Exception:
         snapshot["mode_display"] = None
+    snapshot["mode_human"] = snapshot.get("mode_display") or "—"
 
     exchange = getattr(app, "exchange", None)
     market = getattr(app, "market", None)
@@ -211,15 +216,20 @@ async def collect_status_snapshot(app) -> Dict[str, Any]:
         logger.debug("No se pudo obtener precio para snapshot.", exc_info=True)
         price_val = None
     try:
-        snapshot["price"] = float(price_val) if price_val is not None else None
+        snapshot["price_value"] = float(price_val) if price_val is not None else None
     except Exception:
-        snapshot["price"] = None
+        snapshot["price_value"] = None
+    snapshot["price"] = _fmt_usd(snapshot.get("price_value"), dp=1) if snapshot.get("price_value") is not None else "—"
 
     try:
         equity_val = await _resolve_equity_usdt(exchange)
         snapshot["equity"] = float(equity_val)
     except Exception:
         snapshot["equity"] = None
+    if snapshot.get("equity") is not None:
+        snapshot["equity_usdt"] = f"{_fmt_usd(snapshot['equity'], dp=2)} USDT"
+    else:
+        snapshot["equity_usdt"] = "—"
 
     funding_rate = None
     try:
@@ -240,6 +250,9 @@ async def collect_status_snapshot(app) -> Dict[str, Any]:
         snapshot["funding_rate"] = float(funding_rate)
     except Exception:
         snapshot["funding_rate"] = None
+    snapshot["funding_text"] = (
+        _fmt_pct_8h(snapshot.get("funding_rate")) if snapshot.get("funding_rate") not in (None, "") else "—"
+    )
 
     split: Dict[str, Any] | None = None
     mark_price: float | None = None
@@ -250,7 +263,6 @@ async def collect_status_snapshot(app) -> Dict[str, Any]:
         logger.debug("No se pudo calcular el split de posición para snapshot.", exc_info=True)
         split = None
         mark_price = None
-    snapshot["split"] = split
     if effective_symbol:
         snapshot["symbol"] = effective_symbol
     try:
@@ -271,11 +283,8 @@ async def collect_status_snapshot(app) -> Dict[str, Any]:
             alt_mark = bot_part.get("mark") or bot_part.get("markPrice")
             if alt_mark not in (None, ""):
                 mark_candidate = _safe_float(alt_mark)
-    if not mark_candidate and snapshot.get("price") is not None:
-        try:
-            mark_candidate = float(snapshot["price"])
-        except Exception:
-            mark_candidate = None
+    if not mark_candidate and snapshot.get("price_value") is not None:
+        mark_candidate = snapshot.get("price_value")
 
     pnl_val = _safe_float(total.get("pnl"))
     leverage_val = total.get("leverage")
@@ -308,33 +317,32 @@ async def collect_status_snapshot(app) -> Dict[str, Any]:
     if position_data["has_position"] and not snapshot["mark_price"] and position_data.get("mark_price") is not None:
         snapshot["mark_price"] = position_data["mark_price"]
 
-    try:
-        summary_txt = _format_split_summary(split or {}, snapshot.get("mark_price") or 0.0)
-    except Exception:
-        summary_txt = ""
-    snapshot["split_summary"] = summary_txt or None
+    if position_data["has_position"]:
+        qty_display = f"{position_data.get('qty', 0.0):.6f}"
+        entry_txt = _fmt_usd(position_data.get("entry_price"))
+        mark_txt = _fmt_usd(position_data.get("mark_price"))
+        pnl_val = position_data.get("pnl")
+        pnl_txt = _fmt_usd(pnl_val)
+        snapshot["position_text"] = (
+            f"{position_data.get('symbol') or snapshot.get('symbol')} "
+            f"{str(position_data.get('side') or 'FLAT').upper()} — Qty {qty_display} | "
+            f"Entrada: {entry_txt} | Mark: {mark_txt} | PnL: {pnl_txt}"
+        )
+    else:
+        snapshot["position_text"] = "No hay posiciones abiertas."
 
     return snapshot
 
 
 def render_status(snapshot: Dict[str, Any]) -> str:
-    """Render a snapshot dict into the HTML payload for Telegram."""
-
     base = deepcopy(DEFAULT_STATUS_SNAPSHOT)
     if isinstance(snapshot, dict):
-        base.update({k: v for k, v in snapshot.items() if k != "position"})
+        merged = {k: v for k, v in snapshot.items() if k != "position"}
+        base.update(merged)
         if isinstance(snapshot.get("position"), dict):
-            pos = deepcopy(DEFAULT_STATUS_SNAPSHOT["position"])
-            pos.update(snapshot["position"])
-            base["position"] = pos
-
-    lines = ["<b>🩺 Estado</b>"]
-
-    mode_txt = base.get("mode_display") or base.get("mode") or "—"
-    lines.append(f"• Modo: <b>{html_escape(str(mode_txt))}</b>")
-
-    symbol_txt = base.get("symbol") or "—"
-    lines.append(f"• Símbolo: {html_escape(str(symbol_txt))}")
+            base_position = deepcopy(DEFAULT_STATUS_SNAPSHOT["position"])
+            base_position.update(snapshot["position"])
+            base["position"] = base_position
 
     ccxt_auth = base.get("ccxt_auth")
     if ccxt_auth is True:
@@ -343,64 +351,17 @@ def render_status(snapshot: Dict[str, Any]) -> str:
         ccxt_txt = "NO AUTENTICADO"
     else:
         ccxt_txt = "—"
-    lines.append(f"• CCXT: {ccxt_txt}")
 
-    price_val = base.get("price")
-    price_text = _fmt_usd(price_val, dp=1) if price_val not in (None, "") else "—"
-    lines.append(f"• Precio: {price_text}")
-
-    equity_val = base.get("equity")
-    equity_text = f"{_fmt_usd(equity_val, dp=2)} USDT" if equity_val not in (None, "") else "—"
-    lines.append(f"• Equity: {equity_text}")
-
-    funding_rate = base.get("funding_rate")
-    funding_text = _fmt_pct_8h(funding_rate) if funding_rate not in (None, "") else "—"
-    lines.append(f"• Funding: {funding_text}")
-
-    position = base.get("position") or {}
-    qty_val = _safe_float(position.get("qty"))
-    has_position = bool(position.get("has_position")) or qty_val > EPS_QTY
-
-    if has_position:
-        side_txt = str(position.get("side") or "FLAT").upper()
-        pos_symbol = position.get("symbol") or symbol_txt
-        lines.append(f"• Posición: <b>{html_escape(str(pos_symbol))} {side_txt}</b>")
-        qty_display = f"{qty_val:.6f}" if qty_val > 0 else "0.000000"
-        entry_txt = _fmt_usd(position.get("entry_price"))
-        mark_txt = _fmt_usd(position.get("mark_price"))
-        lines.append(f"  Qty: {qty_display} | Entrada: {entry_txt} | Mark: {mark_txt}")
-        leverage = position.get("leverage")
-        if leverage not in (None, ""):
-            lines.append(f"  Lev: x{leverage}")
-        pnl_val = _safe_float(position.get("pnl"))
-        pnl_prefix = "+" if pnl_val >= 0 else ""
-        pnl_txt = f"{pnl_prefix}{_fmt_usd(pnl_val)}"
-        roe_val = position.get("roe")
-        roe_txt = ""
-        try:
-            if roe_val not in (None, ""):
-                roe_txt = f" | ROE: {float(roe_val):.2f}%"
-        except Exception:
-            roe_txt = ""
-        lines.append(f"  PnL: {pnl_txt}{roe_txt}")
-    else:
-        lines.append("• Posición: <i>No hay posiciones abiertas.</i>")
-
-    split_summary = base.get("split_summary")
-    if split_summary:
-        lines.append("")
-        lines.append(split_summary)
-
-    ts = base.get("collected_at")
-    if ts:
-        try:
-            age = max(0.0, time.time() - float(ts))
-        except Exception:
-            age = None
-        if age is not None:
-            lines.append("")
-            lines.append(f"⏱️ Actualizado hace {_fmt_age_seconds(age)}")
-
+    lines = [
+        "🩺 Estado",
+        f"• Modo: {base.get('mode_human') or '—'}",
+        f"• Símbolo: {base.get('symbol') or '—'}",
+        f"• CCXT: {ccxt_txt}",
+        f"• Precio: {base.get('price') or '—'}",
+        f"• Equity: {base.get('equity_usdt') or '—'}",
+        f"• Funding: {base.get('funding_text') or '—'}",
+        f"• Posición: {base.get('position_text') or '—'}",
+    ]
     return "\n".join(lines)
 
 
@@ -607,72 +568,6 @@ async def _compute_position_split(app) -> tuple[Dict[str, Dict[str, Any]], float
     split = split_total_vs_bot(acct_pos, bot_pos, mark_val)
     return split, mark_val, symbol_cfg
 
-
-def _format_split_summary(split: Dict[str, Dict[str, Any]], mark: float) -> str:
-    def _fmt_qty(value: Any) -> str:
-        try:
-            return f"{float(value):.6f}"
-        except Exception:
-            return "0.000000"
-
-    def _fmt_price(value: Any) -> str:
-        try:
-            price = float(value)
-        except Exception:
-            return "—"
-        if price <= 0:
-            return "—"
-        return f"{price:.2f}"
-
-    def _fmt_pnl(value: Any) -> str:
-        try:
-            pnl_val = float(value)
-        except Exception:
-            pnl_val = 0.0
-        return f"{pnl_val:+.2f}"
-
-    mark_txt = _fmt_price(mark)
-
-    bot_data = split.get("bot") or {}
-    bot_qty = _safe_float(bot_data.get("qty"))
-    bot_side = str(bot_data.get("side") or "FLAT").upper()
-    bot_section = (
-        "\n".join(
-            [
-                "📌 <b>Posición del BOT</b>",
-                f"• {bot_side} {_fmt_qty(bot_data.get('qty'))}",
-                f"• Entrada: {_fmt_price(bot_data.get('entry_price'))} | Mark: {mark_txt}",
-                f"• PnL BOT: {_fmt_pnl(bot_data.get('pnl'))}",
-            ]
-        )
-        if bot_qty > EPS_QTY
-        else ""
-    )
-
-    manual_data = split.get("manual") or {}
-    manual_side = str(manual_data.get("side") or "FLAT").upper()
-    manual_section = "\n".join(
-        [
-            "🧑‍💼 <b>Manual/Otras</b>",
-            f"• {manual_side} {_fmt_qty(manual_data.get('qty'))}",
-            f"• PnL Manual: {_fmt_pnl(manual_data.get('pnl'))}",
-        ]
-    )
-
-    total_data = split.get("total") or {}
-    total_side = str(total_data.get("side") or "FLAT").upper()
-    total_section = "\n".join(
-        [
-            "🧮 <b>TOTAL (BOT + Manual)</b>",
-            f"• {total_side} {_fmt_qty(total_data.get('qty'))}",
-            f"• PnL TOTAL: {_fmt_pnl(total_data.get('pnl'))}",
-        ]
-    )
-
-    sections = [section for section in (bot_section, manual_section, total_section) if section]
-    return "\n\n".join(sections)
-
-
 async def open_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.effective_message
     if message is None:
@@ -730,7 +625,7 @@ async def estado_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         pass
 
-    sent_message = await message.reply_html(display_text)
+    sent_message = await message.reply_text(display_text)
 
     if not should_refresh:
         return
@@ -741,7 +636,7 @@ async def estado_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if cache is not None:
                 cache.put(fresh)
             new_text = render_status(fresh)
-            await sent_message.edit_text(new_text, parse_mode="HTML")
+            await sent_message.edit_text(new_text)
         except BadRequest as exc:
             if "message is not modified" in str(exc).lower():
                 return
@@ -1830,6 +1725,16 @@ async def _cmd_config(engine, reply):
 
 
 def _read_logs_text(engine, limit: int = 15) -> str:
+    events: List[Dict[str, Any]] = []
+    if engine is not None:
+        buffer = getattr(engine, "last_events", None)
+        if isinstance(buffer, deque):
+            events = list(buffer)
+        elif isinstance(buffer, (list, tuple)):
+            events = list(buffer)
+    if events:
+        return render_logs_summary(events)
+
     try:
         n = max(int(limit or 15), 1)
     except (TypeError, ValueError):
@@ -2910,15 +2815,23 @@ async def motivos_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if hasattr(S, "output_timezone")
         else "America/Argentina/Buenos_Aires"
     )
-    lines = ["🕒 Motivos recientes (últimas 10 oportunidades NO abiertas):"]
+    ctx_list: List[Dict[str, Any]] = []
     for it in items:
-        lines.append(it.human_line(tz=tz))
+        ctx_map: Dict[str, Any] = dict(it.ctx or {})
+        ctx_map.setdefault("symbol", it.symbol)
+        ctx_map.setdefault("side_pref", it.side_pref)
+        ctx_map.setdefault("price", it.price)
+        ctx_map["ts"] = datetime.fromtimestamp(it.ts, tz=timezone.utc)
+        ctx_list.append(ctx_map)
+
+    summary = render_reasons_simple(ctx_list, tz_name=tz)
+    first_line = summary.splitlines()[1] if summary.count("\n") else summary
     logger.debug(
         "TELEGRAM /motivos → %d items | 1ra: %s",
         len(items),
-        lines[1] if len(lines) > 1 else "-",
+        first_line,
     )
-    await _reply_chunks(update, "\n".join(lines))
+    await _reply_chunks(update, summary)
 
 
 def _populate_registry() -> None:
