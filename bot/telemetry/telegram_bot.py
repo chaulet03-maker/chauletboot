@@ -1694,9 +1694,9 @@ async def _cmd_config(engine, reply):
     leverage_strong = get_val(S, cfg, "leverage_strong")
     adx_strong_threshold = get_val(S, cfg, "adx_strong_threshold")
 
-    pct_min = get_val(S, cfg, "order_pct_min")
-    pct_def = get_val(S, cfg, "order_pct_default")
-    pct_max = get_val(S, cfg, "order_pct_max")
+    pct_min = get_val(S, cfg, "order_sizing.order_pct_min")
+    pct_def = get_val(S, cfg, "order_sizing.default_pct")
+    pct_max = get_val(S, cfg, "order_sizing.order_pct_max")
 
     slippage_bps = get_val(S, cfg, "slippage_bps")
     leverage_set_last = getattr(engine, "last_leverage", None) if engine else None
@@ -2299,7 +2299,15 @@ async def sl_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # 🚨 CRÍTICO: Usar el servicio de posición del bot para obtener la posición y el SL/TP
     pos_info = _bot_position_info(app)
     if not pos_info:
-        # Si no hay posición del bot, delegamos a la lógica de defaults
+        # SI NO HAY POSICIÓN: Mostramos el default.
+        symbol_conf = _default_symbol(app)
+        defaults = get_protection_defaults(symbol_conf)
+        pct = float(defaults.get("sl_pct_equity") or DEFAULT_SL_PRICE_PCT)
+        await message.reply_text(
+            f"SL predeterminado: {pct:+.2f}% del precio de entrada."
+        )
+
+        # Ejecutamos el router de defaults por si el usuario pasó un argumento
         await _handle_position_controls(
             None,
             lambda txt: reply_markdown_safe(message, txt),
