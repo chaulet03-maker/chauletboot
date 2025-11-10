@@ -10,11 +10,15 @@ from typing import Any, Dict
 
 _DEFAULT_SNAPSHOT: Dict[str, Any] = {
     "mode_display": "…",
+    "mode_human": "…",
     "symbol": "…",
     "ccxt_auth": None,
-    "price": None,
+    "price": "—",
+    "price_value": None,
     "equity": None,
+    "equity_usdt": "—",
     "funding_rate": None,
+    "funding_text": "—",
     "position": {
         "has_position": False,
         "symbol": None,
@@ -26,6 +30,7 @@ _DEFAULT_SNAPSHOT: Dict[str, Any] = {
         "roe": None,
         "leverage": None,
     },
+    "position_text": "No hay posiciones abiertas.",
     "collected_at": None,
 }
 
