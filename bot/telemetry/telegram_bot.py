@@ -2,6 +2,7 @@ import os
 import math
 import logging
 import asyncio
+from asyncio import to_thread
 import sqlite3
 import time
 import re
@@ -582,7 +583,15 @@ async def open_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def rendimiento_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    return await equity_command(update, context)
+    engine = _get_engine_from_context(context)
+    message = update.effective_message
+    if message is None:
+        return
+    if engine is None:
+        await message.reply_text("No pude acceder al engine para generar el rendimiento.")
+        return
+    text = await _build_rendimiento_text(engine)
+    await message.reply_text(text)
 
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1462,6 +1471,10 @@ def _engine_config(engine) -> Dict:
     return {}
 
 
+async def _write_config_async(cfg_dict):
+    await to_thread(_write_cfg_yaml, cfg_dict)
+
+
 def _engine_sqlite_path(engine) -> str:
     cfg = _engine_config(engine)
     storage = cfg.get("storage", {}) if isinstance(cfg, dict) else {}
@@ -1584,29 +1597,36 @@ async def ayuda_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await message.reply_text(text, parse_mode="Markdown")
 
 
-def _build_rendimiento_text(engine) -> str:
+async def _build_rendimiento_text(engine) -> str:
     path = _engine_sqlite_path(engine)
-    if not os.path.exists(path):
+    if not await to_thread(os.path.exists, path):
         return f"No encontré la base de trades ({path}). Todavía no hay operaciones registradas."
+
+    def _fetch_trade_stats(db_path: str):
+        conn = sqlite3.connect(db_path)
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                """
+                SELECT COUNT(*),
+                        SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END),
+                        SUM(CASE WHEN pnl < 0 THEN 1 ELSE 0 END),
+                        COALESCE(SUM(pnl), 0),
+                        COALESCE(SUM(fee), 0)
+                FROM trades
+                WHERE ABS(pnl) > 1e-9
+                """
+            )
+            row = cur.fetchone() or (0, 0, 0, 0.0, 0.0)
+            cur.execute("SELECT MAX(pnl), MIN(pnl) FROM trades WHERE ABS(pnl) > 1e-9")
+            best, worst = cur.fetchone() or (None, None)
+            return row, best, worst
+        finally:
+            conn.close()
+
     try:
-        conn = sqlite3.connect(path)
-        cur = conn.cursor()
-        cur.execute(
-            """
-            SELECT COUNT(*),
-                    SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END),
-                    SUM(CASE WHEN pnl < 0 THEN 1 ELSE 0 END),
-                    COALESCE(SUM(pnl), 0),
-                    COALESCE(SUM(fee), 0)
-            FROM trades
-            WHERE ABS(pnl) > 1e-9
-            """
-        )
-        row = cur.fetchone() or (0, 0, 0, 0.0, 0.0)
+        row, best, worst = await to_thread(_fetch_trade_stats, path)
         total, wins, losses, pnl_total, fees_total = row
-        cur.execute("SELECT MAX(pnl), MIN(pnl) FROM trades WHERE ABS(pnl) > 1e-9")
-        best, worst = cur.fetchone() or (None, None)
-        conn.close()
     except Exception as exc:
         return f"No pude leer la base de datos de trades ({path}): {exc}"
 
@@ -1735,7 +1755,7 @@ async def _cmd_config(engine, reply):
     return await reply("\n".join(text), parse_mode="Markdown")
 
 
-def _read_logs_text(engine, limit: int = 30) -> str:
+async def _read_logs_text(engine, limit: int = 30) -> str:
     try:
         n = max(int(limit or 30), 1)
     except (TypeError, ValueError):
@@ -1759,8 +1779,8 @@ def _read_logs_text(engine, limit: int = 30) -> str:
         path = _engine_logs_path(engine)
         try:
             file_lines: List[str] = []
-            if os.path.exists(path):
-                file_lines = _tail_log_file(path, max(n * 4, n))
+            if await to_thread(os.path.exists, path):
+                file_lines = await to_thread(_tail_log_file, path, max(n * 4, n))
         except Exception as exc:
             return f"Error al leer logs: {exc}"
         tail = _select_tail(file_lines)
@@ -2650,6 +2670,11 @@ async def ajustar_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     value = _parse_adjust_value(raw_value)
     path = _find_and_set_config(engine, param, value)
     if path:
+        cfg = _engine_config(engine)
+        try:
+            await _write_config_async(cfg)
+        except Exception as exc:
+            logger.warning("No pude guardar la configuración ajustada: %s", exc)
         await _reply_chunks(update, f"✅ Actualicé {'/'.join(path)} = {value}")
     else:
         await _reply_chunks(update, f"No encontré el parámetro '{param}' en la configuración.")
@@ -2658,7 +2683,7 @@ async def ajustar_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def logs_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     engine = _get_engine_from_context(context)
     limit = _extract_logs_limit(update, context, default=30)
-    text = _read_logs_text(engine, limit)
+    text = await _read_logs_text(engine, limit)
     chat = update.effective_chat
     bot = getattr(context, "bot", None)
     if bot is not None and chat is not None:
@@ -3123,16 +3148,6 @@ async def _status_plaintext_handler(
 
 def register_commands(application: Application) -> None:
     _populate_registry()
-    if not getattr(application, "_chaulet_bot_handlers_registered", False):
-        application.add_handler(CommandHandler("start", start_command))
-        application.add_handler(CommandHandler(["ayuda", "help"], ayuda_command))
-        application.add_handler(CommandHandler(["estado", "status", "diagnostico"], estado_command))
-        application.add_handler(CommandHandler(["posicion", "position"], posicion_command))
-        application.add_handler(CommandHandler(["posiciones", "positions"], posiciones_command))
-        application.add_handler(CommandHandler(["cerrar", "close"], cerrar_command))
-        application.add_handler(CommandHandler(["sl", "stoploss"], sl_command))
-        application.add_handler(CommandHandler(["tp", "takeprofit"], tp_command))
-        setattr(application, "_chaulet_bot_handlers_registered", True)
     if getattr(application, "_chaulet_router_registered", False):
         return
 
@@ -3467,7 +3482,7 @@ async def _report_periodic(notifier: TelegramNotifier, days: int):
         equity_ini = equity_fin = pnl = 0.0
         total_trades = wins = losses = 0
         try:
-            df_eq = pd.read_csv(eq_csv, parse_dates=["ts"])
+            df_eq = await to_thread(pd.read_csv, eq_csv, parse_dates=["ts"])
             df_eq["ts"] = pd.to_datetime(df_eq["ts"], utc=True)
             now = pd.Timestamp.now(tz=_tz())
             since = now - pd.Timedelta(days=days)
@@ -3480,7 +3495,7 @@ async def _report_periodic(notifier: TelegramNotifier, days: int):
         except Exception:
             pass
         try:
-            df_tr = pd.read_csv(tr_csv, parse_dates=["ts"])
+            df_tr = await to_thread(pd.read_csv, tr_csv, parse_dates=["ts"])
             df_tr["ts"] = pd.to_datetime(df_tr["ts"], utc=True)
             now = pd.Timestamp.now(tz=_tz())
             since = now - pd.Timedelta(days=days)
