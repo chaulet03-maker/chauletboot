@@ -190,7 +190,7 @@ class PriceStream:
             websockets.connect(
                 url,
                 ping_interval=20,
-                ping_timeout=20,
+                ping_timeout=30,
                 close_timeout=10,
                 max_queue=None,
                 max_size=2**20,
