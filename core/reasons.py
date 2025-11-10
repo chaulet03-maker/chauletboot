@@ -39,29 +39,39 @@ def simplify_reason(ctx: Mapping[str, Any]) -> str:
     long_allowed = ctx.get("long_allowed", True)
     short_allowed = ctx.get("short_allowed", True)
 
-    if not long_allowed and price is not None and ema1h is not None and price < ema1h:
-        return f"{trend} ▶ Evito LONG (precio debajo de EMA200)."
-    if not short_allowed and price is not None and ema1h is not None and price > ema1h:
-        return f"{trend} ▶ Evito SHORT (precio sobre EMA200)."
+    if (
+        not long_allowed
+        and price is not None
+        and ema1h is not None
+        and price < ema1h
+    ):
+        return f"{trend} • Precio debajo de EMA200 → no LONG."
+    if (
+        not short_allowed
+        and price is not None
+        and ema1h is not None
+        and price > ema1h
+    ):
+        return f"{trend} • Precio arriba de EMA200 → no SHORT."
 
     in_long = bool(ctx.get("in_long"))
     in_short = bool(ctx.get("in_short"))
     if not in_long and not in_short:
-        return f"{trend} ▶ Sin gatillo en el rango (grid no tocado)."
+        return f"{trend} • Precio fuera del rango de entrada (no tocó bandas)."
 
     if adx is not None and adx < 18:
-        return "Mercado sin fuerza ▶ Espero (ADX bajo)."
+        return "Mercado sin fuerza (ADX bajo) • Espero."
     if rsi4h is not None and rsi4h > 70:
-        return "Sobrecompra ▶ Evito LONG."
+        return "Sobrecompra • Evito LONG."
     if rsi4h is not None and rsi4h < 30:
-        return "Sobreventa ▶ Evito SHORT."
+        return "Sobreventa • Evito SHORT."
 
     if ctx.get("min_notional_ok") is False:
-        return "Monto mínimo del exchange no alcanza."
+        return "Monto mínimo de Binance insuficiente."
     if ctx.get("step_ok") is False:
-        return "Paso de cantidad/precio no válido."
+        return "Paso/lote mínimo inválido para el par."
 
-    return f"{trend} ▶ Sin señal utilizable."
+    return f"{trend} • Sin señal clara."
 
 
 def _ensure_datetime(value: Any) -> datetime:

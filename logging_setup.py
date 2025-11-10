@@ -12,6 +12,27 @@ LOG_FILE = os.path.join(LOG_DIR, "bot.log")
 os.makedirs(LOG_DIR, exist_ok=True)
 
 
+class RingBufferHandler(logging.Handler):
+    """Simple ring-buffer handler to keep recent log records in memory."""
+
+    def __init__(self, capacity: int = 500) -> None:
+        super().__init__()
+        self.buffer: deque[str] = deque(maxlen=capacity)
+        fmt = logging.Formatter(
+            "%(asctime)s - %(levelname)s - %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        )
+        fmt.default_msec_format = "%s,%03d"
+        self.setFormatter(fmt)
+
+    def emit(self, record: logging.LogRecord) -> None:  # pragma: no cover - IO free
+        try:
+            line = self.format(record)
+        except Exception:
+            line = record.getMessage()
+        self.buffer.append(line)
+
+
 class RedactTokenFilter(logging.Filter):
     _pat = re.compile(
         r"(api\.telegram\.org/bot)[A-Za-z0-9:_-]+|bot\d+:[A-Za-z0-9_-]{20,}"
@@ -60,9 +81,18 @@ class RateLimitFilter(logging.Filter):
         return False
 
 
+LOG_RING: RingBufferHandler | None = None
+
+
 def setup_logging() -> logging.Logger:
+    global LOG_RING
     logger = logging.getLogger()
     if logger.handlers:
+        if LOG_RING is None:
+            for handler in logger.handlers:
+                if isinstance(handler, RingBufferHandler):
+                    LOG_RING = handler
+                    break
         return logger
 
     logger.setLevel(logging.INFO)
@@ -87,20 +117,14 @@ def setup_logging() -> logging.Logger:
     logger.addHandler(stream_handler)
     logger.addHandler(file_handler)
 
+    ring_handler = RingBufferHandler(capacity=800)
+    ring_handler.addFilter(RedactTokenFilter())
+    logger.addHandler(ring_handler)
+    logger._memh = ring_handler  # type: ignore[attr-defined]
+    LOG_RING = ring_handler
+
     logger.addFilter(RateLimitFilter())
 
-    class DequeHandler(logging.Handler):
-        def __init__(self, maxlen: int = 5000) -> None:
-            super().__init__()
-            self.buf: deque[str] = deque(maxlen=maxlen)
-            self.setFormatter(fmt)
-
-        def emit(self, record: logging.LogRecord) -> None:
-            self.buf.append(self.format(record))
-
-    mem_handler = DequeHandler()
-    logger.addHandler(mem_handler)
-    logger._memh = mem_handler  # type: ignore[attr-defined]
     logger.info("Logger inicializado. Archivo: %s", LOG_FILE)
     for name in ["httpx", "httpcore", "urllib3", "telegram"]:
         logging.getLogger(name).setLevel(logging.WARNING)
