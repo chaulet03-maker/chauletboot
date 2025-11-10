@@ -150,6 +150,7 @@ DEFAULT_STATUS_SNAPSHOT: Dict[str, Any] = {
     "price_value": None,
     "equity": None,
     "equity_usdt": "—",
+    "equity_src": None,
     "funding_rate": None,
     "funding_text": "—",
     "position": {
@@ -227,7 +228,7 @@ async def collect_status_snapshot(app) -> Dict[str, Any]:
 
     try:
         equity_val = await _resolve_equity_usdt(exchange)
-        snapshot["equity"] = float(equity_val)
+        snapshot["equity"] = float(equity_val or 0.0)
 
         if snapshot["equity"] <= 0.0 and snapshot.get("mode_display") == "PAPER":
             snapshot["equity"] = 1000.0
@@ -235,9 +236,11 @@ async def collect_status_snapshot(app) -> Dict[str, Any]:
     except Exception:
         snapshot["equity"] = None
     if snapshot.get("equity") is not None:
-        snapshot["equity_usdt"] = f"{_fmt_usd(snapshot['equity'], dp=2)} USDT"
+        snapshot["equity_usdt"] = snapshot["equity"]
+        snapshot["equity_src"] = "FUTURES"
     else:
-        snapshot["equity_usdt"] = "—"
+        snapshot["equity_usdt"] = None
+        snapshot["equity_src"] = None
 
     funding_rate = None
     try:
@@ -360,13 +363,22 @@ def render_status(snapshot: Dict[str, Any]) -> str:
     else:
         ccxt_txt = "—"
 
+    equity_usdt_val = base.get("equity_usdt")
+    if equity_usdt_val not in (None, "", "—"):
+        try:
+            base["equity_usdt"] = f"{_fmt_usd(float(equity_usdt_val), dp=2)} USDT"
+        except Exception:
+            base["equity_usdt"] = str(equity_usdt_val)
+    else:
+        base["equity_usdt"] = "—"
+
     lines = [
         "🩺 Estado",
         f"• Modo: {base.get('mode_human') or '—'}",
         f"• Símbolo: {base.get('symbol') or '—'}",
         f"• CCXT: {ccxt_txt}",
         f"• Precio: {base.get('price') or '—'}",
-        f"• Saldo USDT: {base.get('equity_usdt') or '—'}",
+        f"• Saldo USDT: {base.get('equity_usdt') or '—'} ({base.get('equity_src') or '—'})",
         f"• Funding: {base.get('funding_text') or '—'}",
         f"• Posición: {base.get('position_text') or '—'}",
     ]
@@ -374,53 +386,65 @@ def render_status(snapshot: Dict[str, Any]) -> str:
 
 
 async def _resolve_equity_usdt(exchange: Any) -> float:
-    """Obtiene el equity USDT respetando el modo runtime (REAL vs SIM)."""
+    """Equity USDT de Binance USDM (Futures) de forma robusta."""
 
     mode = (runtime_get_mode() or "paper").lower()
-    if mode in {"real", "live"}:
-        if exchange and hasattr(exchange, "fetch_balance_usdt"):
-            try:
-                bal = await exchange.fetch_balance_usdt()
-            except Exception:
-                logger.debug("No se pudo obtener equity live vía fetch_balance_usdt.", exc_info=True)
-            else:
-                if isinstance(bal, dict):
-                    eq = bal.get("equity") or bal.get("total")
-                    if eq is not None:
-                        try:
-                            return float(eq)
-                        except Exception:
-                            logger.debug("Equity dict inválido en fetch_balance_usdt", exc_info=True)
-                try:
-                    return float(bal)
-                except Exception:
-                    logger.debug("Respuesta inválida de fetch_balance_usdt", exc_info=True)
+    if mode not in {"real", "live"}:
+        # Modo simulado
+        try:
+            return float(get_equity_sim())
+        except Exception:
+            return 0.0
 
-        if exchange and hasattr(exchange, "fetch_balance"):
-            try:
-                # 🚨 CORRECCIÓN CRÍTICA: La llamada a la API (fetch_balance) es SÍNCRONA y debe
-                # ser ejecutada en un hilo para no bloquear el bot asíncrono.
-                balance = await asyncio.to_thread(exchange.fetch_balance)
-
-                # Intentar obtener el saldo total de la billetera o el saldo total de USDT
-                # (el campo exacto varía, pero estos son los más comunes en CCXT/Binance Futures)
-                return float(
-                    balance.get("totalWalletBalance")
-                    or balance.get("info", {}).get("totalWalletBalance")
-                    or balance["total"]["USDT"]
-                )
-            except Exception:
-                # ERROR EXPUESTO: Registramos el error COMPLETO para ver si es problema de API Key/Permisos
-                logger.error(
-                    "Error al obtener el saldo (Equity) de Binance Futures. Verifique API Keys/Permisos.",
-                    exc_info=True,
-                )
-                return 0.0
+    if not exchange:
         return 0.0
+
+    import asyncio
+
+    # 1) Pedimos balance FUTURES explícitamente
+    balance = None
     try:
-        return float(get_equity_sim())
+        balance = await asyncio.to_thread(exchange.fetch_balance, {"type": "future"})
     except Exception:
-        return 0.0
+        # Si falla con el parámetro, probamos sin él (por si el wrapper ya viene seteado)
+        try:
+            balance = await asyncio.to_thread(exchange.fetch_balance)
+        except Exception:
+            logger.error("No pude leer balance de Futures (fetch_balance).", exc_info=True)
+            return 0.0
+
+    # 2) Orden de extracción más amplio (cubre los 3 formatos típicos de CCXT/USDM)
+    # 2.a) totalWalletBalance a nivel raíz o dentro de info
+    try:
+        twb = balance.get("totalWalletBalance") or balance.get("info", {}).get("totalWalletBalance")
+        if twb is not None:
+            v = float(twb)
+            if v >= 0:
+                return v
+    except Exception:
+        pass
+
+    # 2.b) assets[].walletBalance para USDT (formato Binance Futures crudo)
+    try:
+        for a in balance.get("info", {}).get("assets", []):
+            if str(a.get("asset")) == "USDT":
+                wb = a.get("walletBalance") or a.get("crossWalletBalance") or "0"
+                v = float(wb)
+                if v >= 0:
+                    return v
+    except Exception:
+        pass
+
+    # 2.c) CCXT normalizado: balance["total"]["USDT"]
+    try:
+        v = float(balance.get("total", {}).get("USDT") or 0.0)
+        if v >= 0:
+            return v
+    except Exception:
+        pass
+
+    # Si nada encaja, devolvemos 0.0
+    return 0.0
 
 
 def _merge_position_entry(entry: Any) -> Dict[str, Any]:
