@@ -228,19 +228,12 @@ async def collect_status_snapshot(app) -> Dict[str, Any]:
 
     try:
         equity_val = await _resolve_equity_usdt(exchange)
-        snapshot["equity"] = float(equity_val or 0.0)
-
-        if snapshot["equity"] <= 0.0 and snapshot.get("mode_display") == "PAPER":
-            snapshot["equity"] = 1000.0
-            set_equity_sim(1000.0)
     except Exception:
-        snapshot["equity"] = None
-    if snapshot.get("equity") is not None:
-        snapshot["equity_usdt"] = snapshot["equity"]
-        snapshot["equity_src"] = "FUTURES"
-    else:
-        snapshot["equity_usdt"] = None
-        snapshot["equity_src"] = None
+        logger.debug("No se pudo resolver equity USDT.", exc_info=True)
+        equity_val = 0.0
+    snapshot["equity"] = float(equity_val or 0.0)
+    snapshot["equity_usdt"] = snapshot["equity"]
+    snapshot["equity_src"] = "FUTURES"
 
     funding_rate = None
     try:
@@ -386,11 +379,13 @@ def render_status(snapshot: Dict[str, Any]) -> str:
 
 
 async def _resolve_equity_usdt(exchange: Any) -> float:
-    """Equity USDT de Binance USDM (Futures) de forma robusta."""
+    """
+    Obtiene equity USDT en REAL desde Futures (USD-M), soportando tu wrapper Exchange.
+    Retorna 0.0 si no puede leer nada.
+    """
 
     mode = (runtime_get_mode() or "paper").lower()
     if mode not in {"real", "live"}:
-        # Modo simulado
         try:
             return float(get_equity_sim())
         except Exception:
@@ -399,51 +394,85 @@ async def _resolve_equity_usdt(exchange: Any) -> float:
     if not exchange:
         return 0.0
 
-    import asyncio
+    import asyncio, math
 
-    # 1) Pedimos balance FUTURES explícitamente
-    balance = None
-    try:
-        balance = await asyncio.to_thread(exchange.fetch_balance, {"type": "future"})
-    except Exception:
-        # Si falla con el parámetro, probamos sin él (por si el wrapper ya viene seteado)
-        try:
-            balance = await asyncio.to_thread(exchange.fetch_balance)
-        except Exception:
-            logger.error("No pude leer balance de Futures (fetch_balance).", exc_info=True)
-            return 0.0
-
-    # 2) Orden de extracción más amplio (cubre los 3 formatos típicos de CCXT/USDM)
-    # 2.a) totalWalletBalance a nivel raíz o dentro de info
-    try:
-        twb = balance.get("totalWalletBalance") or balance.get("info", {}).get("totalWalletBalance")
+    def _extract_usdt(balance: dict) -> float:
+        # 1) totalWalletBalance directo o dentro de info
+        twb = (
+            (balance.get("totalWalletBalance")
+             or balance.get("info", {}).get("totalWalletBalance"))
+        )
         if twb is not None:
-            v = float(twb)
-            if v >= 0:
-                return v
-    except Exception:
-        pass
-
-    # 2.b) assets[].walletBalance para USDT (formato Binance Futures crudo)
-    try:
-        for a in balance.get("info", {}).get("assets", []):
-            if str(a.get("asset")) == "USDT":
-                wb = a.get("walletBalance") or a.get("crossWalletBalance") or "0"
-                v = float(wb)
-                if v >= 0:
+            try:
+                v = float(twb)
+                if math.isfinite(v):
                     return v
-    except Exception:
-        pass
+            except Exception:
+                pass
 
-    # 2.c) CCXT normalizado: balance["total"]["USDT"]
-    try:
-        v = float(balance.get("total", {}).get("USDT") or 0.0)
-        if v >= 0:
-            return v
-    except Exception:
-        pass
+        # 2) assets[].walletBalance para USDT (respuesta cruda de Binance Futures)
+        try:
+            for a in balance.get("info", {}).get("assets", []) or []:
+                if str(a.get("asset")) == "USDT":
+                    wb = a.get("walletBalance") or a.get("crossWalletBalance") or "0"
+                    v = float(wb)
+                    if math.isfinite(v):
+                        return v
+        except Exception:
+            pass
 
-    # Si nada encaja, devolvemos 0.0
+        # 3) CCXT normalizado
+        try:
+            v = float((balance.get("total") or {}).get("USDT") or 0.0)
+            if math.isfinite(v):
+                return v
+        except Exception:
+            pass
+
+        return 0.0
+
+    # --- 1) Si tu wrapper tiene el método, úsalo:
+    if hasattr(exchange, "fetch_balance_usdt"):
+        try:
+            # si tu método acepta tipo, pasamos "future"; si no, igual funciona.
+            maybe_balance = await asyncio.to_thread(exchange.fetch_balance_usdt, "future")
+            # el wrapper puede devolver ya un float o un dict
+            if isinstance(maybe_balance, (int, float)):
+                return float(maybe_balance)
+            if isinstance(maybe_balance, dict):
+                v = _extract_usdt(maybe_balance)
+                if v > 0:
+                    return v
+        except Exception:
+            logger.error("Wrapper.fetch_balance_usdt falló.", exc_info=True)
+
+    # --- 2) Si el wrapper expone el CCXT real:
+    ccxt_client = getattr(exchange, "ccxt", None) or getattr(exchange, "_ccxt", None)
+    if ccxt_client and hasattr(ccxt_client, "fetch_balance"):
+        try:
+            bal = await asyncio.to_thread(ccxt_client.fetch_balance, {"type": "future"})
+            return _extract_usdt(bal)
+        except Exception:
+            # intento sin parámetro por si el default ya es future
+            try:
+                bal = await asyncio.to_thread(ccxt_client.fetch_balance)
+                return _extract_usdt(bal)
+            except Exception:
+                logger.error("ccxt.fetch_balance falló.", exc_info=True)
+
+    # --- 3) Último intento: algunos wrappers guardan el cliente en `client`
+    client = getattr(exchange, "client", None)
+    if client and hasattr(client, "fetch_balance"):
+        try:
+            bal = await asyncio.to_thread(client.fetch_balance, {"type": "future"})
+            return _extract_usdt(bal)
+        except Exception:
+            try:
+                bal = await asyncio.to_thread(client.fetch_balance)
+                return _extract_usdt(bal)
+            except Exception:
+                logger.error("client.fetch_balance falló.", exc_info=True)
+
     return 0.0
 
 
