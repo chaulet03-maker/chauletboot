@@ -3106,7 +3106,7 @@ async def _slash_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     )
 
 
-async def _text_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def on_unknown_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     _prepare_args_for_text(update, context)
     await _dispatch_command(
         update,
@@ -3136,17 +3136,16 @@ def register_commands(application: Application) -> None:
     if getattr(application, "_chaulet_router_registered", False):
         return
 
-    application.add_handler(CommandHandler("logs", logs_command), block=True)
-    application.add_handler(MessageHandler(filters.COMMAND, _slash_router))
+    application.add_handler(CommandHandler("logs", logs_command))
     application.add_handler(
         MessageHandler(
             filters.TEXT
             & (~filters.COMMAND)
             & filters.Regex(LOGS_TEXT_RE_PATTERN),
             logs_command,
-        ),
-        block=True,
+        )
     )
+    application.add_handler(MessageHandler(filters.COMMAND, _slash_router))
     application.add_handler(
         MessageHandler(filters.Regex(r"(?i)^(status|estado)$"), _status_plaintext_handler) # CORRECCIÓN
     )
@@ -3165,7 +3164,7 @@ def register_commands(application: Application) -> None:
     generic_filter = generic_filter & (~filters.Regex(POSITION_TEXT_RE_PATTERN)) # CORRECCIÓN
     generic_filter = generic_filter & (~filters.Regex(r"(?i)^(status|estado)$")) # CORRECCIÓN
     generic_filter = generic_filter & (~filters.Regex(LOGS_TEXT_RE_PATTERN))
-    application.add_handler(MessageHandler(generic_filter, _text_router))
+    application.add_handler(MessageHandler(generic_filter, on_unknown_text))
     setattr(application, "_chaulet_router_registered", True)
     logger.info(
         "Router central de comandos registrado (%d comandos).",
