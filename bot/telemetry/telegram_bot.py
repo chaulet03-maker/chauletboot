@@ -1471,7 +1471,9 @@ def _engine_config(engine) -> Dict:
     return {}
 
 
-async def _write_config_async(cfg_dict):
+async def _write_config_async(cfg_dict: Dict[str, Any]) -> None:
+    """Guarda la configuración en disco sin bloquear el event loop."""
+
     await to_thread(_write_cfg_yaml, cfg_dict)
 
 
@@ -3481,24 +3483,22 @@ async def _report_periodic(notifier: TelegramNotifier, days: int):
         eq_csv, tr_csv = notifier.equity_csv, notifier.trades_csv
         equity_ini = equity_fin = pnl = 0.0
         total_trades = wins = losses = 0
+        now = pd.Timestamp.now(tz=_tz())
+        since = now - pd.Timedelta(days=days)
         try:
             df_eq = await to_thread(pd.read_csv, eq_csv, parse_dates=["ts"])
             df_eq["ts"] = pd.to_datetime(df_eq["ts"], utc=True)
-            now = pd.Timestamp.now(tz=_tz())
-            since = now - pd.Timedelta(days=days)
             dfw = df_eq[df_eq["ts"] >= since.tz_convert("UTC")]
             if not dfw.empty:
                 equity_ini = float(dfw["equity"].iloc[0])
                 equity_fin = float(dfw["equity"].iloc[-1])
                 # Corregido: pnl debe ser la diferencia de equity, no la suma de la columna pnl del equity DF
-                pnl = equity_fin - equity_ini 
+                pnl = equity_fin - equity_ini
         except Exception:
             pass
         try:
             df_tr = await to_thread(pd.read_csv, tr_csv, parse_dates=["ts"])
             df_tr["ts"] = pd.to_datetime(df_tr["ts"], utc=True)
-            now = pd.Timestamp.now(tz=_tz())
-            since = now - pd.Timedelta(days=days)
             dft = df_tr[df_tr["ts"] >= since.tz_convert("UTC")]
             if not dft.empty:
                 total_trades = len(dft)
