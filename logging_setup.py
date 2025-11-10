@@ -128,7 +128,7 @@ def setup_logging() -> logging.Logger:
     logger.info("Logger inicializado. Archivo: %s", LOG_FILE)
     for name in ["httpx", "httpcore", "urllib3", "telegram"]:
         logging.getLogger(name).setLevel(logging.WARNING)
-    logging.getLogger("telegram.http").setLevel(logging.INFO)
+    logging.getLogger("telegram.http").setLevel(logging.WARNING)
     logging.getLogger("apscheduler").setLevel(logging.ERROR)
     logging.getLogger("apscheduler.scheduler").setLevel(logging.ERROR)
     logging.getLogger("apscheduler.executors.default").setLevel(logging.ERROR)
