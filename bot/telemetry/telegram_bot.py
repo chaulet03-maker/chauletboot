@@ -2496,8 +2496,8 @@ async def sl_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     service = getattr(trading, "POSITION_SERVICE", None)
-    args = context.args
-    text_raw = message.text or ""
+    text_raw = (message.text or "").strip()
+    has_args = len(text_raw.split()) > 1
 
     service_open = False
     if service is not None:
@@ -2510,7 +2510,7 @@ async def sl_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif is_open_attr is not None:
             service_open = bool(is_open_attr)
 
-    if service_open and args and app:
+    if service_open and has_args and app:
         pos_getter = getattr(service, "get_position", None)
         try:
             pos = pos_getter() if callable(pos_getter) else pos_getter
