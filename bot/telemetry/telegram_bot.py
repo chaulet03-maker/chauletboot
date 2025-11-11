@@ -103,6 +103,10 @@ def _fmt_money(v: float) -> str:
         return str(v)
 
 
+def format_money(v: float) -> str:
+    return _fmt_money(v)
+
+
 def _fmt_usd(x, dp: int = 2) -> str:
     try:
         return f"{float(x):,.{dp}f}"
@@ -226,11 +230,7 @@ async def collect_status_snapshot(app) -> Dict[str, Any]:
         snapshot["price_value"] = None
     snapshot["price"] = _fmt_usd(snapshot.get("price_value"), dp=1) if snapshot.get("price_value") is not None else "—"
 
-    try:
-        equity_val = await _resolve_equity_usdt(exchange)
-    except Exception:
-        logger.debug("No se pudo resolver equity USDT.", exc_info=True)
-        equity_val = 0.0
+    equity_val = await _resolve_equity_usdt(exchange)
     snapshot["equity"] = float(equity_val or 0.0)
     snapshot["equity_usdt"] = snapshot["equity"]
     snapshot["equity_src"] = "FUTURES"
@@ -380,8 +380,8 @@ def render_status(snapshot: Dict[str, Any]) -> str:
 
 async def _resolve_equity_usdt(exchange: Any) -> float:
     """
-    Lee equity USDT en modo REAL desde Binance USDM (Futures), soportando tu wrapper Exchange
-    (donde fetch_balance_usdt puede ser async) y el cliente CCXT real.
+    Equity USDT en REAL desde Binance USDM (Futures), soportando tu wrapper Exchange
+    (fetch_balance_usdt puede ser async) y el cliente CCXT real.
     Retorna 0.0 si no puede leer.
     """
 
@@ -438,7 +438,7 @@ async def _resolve_equity_usdt(exchange: Any) -> float:
             # Llamado robusto: si es coroutine -> await; si es sync -> to_thread
             if inspect.iscoroutinefunction(fn):
                 try:
-                    maybe_balance = await fn("future")
+                    maybe_balance = await fn("future")   # preferimos pasar tipo
                 except TypeError:
                     maybe_balance = await fn()
             else:
@@ -447,7 +447,7 @@ async def _resolve_equity_usdt(exchange: Any) -> float:
                 except TypeError:
                     maybe_balance = await asyncio.to_thread(fn)
 
-            # Por si el wrapper devuelve una coroutine en vez del resultado:
+            # Por si devuelve una coroutine:
             if inspect.iscoroutine(maybe_balance):
                 maybe_balance = await maybe_balance
 
@@ -461,7 +461,7 @@ async def _resolve_equity_usdt(exchange: Any) -> float:
         except Exception:
             logger.error("Wrapper.fetch_balance_usdt falló.", exc_info=True)
 
-    # --- 2) Cliente CCXT dentro del wrapper (ccxt o _ccxt)
+    # --- 2) Cliente CCXT expuesto (.ccxt o ._ccxt)
     ccxt_client = getattr(exchange, "ccxt", None) or getattr(exchange, "_ccxt", None)
     if ccxt_client and hasattr(ccxt_client, "fetch_balance"):
         try:
@@ -478,7 +478,7 @@ async def _resolve_equity_usdt(exchange: Any) -> float:
             except Exception:
                 logger.error("ccxt.fetch_balance falló.", exc_info=True)
 
-    # --- 3) Algunos wrappers exponen el cliente como .client
+    # --- 3) A veces el cliente está en .client
     client = getattr(exchange, "client", None)
     if client and hasattr(client, "fetch_balance"):
         try:
@@ -3004,18 +3004,16 @@ async def equity_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not match:
         fraction = float(_get_equity_fraction(engine))
         pct = round(fraction * 100.0, 2)
-        if hasattr(engine, "exchange") and engine.exchange is not None:
-            try:
-                balance_info = await engine.exchange.fetch_balance()
-                base_equity = float(balance_info["USDT"]["total"])
-            except Exception:
-                base_equity = get_equity_sim()
+        mode = (runtime_get_mode() or "paper").lower()
+        exchange = getattr(engine, "exchange", None)
+        if mode in {"real", "live"}:
+            base_equity = await _resolve_equity_usdt(exchange)
+            header = f"Equity REAL (FUTURES): {format_money(base_equity)} USDT"
         else:
-            base_equity = get_equity_sim()
+            base_equity = float(get_equity_sim())
+            header = f"Saldo base actual (SIM): {format_money(base_equity)} USDT"
         await message.reply_text(
-            "Saldo base actual: {:.2f} USDT\nEquity % (Riesgo): {:.2f}% (frac={:.4f})".format(
-                float(base_equity or 0.0), pct, fraction
-            )
+            f"{header}\nEquity % (Riesgo): {pct:.2f}% (frac={fraction:.4f})"
         )
         return
 
