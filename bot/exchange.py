@@ -242,7 +242,7 @@ class Exchange:
         try:
             from state_store import load_state  # import local para evitar ciclos
 
-            st = load_state() or {}
+            st = await load_state() or {}
             open_pos = (st.get("open_positions") or {}).get(sym_key)
             qty_st = float((open_pos or {}).get("qty") or 0.0)
             if open_pos and abs(qty_st) > 0.0:

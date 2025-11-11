@@ -9,6 +9,8 @@ import uuid
 from dataclasses import asdict, dataclass
 from typing import Any, Dict, Optional
 
+import asyncio
+
 from bot.async_state_store import AsyncRedisStateStore
 from bot.runtime_state import get_mode as runtime_get_mode
 
@@ -109,7 +111,17 @@ async def async_save_state(state: Dict[str, Any]) -> None:
     _save_state_to_disk(state)
 
 
-def load_state() -> Dict[str, Any]:
+async def load_state() -> Dict[str, Any]:
+    """Carga asincrónicamente el estado desde la tienda configurada."""
+
+    try:
+        return await async_load_state()
+    except Exception:
+        logger.debug("No se pudo cargar estado en modo async; usando respaldo local.", exc_info=True)
+        return await asyncio.to_thread(_load_state_from_disk)
+
+
+def load_state_sync() -> Dict[str, Any]:
     store = _ASYNC_STORE
     if store and store.is_connected:
         try:
@@ -121,7 +133,17 @@ def load_state() -> Dict[str, Any]:
     return _load_state_from_disk()
 
 
-def save_state(state: Dict[str, Any]) -> None:
+async def save_state(state: Dict[str, Any]) -> None:
+    """Persiste asincrónicamente el estado en la tienda configurada."""
+
+    try:
+        await async_save_state(state)
+    except Exception:
+        logger.debug("No se pudo guardar estado en modo async; intentando respaldo local.", exc_info=True)
+        await asyncio.to_thread(_save_state_to_disk, state)
+
+
+def save_state_sync(state: Dict[str, Any]) -> None:
     store = _ASYNC_STORE
     if store and store.is_connected:
         try:
@@ -157,10 +179,10 @@ def create_position(
 
 
 def persist_open(pos: Position, state: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    state_obj = state or load_state()
+    state_obj = state or load_state_sync()
     state_obj.setdefault("open_positions", {})[pos.symbol] = asdict(pos)
     state_obj.setdefault("closed_positions", [])
-    save_state(state_obj)
+    save_state_sync(state_obj)
     return state_obj
 
 
@@ -173,7 +195,7 @@ def persist_close(
     gross_pnl: Optional[float] = None,
     state: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    state_obj = state or load_state()
+    state_obj = state or load_state_sync()
     open_positions = state_obj.setdefault("open_positions", {})
     pos = open_positions.pop(symbol, None)
     if pos is None and "/" in symbol:
@@ -190,7 +212,7 @@ def persist_close(
             pos["gross_pnl"] = float(gross_pnl)
         pos["realized_pnl"] = float(realized_pnl)
         state_obj.setdefault("closed_positions", []).append(pos)
-        save_state(state_obj)
+        save_state_sync(state_obj)
     return state_obj
 
 
@@ -200,7 +222,7 @@ def update_open_position(symbol: str, **changes: Any) -> bool:
     if not changes:
         return False
 
-    state = load_state()
+    state = load_state_sync()
     open_positions = state.setdefault("open_positions", {})
 
     candidates = []
@@ -228,7 +250,7 @@ def update_open_position(symbol: str, **changes: Any) -> bool:
             except (TypeError, ValueError):
                 updated[field] = value
         open_positions[key] = updated
-        save_state(state)
+        save_state_sync(state)
         return True
     return False
 
@@ -305,7 +327,7 @@ def on_close_filled(symbol: str, exit_price: float, fee: float = 0.0) -> None:
     # En REAL no persistimos posición del BOT en disco
     if not _runtime_is_paper():
         return
-    state = load_state()
+    state = load_state_sync()
     open_positions = state.get("open_positions", {})
     pos = open_positions.get(symbol)
     key_used = symbol
@@ -348,7 +370,7 @@ def on_close_filled(symbol: str, exit_price: float, fee: float = 0.0) -> None:
 
 
 def position_status(symbol: str, mode: str) -> str:
-    state = load_state()
+    state = load_state_sync()
     pos = state.get("open_positions", {}).get(symbol)
     if pos:
         return (
@@ -368,7 +390,7 @@ def position_status(symbol: str, mode: str) -> str:
                 mode="live",
             )
             persist_open(reconstructed)
-            pos = load_state().get("open_positions", {}).get(symbol)
+            pos = load_state_sync().get("open_positions", {}).get(symbol)
             if pos:
                 return (
                     f"Posición ABIERTA (sincronizada): {pos['side']} {symbol} @ {pos['entry_price']} "
@@ -386,6 +408,8 @@ __all__ = [
     "async_save_state",
     "load_state",
     "save_state",
+    "load_state_sync",
+    "save_state_sync",
     "create_position",
     "persist_open",
     "persist_close",
