@@ -6,7 +6,9 @@ import threading
 import time
 from typing import Any, Dict, List, Mapping, Optional
 
-import ccxt
+import inspect
+
+import ccxt.async_support as ccxt
 from ccxt.base.errors import ExchangeError, NetworkError
 
 from bot.exchanges.binance_filters import build_filters
@@ -29,7 +31,7 @@ def _get_brokers_module():
 
 logger = logging.getLogger(__name__)
 
-def create_order_smart(
+async def create_order_smart(
     symbol: str,
     side: str,
     qty: float,
@@ -48,11 +50,13 @@ def create_order_smart(
         ex = client or get_ccxt()
     except Exception as exc:
         raise RuntimeError("Faltan credenciales o CCXT no disponible") from exc
+
     side_up = str(side).upper()
     order_type = "market" if price is None else "limit"
     params = dict(extra_params or {})
+
     try:
-        return ex.create_order(symbol, order_type, side_up, qty, price, params)
+        return await ex.create_order(symbol, order_type, side_up, qty, price, params)
     except NetworkError as e:
         raise RuntimeError("Faltan credenciales (ccxt) o sin conectividad") from e
     except ExchangeError as e:
@@ -62,7 +66,9 @@ def create_order_smart(
             retry_params = dict(params)
             retry_params["positionSide"] = ps
             logger.info("Reintento con positionSide=%s (cuenta en HEDGE)", ps)
-            return ex.create_order(symbol, order_type, side_up, qty, price, retry_params)
+            return await ex.create_order(
+                symbol, order_type, side_up, qty, price, retry_params
+            )
         raise
 
 
@@ -266,7 +272,7 @@ class Exchange:
         pos_list: Optional[List[Dict[str, Any]]] = None
         if ccxt_client is not None and hasattr(ccxt_client, "fetch_positions"):
             try:
-                pos_list = await asyncio.to_thread(ccxt_client.fetch_positions, [sym])
+                pos_list = await ccxt_client.fetch_positions([sym])
             except Exception as exc:
                 logger.debug("fetch_positions fallo, intento fallback: %s", exc)
         for entry in pos_list or []:
@@ -342,9 +348,7 @@ class Exchange:
         # 1) CCXT en futures
         if ccxt_client is not None and hasattr(ccxt_client, "fetch_positions"):
             try:
-                pos_list = await asyncio.to_thread(
-                    ccxt_client.fetch_positions, None, {"type": "future"}
-                )
+                pos_list = await ccxt_client.fetch_positions(None, {"type": "future"})
                 for entry in pos_list or []:
                     info = entry.get("info") or {}
                     raw_amt = (
@@ -438,7 +442,9 @@ class Exchange:
                     continue
 
                 try:
-                    result = await asyncio.to_thread(method, request)
+                    result = method(request)
+                    if inspect.isawaitable(result):
+                        result = await result
                 except Exception:
                     continue
 
@@ -495,12 +501,13 @@ class Exchange:
 
         # 1) CCXT en Futuros USD-M
         try:
-            def _fetch_ccxt_balance() -> Optional[float]:
-                ccxt_client = get_ccxt()
-                if ccxt_client is None:
-                    return None
+            ccxt_client = get_ccxt()
+        except Exception:
+            ccxt_client = None
 
-                bal = ccxt_client.fetch_balance({"type": "future"})
+        if ccxt_client is not None and hasattr(ccxt_client, "fetch_balance"):
+            try:
+                bal = await ccxt_client.fetch_balance({"type": "future"})
                 total = (bal.get("total") or {}).get("USDT")
                 if total is not None:
                     return float(total)
@@ -512,12 +519,25 @@ class Exchange:
                         return float(t)
                     return float((usdt.get("free", 0.0) or 0.0) + (usdt.get("used", 0.0) or 0.0))
                 return float(usdt or 0.0)
-
-            balance = await asyncio.to_thread(_fetch_ccxt_balance)
-            if balance is not None:
-                return float(balance)
-        except Exception:
-            pass
+            except Exception:
+                try:
+                    bal = await ccxt_client.fetch_balance()
+                    total = (bal.get("total") or {}).get("USDT")
+                    if total is not None:
+                        return float(total)
+                    usdt = bal.get("USDT") or {}
+                    if isinstance(usdt, dict):
+                        t = usdt.get("total")
+                        if t is not None:
+                            return float(t)
+                        return float(
+                            (usdt.get("free", 0.0) or 0.0)
+                            + (usdt.get("used", 0.0) or 0.0)
+                        )
+                    if usdt not in (None, ""):
+                        return float(usdt)
+                except Exception:
+                    pass
 
         # 2) Fallback nativo (python-binance): wallet de USD-M (solo si runtime live)
         try:
@@ -814,12 +834,7 @@ class Exchange:
 
         hedged = not bool(one_way)
         try:
-            matched = await asyncio.to_thread(ensure_position_mode, hedged)
-            if matched:
-                logger.debug(
-                    "Modo de posiciones ya era %s",
-                    "HEDGE" if hedged else "ONE-WAY",
-                )
+            ensure_position_mode(self.client, hedged)
         except Exception:
             logger.debug(
                 "ensure_position_mode(one_way=%s) falló (no crítico)",
@@ -837,12 +852,12 @@ class Exchange:
         sym = symbol or self.config.get('symbol', 'BTC/USDT')
         logger.debug("Solicitando klines %s para %s", timeframe, sym)
         try:
-            return await asyncio.to_thread(self.client.fetch_ohlcv, sym, timeframe=timeframe, limit=limit)
+            return await self.client.fetch_ohlcv(sym, timeframe=timeframe, limit=limit)
         except Exception:
             alt = sym.replace('/', '')
             if alt != sym:
                 logger.debug("Fallo al obtener klines para %s, probando %s", sym, alt)
-                return await asyncio.to_thread(self.client.fetch_ohlcv, alt, timeframe=timeframe, limit=limit)
+                return await self.client.fetch_ohlcv(alt, timeframe=timeframe, limit=limit)
             raise
 
     def get_price_age_sec(self, symbol: Optional[str] = None) -> float:
@@ -886,8 +901,13 @@ class Exchange:
 
         for candidate in candidates:
             for client in clients:
+                fetch = getattr(client, "fetch_ticker", None)
+                if fetch is None:
+                    continue
                 try:
-                    data = await asyncio.to_thread(client.fetch_ticker, candidate)
+                    data = fetch(candidate)
+                    if inspect.isawaitable(data):
+                        data = await data
                 except Exception:
                     continue
 
@@ -921,7 +941,13 @@ class Exchange:
 
         markets: Dict[str, Any] = {}
         try:
-            markets = await asyncio.to_thread(client.load_markets)
+            load = getattr(client, "load_markets", None)
+            if callable(load):
+                maybe_markets = load()
+                if inspect.isawaitable(maybe_markets):
+                    maybe_markets = await maybe_markets
+                if isinstance(maybe_markets, dict):
+                    markets = maybe_markets
         except Exception:
             markets = {}
 
@@ -938,7 +964,7 @@ class Exchange:
 
         if market is None:
             try:
-                market = await asyncio.to_thread(client.market, sym)
+                market = client.market(sym)
             except Exception:
                 market = None
 
@@ -967,7 +993,7 @@ class Exchange:
             return
 
         await self._ensure_auth_for_private()
-        await asyncio.to_thread(self.client.set_leverage, lev_int, sym)
+        await self.client.set_leverage(lev_int, sym)
         logger.info("Apalancamiento establecido en x%s para %s", lev_int, sym)
 
     async def fetch_current_funding_rate(self, symbol: Optional[str] = None) -> Optional[float]:
@@ -988,8 +1014,13 @@ class Exchange:
 
         for candidate in candidates:
             for client in clients:
+                fetch = getattr(client, "fetch_funding_rate", None)
+                if fetch is None:
+                    continue
                 try:
-                    fr = await asyncio.to_thread(client.fetch_funding_rate, candidate)
+                    fr = fetch(candidate)
+                    if inspect.isawaitable(fr):
+                        fr = await fr
                     if fr is None:
                         continue
                     rate = fr.get('fundingRate')
@@ -1019,8 +1050,8 @@ class Exchange:
         await self._ensure_auth_for_private()
         try:
             if symbol:
-                return await asyncio.to_thread(self.client.fetch_positions, [symbol])
-            return await asyncio.to_thread(self.client.fetch_positions)
+                return await self.client.fetch_positions([symbol])
+            return await self.client.fetch_positions()
         except Exception:
             logger.debug("fetch_positions falló (symbol=%s)", symbol, exc_info=True)
             return []
@@ -1047,7 +1078,7 @@ class Exchange:
 
         if not self.is_paper():
             try:
-                await asyncio.to_thread(ensure_position_mode, self.hedge_mode)
+                ensure_position_mode(self.client, self.hedge_mode)
             except Exception:
                 logger.warning("No se pudo asegurar el modo de posición antes de abrir", exc_info=True)
 

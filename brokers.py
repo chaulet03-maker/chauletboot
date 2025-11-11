@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import inspect
 import logging
 import os
 import time
@@ -48,6 +50,7 @@ PAPER_STORE_PATH = get_paper_store_path()
 ACTIVE_PAPER_STORE: PaperStore | None = None
 ACTIVE_LIVE_CLIENT: Any | None = None
 _LAST_MODE_STATUS: Optional[str] = None
+_SYNC_CCXT_LOOP: asyncio.AbstractEventLoop | None = None
 
 
 def _log_mode_status(status: str, level: int, message: str, *args) -> None:
@@ -450,7 +453,20 @@ class BinanceBroker:
         attempt = 0
         while True:
             try:
-                return fn(*args, **kwargs)
+                result = fn(*args, **kwargs)
+                if inspect.isawaitable(result):
+                    global _SYNC_CCXT_LOOP
+                    loop = _SYNC_CCXT_LOOP
+                    if loop is None or loop.is_closed():
+                        loop = asyncio.new_event_loop()
+                        asyncio.set_event_loop(loop)
+                        _SYNC_CCXT_LOOP = loop
+                    if loop.is_running():
+                        raise RuntimeError(
+                            "create_order_smart coroutine cannot run inside an active event loop"
+                        )
+                    return loop.run_until_complete(result)
+                return result
             except Exception as exc:
                 classification = self._classify_error(exc)
                 should_retry = self._should_retry(classification)

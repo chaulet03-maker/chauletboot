@@ -1,10 +1,11 @@
 """Shared CCXT client helpers and position mode utilities."""
 
+import asyncio
 import logging
 import os
 from typing import Any
 
-import ccxt
+import ccxt.async_support as ccxt
 
 logger = logging.getLogger(__name__)
 
@@ -67,7 +68,23 @@ def get_ccxt() -> ccxt.Exchange:
 
 def reset_ccxt_client() -> None:
     global _CCXT
-    _CCXT = None
+    client, _CCXT = _CCXT, None
+    if not client:
+        return
+
+    close = getattr(client, "close", None)
+    if not callable(close):
+        return
+
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        try:
+            asyncio.run(close())
+        except RuntimeError:
+            logger.debug("No event loop available to close CCXT client.", exc_info=True)
+    else:
+        loop.create_task(close())
 
 
 def ensure_position_mode(exchange: Any, hedge: bool = False) -> None:

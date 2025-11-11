@@ -1896,16 +1896,10 @@ class TradingApp:
         )
 
         try:
-            if inspect.iscoroutinefunction(getter):
-                try:
-                    rate_value = await getter(symbol)
-                except TypeError:
-                    rate_value = await getter()
-            else:
-                try:
-                    rate_value = await asyncio.to_thread(getter, symbol)
-                except TypeError:
-                    rate_value = await asyncio.to_thread(getter)
+            try:
+                rate_value = getter(symbol)
+            except TypeError:
+                rate_value = getter()
             if inspect.isawaitable(rate_value):
                 rate_value = await rate_value
             rate = float(rate_value)
@@ -2337,8 +2331,16 @@ class TradingApp:
             )
             self._start_internal_scheduler(loop)
 
+        async def _ensure_exchange_position_mode():
+            try:
+                ensure_position_mode(self.exchange.client, self.exchange.hedge_mode)
+            except Exception:
+                self.logger.debug(
+                    "No se pudo asegurar el modo de posición al iniciar.", exc_info=True
+                )
+
         bootstrap_tasks = [
-            asyncio.to_thread(ensure_position_mode, self.exchange.hedge_mode),
+            _ensure_exchange_position_mode(),
             self._preload_position_from_store(),
         ]
         for task in bootstrap_tasks:

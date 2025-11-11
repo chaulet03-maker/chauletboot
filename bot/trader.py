@@ -6,7 +6,7 @@ from typing import Any, Dict, Optional
 from config import S
 import trading
 from bot.paper_store import get_equity as paper_get_equity, set_equity as paper_set_equity
-from position_service import fetch_live_equity_usdm
+from position_service import async_fetch_live_equity_usdm, fetch_live_equity_usdm
 from bot.runtime_state import get_mode as runtime_get_mode
 from bot.logger import _warn
 
@@ -79,7 +79,7 @@ class Trader:
                 _warn("TRADER", "No se pudo refrescar equity en modo paper.", exc=exc, level="debug")
 
         try:
-            live_equity = await asyncio.to_thread(fetch_live_equity_usdm)
+            live_equity = await async_fetch_live_equity_usdm()
             self._balance = float(live_equity)
             return self._balance
         except Exception as exc:
@@ -87,7 +87,7 @@ class Trader:
 
         if exchange and getattr(exchange, 'client', None):
             try:
-                balance = await asyncio.to_thread(exchange.client.fetch_balance)
+                balance = await exchange.client.fetch_balance()
                 usdt_info = balance.get('USDT') if isinstance(balance, dict) else None
                 if isinstance(usdt_info, dict):
                     total = usdt_info.get('total') or usdt_info.get('free')

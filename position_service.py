@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from typing import Any, Dict, Optional, Literal
@@ -52,16 +53,19 @@ logger = logging.getLogger(__name__)
 EPS_QTY = 1e-9
 
 
-def fetch_live_equity_usdm() -> float:
-    """Equity para USDⓈ-M (USDT)."""
+async def async_fetch_live_equity_usdm() -> float:
+    """Equity para USDⓈ-M (USDT) usando cliente CCXT asíncrono."""
 
     try:
         from bot import exchange_client
 
         client = exchange_client.get_ccxt()
+        if client is None:
+            return 0.0
+
         # Ruta estándar CCXT
         try:
-            bal = client.fetch_balance({"type": "future"})
+            bal = await client.fetch_balance({"type": "future"})
             # ccxt puede exponerlo en bal['USDT']['total'] o similar
             for key in ("total", "free", "used"):
                 try:
@@ -77,7 +81,12 @@ def fetch_live_equity_usdm() -> float:
                 if isinstance(assets, list):
                     for it in assets:
                         if (it or {}).get("asset") == "USDT":
-                            for k in ("walletBalance", "balance", "cashBalance", "availableBalance"):
+                            for k in (
+                                "walletBalance",
+                                "balance",
+                                "cashBalance",
+                                "availableBalance",
+                            ):
                                 v = (it or {}).get(k)
                                 if v is not None:
                                     return float(v)
@@ -86,12 +95,20 @@ def fetch_live_equity_usdm() -> float:
 
         # Fallback Binance nativo: /fapi/v2/balance
         try:
-            if hasattr(client, "fapiPrivateV2GetBalance"):
-                lst = client.fapiPrivateV2GetBalance()
-                if isinstance(lst, list):
-                    for it in lst:
+            raw_method = getattr(client, "fapiPrivateV2GetBalance", None)
+            if raw_method is not None:
+                payload = raw_method()
+                if asyncio.iscoroutine(payload):
+                    payload = await payload
+                if isinstance(payload, list):
+                    for it in payload:
                         if (it or {}).get("asset") == "USDT":
-                            for k in ("walletBalance", "balance", "cashBalance", "availableBalance"):
+                            for k in (
+                                "walletBalance",
+                                "balance",
+                                "cashBalance",
+                                "availableBalance",
+                            ):
                                 v = (it or {}).get(k)
                                 if v is not None:
                                     return float(v)
@@ -101,6 +118,20 @@ def fetch_live_equity_usdm() -> float:
     except Exception as exc:
         _warn("POSITION", "fetch_live_equity_usdm() error", exc=exc, level="debug")
     return 0.0
+
+
+def fetch_live_equity_usdm() -> float:
+    """Equity para USDⓈ-M (USDT) en contexto síncrono."""
+
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(async_fetch_live_equity_usdm())
+    if loop.is_running():
+        raise RuntimeError(
+            "fetch_live_equity_usdm no puede ejecutarse en un loop activo; use async_fetch_live_equity_usdm"
+        )
+    return loop.run_until_complete(async_fetch_live_equity_usdm())
 
 
 def _pnl(side: str, qty: float, entry: float, mark: float) -> float:
@@ -950,4 +981,5 @@ __all__ = [
     "build_position_service",
     "pos_svc",
     "fetch_live_equity_usdm",
+    "async_fetch_live_equity_usdm",
 ]
