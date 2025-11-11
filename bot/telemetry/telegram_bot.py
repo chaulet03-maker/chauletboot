@@ -2488,111 +2488,117 @@ async def control_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def sl_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     app = _get_app_from_context(context)
+    if app is None:
+        return
+
     message = update.effective_message
-    if app is None or message is None:
+    if message is None:
         return
 
-    # 🚨 CRÍTICO: Usar el servicio de posición del bot para obtener la posición y el SL/TP
-    pos_info = _bot_position_info(app)
-    if not pos_info:
-        # SI NO HAY POSICIÓN: Mostramos el default.
-        symbol_conf = _default_symbol(app)
-        defaults = get_protection_defaults(symbol_conf)
-        pct = float(defaults.get("sl_pct_equity") or DEFAULT_SL_PRICE_PCT)
-        await message.reply_text(
-            f"SL predeterminado: {pct:+.2f}% del precio de entrada."
-        )
+    service = getattr(trading, "POSITION_SERVICE", None)
+    args = context.args
+    text_raw = message.text or ""
 
-        # Ejecutamos el router de defaults por si el usuario pasó un argumento
-        await _handle_position_controls(
-            None,
-            lambda txt: reply_markdown_safe(message, txt),
-            update.effective_message.text,
-        )
-        return
-
-    symbol_conf = pos_info["symbol_conf"]
-
-    args = context.args or []
-    if not args:
-        # Mostrar SL actual del servicio (que contiene el SL de la posición abierta)
-        service = getattr(trading, "POSITION_SERVICE", None)
-        sl_price = None
-        if service is not None:
-            get_levels = getattr(service, "get_protection_levels", None)
-            if callable(get_levels):
-                levels = None
-                try:
-                    levels = get_levels(symbol_conf)
-                except TypeError:
-                    try:
-                        levels = get_levels()
-                    except Exception:
-                        logger.debug("get_protection_levels falló sin argumentos", exc_info=True)
-                        levels = None
-                except Exception:
-                    logger.debug("get_protection_levels falló", exc_info=True)
-                if isinstance(levels, dict):
-                    sl_price = levels.get("sl")
-                else:
-                    sl_price = getattr(levels, "sl", None)
-        if sl_price not in (None, ""):
+    service_open = False
+    if service is not None:
+        is_open_attr = getattr(service, "is_open", None)
+        if callable(is_open_attr):
             try:
-                await message.reply_text(f"SL actual de la posición: {_num(sl_price)}")
+                service_open = bool(is_open_attr())
             except Exception:
-                await message.reply_text(f"SL actual de la posición: {sl_price}")
-        else:
-            defaults = get_protection_defaults(symbol_conf)
-            pct = float(defaults.get("sl_pct_equity") or 0.0)
-            await message.reply_text(f"SL predeterminado: -{abs(pct):.2f}% del precio.")
-        return
+                logger.debug("sl_command: fallo al consultar POSITION_SERVICE.is_open", exc_info=True)
+        elif is_open_attr is not None:
+            service_open = bool(is_open_attr)
 
-    raw = " ".join(args).strip().replace(",", ".")
-    if raw.startswith("$"):
+    if service_open and args and app:
+        pos_getter = getattr(service, "get_position", None)
         try:
-            px = float(raw.replace("$", "").strip())
+            pos = pos_getter() if callable(pos_getter) else pos_getter
         except Exception:
-            await message.reply_text("Formato inválido. Usá `sl 5` (pct) o `sl $108000` (precio).")
+            logger.debug("sl_command: fallo al obtener la posición actual", exc_info=True)
+            pos = None
+        if not pos:
+            # Si no hay posición obtenible desde el servicio, seguimos con el flujo por defecto
+            await _handle_position_controls(
+                None,
+                lambda txt: reply_markdown_safe(message, txt),
+                text_raw,
+            )
             return
 
-        # Actualizar la protección a través del Position Service (SOLO si hay posición del bot)
-        service = getattr(trading, "POSITION_SERVICE", None)
-        updated = False
-        if service is not None:
+        entry_px = getattr(pos, "entry_price", None)
+        if entry_px is None and isinstance(pos, dict):
+            entry_px = pos.get("entry_price") or pos.get("entryPrice")
+        side = getattr(pos, "side", "")
+        if not side and isinstance(pos, dict):
+            side = pos.get("side")
+
+        if entry_px is None:
+            await message.reply_text("No se pudo determinar el precio de entrada de la posición actual.")
+            return
+
+        try:
+            entry_px = float(entry_px)
+        except (TypeError, ValueError):
+            await message.reply_text("No se pudo interpretar el precio de entrada de la posición actual.")
+            return
+
+        m_sl_abs = re.match(r"^(?:/?sl)\s*\$?\s*(\d+(?:\.\d+)?)\s*$", text_raw, re.IGNORECASE)
+        m_sl_pct = re.match(r"^(?:/?sl)\s*([+\-]?)(\d+(?:\.\d+)?)%?\s*$", text_raw, re.IGNORECASE)
+
+        new_sl_price: Optional[float] = None
+
+        if m_sl_abs:
+            new_sl_price = float(m_sl_abs.group(1))
+        elif m_sl_pct:
+            pct_val = float(m_sl_pct.group(2)) / 100.0
+            pct_val = abs(pct_val)
+
+            if str(side).upper() == "LONG":
+                new_sl_price = entry_px * (1.0 - pct_val)
+            else:
+                new_sl_price = entry_px * (1.0 + pct_val)
+
+        if new_sl_price is not None:
+            try:
+                new_sl_price = float(new_sl_price)
+            except (TypeError, ValueError):
+                new_sl_price = None
+
+        if new_sl_price is not None:
             update_sl = getattr(service, "update_stop_loss", None)
+            updated = False
             if callable(update_sl):
                 try:
-                    update_sl(px)
+                    update_sl(new_sl_price)
                     updated = True
                 except TypeError:
                     try:
-                        update_sl(symbol_conf, px)
+                        update_sl(app.config.get("symbol"), new_sl_price)
                         updated = True
                     except Exception:
-                        logger.debug("update_stop_loss falló con firma alternativa", exc_info=True)
+                        logger.debug("sl_command: update_stop_loss falló con firma alternativa", exc_info=True)
                 except Exception:
-                    logger.debug("update_stop_loss falló", exc_info=True)
-        if not updated and getattr(app, "exchange", None) is not None:
-            try:
-                pos = await app.exchange.get_open_position(app.config.get("symbol"))
-            except Exception:
-                pos = None
-            if pos:
-                await app.exchange.update_protections(
-                    symbol=app.config.get("symbol"),
-                    side=pos.get("side"),
-                    qty=float(pos.get("contracts") or pos.get("positionAmt") or 0.0),
-                    sl=px,
+                    logger.debug("sl_command: update_stop_loss falló", exc_info=True)
+            if updated:
+                await reply_markdown_safe(
+                    message,
+                    f"✅ SL de la posición LIVE actualizado a: **{new_sl_price:,.2f}**",
                 )
-                updated = True
-        if updated:
-            await message.reply_text(f"✅ SL de la posición actualizado a {_num(px)}")
-        else:
+                return
             await message.reply_text("No se pudo actualizar el SL de la posición.")
+            return
+
+        await message.reply_text(
+            "Formato inválido. Usá `sl 6` (pct) o `sl $104500` (precio), o solo `sl` para consultar."
+        )
         return
 
-    # Si no es precio fijo (y hay posición), no hacemos nada más, evitando el router de defaults.
-    # Si queremos setear un % de riesgo, el usuario debe usar /ajustar o usar sl sin posición.
+    await _handle_position_controls(
+        None,
+        lambda txt: reply_markdown_safe(message, txt),
+        text_raw,
+    )
 
 
 async def tp_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3806,9 +3812,9 @@ async def start_telegram_bot(app, config):
             j = application.job_queue
             tz = _tz()
             j.run_daily(lambda c: notifier.app.create_task(_report_periodic(notifier, days=1)),
-                         time=dtime(hour=7, minute=0, tzinfo=tz), name="daily_report")
+                         time=dtime(hour=10, minute=0, tzinfo=tz), name="daily_report")
             j.run_daily(lambda c: notifier.app.create_task(_report_periodic(notifier, days=7)),
-                         time=dtime(hour=7, minute=1, tzinfo=tz), days=(6,), name="weekly_report")
+                         time=dtime(hour=11, minute=0, tzinfo=tz), days=(0,), name="weekly_report")
             logger.info("Reportes diarios/semanales programados en telegram_bot")
             setattr(application, "_chaulet_reports_scheduled", True)
         except Exception as e:
