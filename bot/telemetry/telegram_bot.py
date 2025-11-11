@@ -380,8 +380,9 @@ def render_status(snapshot: Dict[str, Any]) -> str:
 
 async def _resolve_equity_usdt(exchange: Any) -> float:
     """
-    Obtiene equity USDT en REAL desde Futures (USD-M), soportando tu wrapper Exchange.
-    Retorna 0.0 si no puede leer nada.
+    Lee equity USDT en modo REAL desde Binance USDM (Futures), soportando tu wrapper Exchange
+    (donde fetch_balance_usdt puede ser async) y el cliente CCXT real.
+    Retorna 0.0 si no puede leer.
     """
 
     mode = (runtime_get_mode() or "paper").lower()
@@ -394,14 +395,12 @@ async def _resolve_equity_usdt(exchange: Any) -> float:
     if not exchange:
         return 0.0
 
-    import asyncio, math
+    import asyncio
 
     def _extract_usdt(balance: dict) -> float:
-        # 1) totalWalletBalance directo o dentro de info
-        twb = (
-            (balance.get("totalWalletBalance")
-             or balance.get("info", {}).get("totalWalletBalance"))
-        )
+        # 1) totalWalletBalance (root o dentro de info)
+        twb = (balance.get("totalWalletBalance")
+               or balance.get("info", {}).get("totalWalletBalance"))
         if twb is not None:
             try:
                 v = float(twb)
@@ -410,9 +409,9 @@ async def _resolve_equity_usdt(exchange: Any) -> float:
             except Exception:
                 pass
 
-        # 2) assets[].walletBalance para USDT (respuesta cruda de Binance Futures)
+        # 2) info.assets[].walletBalance (formato crudo de Binance Futures)
         try:
-            for a in balance.get("info", {}).get("assets", []) or []:
+            for a in (balance.get("info", {}).get("assets", []) or []):
                 if str(a.get("asset")) == "USDT":
                     wb = a.get("walletBalance") or a.get("crossWalletBalance") or "0"
                     v = float(wb)
@@ -431,45 +430,68 @@ async def _resolve_equity_usdt(exchange: Any) -> float:
 
         return 0.0
 
-    # --- 1) Si tu wrapper tiene el método, úsalo:
+    # --- 1) Tu wrapper: fetch_balance_usdt puede ser async o sync
     if hasattr(exchange, "fetch_balance_usdt"):
         try:
-            # Llamamos sin argumentos adicionales para evitar incompatibilidades.
-            maybe_balance = await asyncio.to_thread(exchange.fetch_balance_usdt)
-            # el wrapper puede devolver ya un float o un dict
+            fn = exchange.fetch_balance_usdt  # puede ser coroutinefunction
+
+            # Llamado robusto: si es coroutine -> await; si es sync -> to_thread
+            if inspect.iscoroutinefunction(fn):
+                try:
+                    maybe_balance = await fn("future")
+                except TypeError:
+                    maybe_balance = await fn()
+            else:
+                try:
+                    maybe_balance = await asyncio.to_thread(fn, "future")
+                except TypeError:
+                    maybe_balance = await asyncio.to_thread(fn)
+
+            # Por si el wrapper devuelve una coroutine en vez del resultado:
+            if inspect.iscoroutine(maybe_balance):
+                maybe_balance = await maybe_balance
+
             if isinstance(maybe_balance, (int, float)):
-                return float(maybe_balance)
+                v = float(maybe_balance)
+                return v if math.isfinite(v) else 0.0
             if isinstance(maybe_balance, dict):
                 v = _extract_usdt(maybe_balance)
-                if v > 0:
+                if v >= 0:
                     return v
         except Exception:
             logger.error("Wrapper.fetch_balance_usdt falló.", exc_info=True)
 
-    # --- 2) Si el wrapper expone el CCXT real:
+    # --- 2) Cliente CCXT dentro del wrapper (ccxt o _ccxt)
     ccxt_client = getattr(exchange, "ccxt", None) or getattr(exchange, "_ccxt", None)
     if ccxt_client and hasattr(ccxt_client, "fetch_balance"):
         try:
             bal = await asyncio.to_thread(ccxt_client.fetch_balance, {"type": "future"})
-            return _extract_usdt(bal)
+            v = _extract_usdt(bal)
+            if v >= 0:
+                return v
         except Exception:
-            # intento sin parámetro por si el default ya es future
             try:
                 bal = await asyncio.to_thread(ccxt_client.fetch_balance)
-                return _extract_usdt(bal)
+                v = _extract_usdt(bal)
+                if v >= 0:
+                    return v
             except Exception:
                 logger.error("ccxt.fetch_balance falló.", exc_info=True)
 
-    # --- 3) Último intento: algunos wrappers guardan el cliente en `client`
+    # --- 3) Algunos wrappers exponen el cliente como .client
     client = getattr(exchange, "client", None)
     if client and hasattr(client, "fetch_balance"):
         try:
             bal = await asyncio.to_thread(client.fetch_balance, {"type": "future"})
-            return _extract_usdt(bal)
+            v = _extract_usdt(bal)
+            if v >= 0:
+                return v
         except Exception:
             try:
                 bal = await asyncio.to_thread(client.fetch_balance)
-                return _extract_usdt(bal)
+                v = _extract_usdt(bal)
+                if v >= 0:
+                    return v
             except Exception:
                 logger.error("client.fetch_balance falló.", exc_info=True)
 
