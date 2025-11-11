@@ -917,6 +917,11 @@ async def posiciones_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         side = str(merged.get("side") or merged.get("positionSide") or "FLAT").upper()
         entry_px = _safe_float(merged.get("entryPrice") or merged.get("avgPrice"))
         mark_px = _safe_float(merged.get("markPrice") or merged.get("mark"))
+        leverage_raw = merged.get("leverage") or merged.get("isolatedLeverage")
+        leverage = _safe_float(leverage_raw) if leverage_raw not in (None, "") else 1.0
+        if leverage <= 0:
+            leverage = 1.0
+        leverage_disp = f"{leverage:g}"
         pnl = 0.0
         if entry_px > 0 and mark_px > 0:
             pnl = (mark_px - entry_px) * qty
@@ -924,12 +929,18 @@ async def posiciones_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 pnl = -pnl
         entry_txt = f"{entry_px:,.2f}" if entry_px > 0 else "—"
         mark_txt = f"{mark_px:,.2f}" if mark_px > 0 else "—"
+        sl_px = _safe_float(merged.get("stopLoss") or merged.get("slOrderPrice"))
+        tp_px = _safe_float(merged.get("takeProfit") or merged.get("tpOrderPrice"))
         symbol_disp = merged.get("symbol") or merged.get("pair") or sym_raw
+        protections_line = (
+            f"• SL: {_fmt_usd(sl_px)} | TP: {_fmt_usd(tp_px)}" if sl_px or tp_px else ""
+        )
         other_sections.append(
-            f"<b>{symbol_disp} {side}</b>\n"
+            f"<b>{symbol_disp} {side}</b> (x{leverage_disp})\n"
             f"• Qty: {qty:.6f}\n"
             f"• Entrada: {entry_txt} | Mark: {mark_txt}\n"
             f"• PnL: {pnl:+,.2f}"
+            + (f"\n{protections_line}" if protections_line else "")
         )
 
     if other_sections:
