@@ -1,4 +1,4 @@
-import asyncio, logging, hashlib
+import asyncio, logging, hashlib, inspect
 from dataclasses import dataclass
 from time import time as _t
 from typing import Any, Dict, List, Optional
@@ -146,14 +146,13 @@ class RealExchange:
         try:
             lev_int = int(float(lev))
             # Preferir la API de alto nivel de CCXT
-            return await asyncio.to_thread(self.client.set_leverage, lev_int, symbol)
+            return await self.client.set_leverage(lev_int, symbol)
         except Exception as e:
             # Fallback explícito al endpoint oficial si hiciera falta
             try:
                 m = self.client.market(symbol)  # m["id"] -> 'BTCUSDT'
-                return await asyncio.to_thread(
-                    self.client.fapiPrivatePostLeverage,
-                    {"symbol": m["id"], "leverage": lev_int},
+                return await self.client.fapiPrivatePostLeverage(
+                    {"symbol": m["id"], "leverage": lev_int}
                 )
             except Exception as ex:
                 self.log.warning("set_leverage(%s,%s) failed: %s / %s", symbol, lev_int, e, ex)
@@ -521,7 +520,10 @@ class RealExchange:
             if method is None:
                 return None
             try:
-                return await asyncio.to_thread(method, {"symbol": sym_clean})
+                result = method({"symbol": sym_clean})
+                if inspect.isawaitable(result):
+                    result = await result
+                return result
             except Exception:
                 return None
 
@@ -547,7 +549,7 @@ class RealExchange:
                     except Exception:
                         continue
 
-        ticker = await asyncio.to_thread(client.fetch_ticker, sym)
+        ticker = await self._place(client.fetch_ticker, sym)
         for key in ("last", "close", "bid", "ask"):
             value = ticker.get(key)
             if value is None:

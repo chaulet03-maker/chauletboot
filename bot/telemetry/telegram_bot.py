@@ -481,19 +481,12 @@ async def _resolve_equity_usdt(exchange: Any) -> float:
                 fn = exchange.fetch_balance_usdt  # puede ser coroutinefunction
 
                 # Llamado robusto: si es coroutine -> await; si es sync -> to_thread
-                if inspect.iscoroutinefunction(fn):
-                    try:
-                        maybe_balance = await fn("future")  # preferimos pasar tipo
-                    except TypeError:
-                        maybe_balance = await fn()
-                else:
-                    try:
-                        maybe_balance = await asyncio.to_thread(fn, "future")
-                    except TypeError:
-                        maybe_balance = await asyncio.to_thread(fn)
+                try:
+                    maybe_balance = fn("future")
+                except TypeError:
+                    maybe_balance = fn()
 
-                # Por si devuelve una coroutine:
-                if inspect.iscoroutine(maybe_balance):
+                if inspect.isawaitable(maybe_balance):
                     maybe_balance = await maybe_balance
 
                 if isinstance(maybe_balance, (int, float)):
@@ -512,7 +505,7 @@ async def _resolve_equity_usdt(exchange: Any) -> float:
         ccxt_client = getattr(exchange, "ccxt", None) or getattr(exchange, "_ccxt", None)
         if ccxt_client and hasattr(ccxt_client, "fetch_balance"):
             try:
-                bal = await asyncio.to_thread(ccxt_client.fetch_balance, {"type": "future"})
+                bal = await ccxt_client.fetch_balance({"type": "future"})
                 v = _extract_usdt(bal)
                 if v >= 0:
                     return v
@@ -520,7 +513,7 @@ async def _resolve_equity_usdt(exchange: Any) -> float:
                 await _handle_authentication_failure(exc)
             except Exception:
                 try:
-                    bal = await asyncio.to_thread(ccxt_client.fetch_balance)
+                    bal = await ccxt_client.fetch_balance()
                     v = _extract_usdt(bal)
                     if v >= 0:
                         return v
@@ -533,7 +526,7 @@ async def _resolve_equity_usdt(exchange: Any) -> float:
         client = getattr(exchange, "client", None)
         if client and hasattr(client, "fetch_balance"):
             try:
-                bal = await asyncio.to_thread(client.fetch_balance, {"type": "future"})
+                bal = await client.fetch_balance({"type": "future"})
                 v = _extract_usdt(bal)
                 if v >= 0:
                     return v
@@ -541,7 +534,7 @@ async def _resolve_equity_usdt(exchange: Any) -> float:
                 await _handle_authentication_failure(exc)
             except Exception:
                 try:
-                    bal = await asyncio.to_thread(client.fetch_balance)
+                    bal = await client.fetch_balance()
                     v = _extract_usdt(bal)
                     if v >= 0:
                         return v
