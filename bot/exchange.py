@@ -1136,5 +1136,47 @@ class Exchange:
             **order_kwargs,
         )
 
+        if not close_bot:
+            try:
+                trading_mod = _get_trading_module()
+                infer_fn = getattr(trading_mod, "_infer_fill_price", None)
+                entry_price = None
+                if callable(infer_fn):
+                    try:
+                        entry_price = infer_fn(order, None)
+                    except Exception:
+                        entry_price = None
+                if entry_price is not None and math.isfinite(entry_price):
+                    qty_val = float(quantity)
+                    if qty_val > 0:
+                        side_label = (
+                            "LONG" if str(side).upper() in {"BUY", "LONG"} else "SHORT"
+                        )
+                        try:
+                            from bot.telemetry import telegram_bot as tg_bot
+
+                            cur = tg_bot.sl_default_get()
+                            if cur["mode"] == "abs":
+                                sl_price_default = float(cur["value"])
+                            else:
+                                pct = float(cur["value"]) / 100.0
+                                sl_price_default = (
+                                    entry_price * (1 - pct)
+                                    if side_label == "LONG"
+                                    else entry_price * (1 + pct)
+                                )
+                            ok, msg = await tg_bot.trading_update_stop_loss(
+                                sl_price_default,
+                                side=side_label,
+                                qty=qty_val if side_label == "LONG" else -qty_val,
+                                symbol=symbol,
+                            )
+                            if not ok:
+                                logger.warning("No pude setear SL inicial: %s", msg)
+                        except Exception:
+                            logger.exception("Fallo al setear SL inicial")
+            except Exception:
+                logger.exception("Fallo al setear SL inicial")
+
         logger.info("Orden ejecutada vía broker seguro: %s", order)
         return order

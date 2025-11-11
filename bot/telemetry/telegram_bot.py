@@ -23,6 +23,19 @@ from telegram.error import BadRequest
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 from telegram.request import HTTPXRequest
 
+# Estado en memoria del SL por defecto
+_SL_DEFAULT = {"mode": "pct", "value": 10.0}  # -10% por defecto
+
+
+def sl_default_get():
+    return dict(_SL_DEFAULT)
+
+
+def sl_default_set(mode: str, value: float):
+    # mode ∈ {"pct", "abs"}
+    _SL_DEFAULT["mode"] = mode
+    _SL_DEFAULT["value"] = float(value)
+
 from logging_setup import LOG_DIR, LOG_FILE, LOG_RING
 from time_fmt import fmt_ar
 from config import S, MANUAL_OPEN_RISK_PCT
@@ -127,7 +140,7 @@ POSITION_TEXT_RE_PATTERN_SINGULAR = r"(?i)^(posicion|posición|position)$"
 POSITION_TEXT_RE_PATTERN_PLURAL = r"(?i)^(posiciones|posiciónes|positions)$"
 
 LOGS_TEXT_RE_PATTERN = r"(?i)^(logs?|ver\s+logs|log\s+tail)$"
-SL_TEXT_RE_PATTERN = r"(?i)^\s*sl\s+(\$?\s*[\d.,]+)\s*$"
+SL_TEXT_RE_PATTERN = r"(?i)^\s*sl(?:\s+(\$?\s*[\d.,]+))?\s*$"
 
 CLOSE_TEXT_RE = re.compile(CLOSE_TEXT_RE_PATTERN)
 OPEN_TEXT_RE = re.compile(OPEN_TEXT_RE_PATTERN)
@@ -2142,7 +2155,7 @@ def _bot_position_info(engine) -> Optional[dict[str, Any]]:
 async def _handle_position_controls(engine, reply_md, text: str) -> bool:
     """
     Solo maneja seteo/consulta de *defaults* de SL/TP cuando NO hay posición del BOT.
-    Si hay posición abierta, devolvemos False y dejan trabajar a sl_command/tp_command.
+    Si hay posición abierta, devolvemos False y dejan trabajar a cmd_sl/tp_command.
     """
     if not text:
         return False
@@ -2504,7 +2517,7 @@ async def _active_position_for_sl(engine) -> Optional[dict[str, Any]]:
             try:
                 status = get_status() or {}
             except Exception:
-                logger.debug("sl_command: fallo al obtener estado del PositionService", exc_info=True)
+                logger.debug("cmd_sl: fallo al obtener estado del PositionService", exc_info=True)
                 status = {}
             side = str(status.get("side", "FLAT")).upper()
             try:
@@ -2530,7 +2543,7 @@ async def _active_position_for_sl(engine) -> Optional[dict[str, Any]]:
         try:
             pos_data = await exchange.get_open_position(symbol_conf)
         except Exception:
-            logger.debug("sl_command: get_open_position falló", exc_info=True)
+            logger.debug("cmd_sl: get_open_position falló", exc_info=True)
             pos_data = None
         if isinstance(pos_data, dict) and pos_data:
             side = str(pos_data.get("side") or "").upper()
@@ -2556,41 +2569,113 @@ async def _active_position_for_sl(engine) -> Optional[dict[str, Any]]:
     return None
 
 
-async def sl_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def trading_update_stop_loss(
+    sl_price: float,
+    *,
+    side: Optional[str] = None,
+    qty: Optional[float] = None,
+    symbol: Optional[str] = None,
+) -> Tuple[bool, Optional[str]]:
+    updated = False
+    error_msg: Optional[str] = None
+
+    service = getattr(trading, "POSITION_SERVICE", None)
+    if service is not None:
+        update_sl = getattr(service, "update_stop_loss", None)
+        if callable(update_sl):
+            try:
+                if symbol is not None:
+                    try:
+                        update_sl(symbol, sl_price)
+                        updated = True
+                    except TypeError:
+                        update_sl(sl_price)
+                        updated = True
+                else:
+                    update_sl(sl_price)
+                    updated = True
+            except Exception:
+                logger.debug(
+                    "trading_update_stop_loss: update_stop_loss falló",
+                    exc_info=True,
+                )
+
+    if updated:
+        return True, None
+
+    broker = getattr(trading, "BROKER", None)
+    if broker is not None and hasattr(broker, "update_protections"):
+        try:
+            target_symbol = symbol or getattr(S, "symbol", None) or "BTC/USDT"
+        except Exception:
+            target_symbol = "BTC/USDT"
+        try:
+            payload = broker.update_protections(
+                symbol=target_symbol,
+                side=side or ("LONG" if (qty or 0.0) >= 0 else "SHORT"),
+                qty=abs(float(qty)) if qty is not None else 0.0,
+                sl=float(sl_price),
+            )
+            if inspect.isawaitable(payload):
+                payload = await payload
+            if isinstance(payload, dict):
+                ok = bool(payload.get("ok", True))
+                if not ok:
+                    return False, str(payload.get("reason") or "error")
+            return True, None
+        except Exception as exc:
+            logger.debug(
+                "trading_update_stop_loss: update_protections falló",
+                exc_info=True,
+            )
+            error_msg = str(exc)
+
+    return False, error_msg or "error"
+
+
+async def cmd_sl(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    sl               -> muestra el SL por defecto actual
+    sl 7             -> setea SL por defecto: -7%
+    sl $10400        -> setea SL por defecto: precio absoluto 10400
+    Si hay posición abierta, además intenta actualizar el SL de ESA posición.
+    """
+
     engine = _get_app_from_context(context)
     message = update.effective_message
-    if engine is None or message is None:
+    if message is None:
         return
 
-    engine_cfg = getattr(engine, "config", None)
-    default_symbol = "BTC/USDT"
-    if isinstance(engine_cfg, dict):
-        default_symbol = engine_cfg.get("symbol", default_symbol)
+    async def tg_reply(text: str):
+        return await reply_markdown_safe(message, text)
 
-    text_raw = (message.text or "").strip()
-    arg = (context.args[0] if context.args else "").strip()
+    raw = (context.args[0] if context.args else "").strip()
+    if not raw:
+        cur = sl_default_get()
+        if cur["mode"] == "pct":
+            return await tg_reply(f"SL por defecto: -{cur['value']:.2f}%")
+        return await tg_reply(f"SL por defecto: ${cur['value']:.2f}")
 
-    if not arg:
-        handled = await _handle_position_controls(
-            engine,
-            lambda txt: reply_markdown_safe(message, txt),
-            text_raw,
-        )
-        if not handled:
-            await reply_markdown_safe(message, "Usá: sl 7   o   sl $10400")
-        return
-
-    raw = arg.replace(" ", "").replace(",", ".")
+    raw = raw.replace(" ", "").replace(",", ".")
     is_abs = raw.startswith("$")
     try:
-        value = float(raw[1:] if is_abs else raw)
+        val = float(raw[1:] if is_abs else raw)
     except Exception:
-        await reply_markdown_safe(message, "Formato inválido. Ej: sl 7  ó  sl $10400")
-        return
+        return await tg_reply("Formato inválido. Usá: sl 7  o  sl $10400")
 
-    pos = await _active_position_for_sl(engine)
+    if is_abs:
+        sl_default_set("abs", val)
+        await tg_reply(f"✅ SL por defecto seteado en ${val:.2f}")
+    else:
+        sl_default_set("pct", val)
+        await tg_reply(f"✅ SL por defecto seteado en -{val:.2f}%")
+
+    try:
+        pos = await _active_position_for_sl(engine)
+    except Exception:
+        pos = None
+
     if not pos:
-        await reply_markdown_safe(message, "No hay posición abierta para setear SL.")
         return
 
     try:
@@ -2602,105 +2687,45 @@ async def sl_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         amt = 0.0
 
+    if entry <= 0 or amt == 0:
+        return await tg_reply(
+            "⚠️ SL por defecto guardado, no pude actualizar el actual: posición inválida"
+        )
+
     side = "LONG" if amt > 0 else "SHORT"
 
-    if entry <= 0 or abs(amt) <= 0:
-        await reply_markdown_safe(
-            message,
-            "No se pudo determinar el precio o tamaño de la posición actual.",
-        )
-        return
-
-    if is_abs:
-        sl_price = value
+    if _SL_DEFAULT["mode"] == "abs":
+        sl_price = _SL_DEFAULT["value"]
     else:
-        pct = value / 100.0
-        if side == "LONG":
-            sl_price = entry * (1 - pct)
-        else:
-            sl_price = entry * (1 + pct)
+        pct = _SL_DEFAULT["value"] / 100.0
+        sl_price = entry * (1 - pct) if side == "LONG" else entry * (1 + pct)
 
-    updated = False
-    error_msg: Optional[str] = None
-    service = getattr(trading, "POSITION_SERVICE", None)
-    if service is not None:
-        update_sl = getattr(service, "update_stop_loss", None)
-        if callable(update_sl):
-            try:
-                update_sl(sl_price)
-                updated = True
-            except TypeError:
-                try:
-                    update_sl(pos.get("symbol"), sl_price)
-                    updated = True
-                except Exception:
-                    logger.debug(
-                        "sl_command: update_stop_loss falló con firma alternativa",
-                        exc_info=True,
-                    )
-            except Exception:
-                logger.debug("sl_command: update_stop_loss falló", exc_info=True)
-
-    exchange = getattr(engine, "exchange", None)
-    if not updated and exchange is not None and hasattr(exchange, "update_protections"):
-        try:
-            symbol = pos.get("symbol") or default_symbol
-            result = await exchange.update_protections(
-                symbol=symbol or "BTC/USDT",
-                side=side,
-                qty=abs(float(amt)),
-                sl=float(sl_price),
-            )
-            if isinstance(result, dict):
-                updated = bool(result.get("ok", True))
-                if not updated:
-                    error_msg = str(result.get("reason") or "error")
-            else:
-                updated = True
-        except Exception as exc:
-            error_msg = str(exc)
-            logger.debug("sl_command: update_protections falló", exc_info=True)
-
-    if not updated:
-        await reply_markdown_safe(
-            message,
-            f"❌ No pude actualizar SL: {error_msg or 'error'}",
-        )
-        return
-
-    pct_label = "abs" if is_abs else f"-{value:.2f}%"
-    await reply_markdown_safe(
-        message,
-        f"✅ SL seteado en {_num(sl_price)} ({pct_label}; {side})",
+    ok, msg = await trading_update_stop_loss(
+        sl_price,
+        side=side,
+        qty=float(amt),
+        symbol=pos.get("symbol"),
     )
+    if ok:
+        await tg_reply(f"🛡️ SL actualizado ahora en {sl_price:.2f} ({side})")
+    else:
+        await tg_reply(
+            f"⚠️ SL por defecto guardado, pero no pude actualizar el actual: {msg or 'error'}"
+        )
 
 
 async def cmd_sl_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Permite "sl 5", "sl 7", "sl $10400" SIN barra.
-    Reusa el handler /sl pasando args normalizados.
-    """
-
-    message = update.effective_message
-    if message is None:
+    text = (update.message.text or "").strip() if update.message else ""
+    m = re.match(SL_TEXT_RE_PATTERN, text)
+    if not m:
         return
-
-    text = (message.text or "").strip()
-    match = re.match(SL_TEXT_RE_PATTERN, text)
-    if not match:
-        return
-
-    raw = match.group(1).strip().replace(" ", "")
-    raw = raw.replace(",", ".")
-
-    if raw.startswith("$"):
-        args = [f"${raw[1:]}"]
+    arg = (m.group(1) or "").strip()
+    if arg:
+        arg = arg.replace(" ", "").replace(",", ".")
+        context.args = [arg]
     else:
-        args = [raw]
-
-    setattr(context, "args", args)
-
-    return await sl_command(update, context)
+        context.args = []
+    return await cmd_sl(update, context)
 
 
 async def tp_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3439,7 +3464,7 @@ def _populate_registry() -> None:
     )
     REGISTRY.register(
         "sl",
-        sl_command,
+        cmd_sl,
         aliases=["stop", "stoploss"],
         help_text="Ver o setear SL como % del equity o precio fijo. Ej: `sl 10` o `sl $108000`.",
     )
