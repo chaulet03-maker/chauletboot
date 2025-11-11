@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import tempfile
 import time
@@ -8,9 +9,15 @@ import uuid
 from dataclasses import asdict, dataclass
 from typing import Any, Dict, Optional
 
+from bot.async_state_store import AsyncRedisStateStore
 from bot.runtime_state import get_mode as runtime_get_mode
 
 STATE_PATH = os.getenv("BOT_STATE_PATH", "./state.json")
+REDIS_STATE_KEY = os.getenv("BOT_STATE_REDIS_KEY", "bot:state:v1")
+
+logger = logging.getLogger(__name__)
+
+_ASYNC_STORE: Optional[AsyncRedisStateStore] = None
 
 
 @dataclass
@@ -57,16 +64,71 @@ def _atomic_write(path: str, data: bytes) -> None:
             pass
 
 
-def load_state() -> Dict[str, Any]:
+def configure_async_state_store(
+    store: Optional[AsyncRedisStateStore], *, redis_key: Optional[str] = None
+) -> None:
+    """Configura la tienda de estado asíncrona respaldada por Redis."""
+
+    global _ASYNC_STORE, REDIS_STATE_KEY
+    if redis_key:
+        REDIS_STATE_KEY = str(redis_key)
+    _ASYNC_STORE = store
+
+
+def _load_state_from_disk() -> Dict[str, Any]:
     if not os.path.exists(STATE_PATH):
         return {"open_positions": {}, "closed_positions": []}
     with open(STATE_PATH, "rb") as handle:
         return json.loads(handle.read().decode("utf-8"))
 
 
-def save_state(state: Dict[str, Any]) -> None:
+def _save_state_to_disk(state: Dict[str, Any]) -> None:
     payload = json.dumps(state, ensure_ascii=False, separators=(",", ":"))
     _atomic_write(STATE_PATH, payload.encode("utf-8"))
+
+
+async def async_load_state() -> Dict[str, Any]:
+    store = _ASYNC_STORE
+    if store and store.is_connected:
+        try:
+            data = await store.load_state(REDIS_STATE_KEY)
+            if isinstance(data, dict) and data:
+                return data
+        except Exception:
+            logger.debug("No se pudo leer estado desde Redis (async).", exc_info=True)
+    return _load_state_from_disk()
+
+
+async def async_save_state(state: Dict[str, Any]) -> None:
+    store = _ASYNC_STORE
+    if store and store.is_connected:
+        try:
+            await store.save_state(REDIS_STATE_KEY, state)
+        except Exception:
+            logger.debug("No se pudo guardar estado en Redis (async).", exc_info=True)
+    _save_state_to_disk(state)
+
+
+def load_state() -> Dict[str, Any]:
+    store = _ASYNC_STORE
+    if store and store.is_connected:
+        try:
+            data = store.load_state_sync(REDIS_STATE_KEY)
+            if isinstance(data, dict) and data:
+                return data
+        except Exception:
+            logger.debug("No se pudo leer estado desde Redis.", exc_info=True)
+    return _load_state_from_disk()
+
+
+def save_state(state: Dict[str, Any]) -> None:
+    store = _ASYNC_STORE
+    if store and store.is_connected:
+        try:
+            store.save_state_sync(REDIS_STATE_KEY, state)
+        except Exception:
+            logger.debug("No se pudo guardar estado en Redis.", exc_info=True)
+    _save_state_to_disk(state)
 
 
 def create_position(
@@ -318,6 +380,10 @@ def position_status(symbol: str, mode: str) -> str:
 __all__ = [
     "Position",
     "STATE_PATH",
+    "REDIS_STATE_KEY",
+    "configure_async_state_store",
+    "async_load_state",
+    "async_save_state",
     "load_state",
     "save_state",
     "create_position",

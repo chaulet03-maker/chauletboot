@@ -25,9 +25,12 @@ from config import load_raw_config, get_telegram_token, get_telegram_chat_id
 from bot.engine import TradingApp
 from bot.mode_manager import ensure_startup_mode
 from paths import get_data_dir
+from bot.async_state_store import AsyncRedisStateStore
+from state_store import configure_async_state_store
 
 
 LOCK_PATH = Path("/tmp/chauletbot.lock")
+_STATE_STORE_INSTANCE: AsyncRedisStateStore | None = None
 
 
 def _read_lock_pid(lock_path: Path) -> int | None:
@@ -119,6 +122,58 @@ def _acquire_single_instance_lock() -> None:
             logging.exception("No se pudo eliminar el archivo de lock al finalizar")
 
 
+def _setup_state_store(cfg: dict) -> None:
+    global _STATE_STORE_INSTANCE
+
+    cfg_state_store = cfg.get("state_store") if isinstance(cfg, dict) else {}
+    cfg_state_store = cfg_state_store if isinstance(cfg_state_store, dict) else {}
+
+    redis_url = os.getenv("REDIS_URL") or str(cfg_state_store.get("redis_url") or "").strip()
+    redis_key = os.getenv("BOT_STATE_REDIS_KEY") or cfg_state_store.get("redis_key") or None
+
+    if not redis_url and not os.getenv("REDIS_HOST"):
+        configure_async_state_store(None)
+        return
+
+    try:
+        if redis_url:
+            store = AsyncRedisStateStore(url=redis_url)
+        else:
+            host = os.getenv("REDIS_HOST", "localhost")
+            port = int(os.getenv("REDIS_PORT", "6379"))
+            db = int(os.getenv("REDIS_DB", "0"))
+            password = os.getenv("REDIS_PASSWORD") or None
+            store = AsyncRedisStateStore(
+                host=host,
+                port=port,
+                db=db,
+                password=password,
+            )
+        store.connect_sync(timeout=5.0)
+    except Exception:
+        logging.exception(
+            "No se pudo inicializar la persistencia Redis; se usará almacenamiento local."
+        )
+        configure_async_state_store(None)
+        return
+
+    _STATE_STORE_INSTANCE = store
+    if redis_url:
+        redis_target = redis_url
+    else:
+        redis_target = f"{host}:{port}/{db}"
+    configure_async_state_store(store, redis_key=redis_key)
+    logging.info("Persistencia de estado habilitada con Redis (%s)", redis_target)
+
+    def _close_store() -> None:
+        try:
+            store.close_sync()
+        except Exception:
+            logging.debug("No se pudo cerrar la conexión Redis limpiamente.", exc_info=True)
+
+    atexit.register(_close_store)
+
+
 def main(argv: list[str] | None = None):
     # --- SINGLE INSTANCE LOCK ---
     _acquire_single_instance_lock()
@@ -152,6 +207,8 @@ def main(argv: list[str] | None = None):
         persisted,
     )
     logging.info("DATA_DIR=%s", get_data_dir())
+
+    _setup_state_store(cfg)
 
     app = TradingApp(cfg, mode_source=mode_source)
 

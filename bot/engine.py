@@ -236,6 +236,7 @@ class TradingApp:
         self.symbols = [self.config.get('symbol', 'BTC/USDT')]
         self.price_cache = {}
         self._funding_series = None
+        self._last_funding_alert_at = 0.0
         self._daily_R: dict = {}
         self._risk_usd_trade = 0.0
         self._eq_on_open = 0.0
@@ -1824,6 +1825,22 @@ class TradingApp:
     async def fetch_last_price(self, symbol: str):
         return await self.exchange.get_current_price(symbol)
 
+    def _funding_alert_interval_seconds(self) -> int:
+        try:
+            minutes = float(self.config.get("funding_alert_interval_minutes", 240))
+        except Exception:
+            minutes = 240.0
+        if minutes <= 0:
+            return 0
+        return max(int(minutes * 60.0), 60)
+
+    def _funding_alert_threshold(self) -> float:
+        try:
+            threshold = float(self.config.get("funding_alert_threshold", 0.001) or 0.0)
+        except Exception:
+            threshold = 0.0
+        return max(threshold, 0.0)
+
     async def _update_price_cache_job(self, context):
         try:
             symbols = self.symbols or [self.config.get('symbol', 'BTC/USDT')]
@@ -1854,6 +1871,75 @@ class TradingApp:
                     )
         except Exception as e:
             logging.warning(f"No pude actualizar la cache de precios: {e}")
+
+    async def _funding_rate_alert_job(self, context):
+        if getattr(self, "notifier", None) is None:
+            return
+        threshold = self._funding_alert_threshold()
+        if threshold <= 0:
+            return
+
+        getter = getattr(self.exchange, "fetch_current_funding_rate", None)
+        if getter is None:
+            return
+
+        symbol = str(
+            self.config.get("funding_alert_symbol")
+            or self.config.get("symbol")
+            or "BTC/USDT"
+        )
+
+        try:
+            if inspect.iscoroutinefunction(getter):
+                try:
+                    rate_value = await getter(symbol)
+                except TypeError:
+                    rate_value = await getter()
+            else:
+                try:
+                    rate_value = await asyncio.to_thread(getter, symbol)
+                except TypeError:
+                    rate_value = await asyncio.to_thread(getter)
+            if inspect.isawaitable(rate_value):
+                rate_value = await rate_value
+            rate = float(rate_value)
+        except Exception as exc:
+            self.logger.warning("Error al verificar la tasa de fondeo: %s", exc)
+            return
+
+        if not math.isfinite(rate) or abs(rate) < threshold:
+            return
+
+        now = time.time()
+        try:
+            cooldown_minutes = float(
+                self.config.get("funding_alert_cooldown_minutes", 240) or 0.0
+            )
+        except Exception:
+            cooldown_minutes = 240.0
+        cooldown_seconds = max(cooldown_minutes * 60.0, 0.0)
+        if cooldown_seconds > 0 and (now - self._last_funding_alert_at) < cooldown_seconds:
+            return
+
+        self._last_funding_alert_at = now
+        rate_pct = rate * 100.0
+        direction = "positiva" if rate >= 0 else "negativa"
+        message = (
+            "⚠️ <b>ALERTA DE FONDEO</b>\n"
+            f"Símbolo: <code>{symbol}</code>\n"
+            f"Tasa {direction}: <b>{rate_pct:.3f}%</b>\n"
+            "Revisá costos antes del próximo cobro."
+        )
+
+        try:
+            await self.notifier.send(message, disable_preview=True)
+            self.logger.info(
+                "Alerta de fondeo enviada para %s: %.6f", symbol, rate
+            )
+        except Exception:
+            self.logger.warning(
+                "No se pudo enviar alerta de fondeo por Telegram.", exc_info=True
+            )
 
     def has_open_position(self) -> bool:
         """Indica si el estado local del bot registra una posición abierta."""
@@ -2201,6 +2287,17 @@ class TradingApp:
                 kwargs={"context": None},
                 next_run_time=start_time + timedelta(seconds=5),
             )
+            funding_interval = self._funding_alert_interval_seconds()
+            if funding_interval > 0:
+                scheduler.add_job(
+                    self._funding_rate_alert_job,
+                    "interval",
+                    seconds=funding_interval,
+                    id="funding_rate_alert",
+                    replace_existing=True,
+                    kwargs={"context": None},
+                    next_run_time=start_time + timedelta(seconds=15),
+                )
         except Exception:
             self.logger.exception("No se pudieron registrar jobs en AsyncIOScheduler")
             try:
@@ -2220,6 +2317,14 @@ class TradingApp:
             job_queue = self.telegram_app.job_queue
             job_queue.run_repeating(self._update_price_cache_job, interval=20, first=1)
             job_queue.run_repeating(self.trading_loop, interval=60, first=5)
+            funding_interval = self._funding_alert_interval_seconds()
+            if funding_interval > 0:
+                job_queue.run_repeating(
+                    self._funding_rate_alert_job,
+                    interval=funding_interval,
+                    first=15,
+                    name="funding_rate_alert",
+                )
         else:
             logging.info(
                 "Telegram deshabilitado; iniciando planificador interno basado en asyncio."
