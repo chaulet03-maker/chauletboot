@@ -41,7 +41,7 @@ from bot.runtime_state import (
 from bot.settings_utils import get_val, read_config_raw
 from bot.telemetry.command_registry import CommandRegistry, normalize
 from bot.telemetry.formatter import open_msg
-from state_store import load_state, update_open_position
+from state_store import load_state_sync, update_open_position
 from bot.telemetry.notifier import notify
 from ccxt.base.errors import AuthenticationError
 import trading
@@ -1130,7 +1130,7 @@ def _build_bot_position_message(*, engine, symbol, qty, avg, mark_val) -> str:
     pos_state = None
 
     try:
-        st = load_state() or {}
+        st = load_state_sync() or {}
         sym_key1 = str(symbol).replace("/", "")
         sym_key2 = str(symbol)
         open_positions = st.get("open_positions", {}) or {}

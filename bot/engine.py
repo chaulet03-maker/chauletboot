@@ -32,7 +32,13 @@ from bot.health.endpoint import attach_to_application
 from brokers import ACTIVE_LIVE_CLIENT
 from bot.identity import get_bot_id, make_client_oid
 from bot.ledger import bot_position, prune_open_older_than, init as ledger_init
-from state_store import create_position, load_state, persist_open, save_state
+from state_store import (
+    create_position,
+    load_state,
+    load_state_sync,
+    persist_open,
+    save_state_sync,
+)
 from bot.motives import MOTIVES, MotiveItem, compute_codes
 from core.strategy import Strategy
 from core.indicators import add_indicators
@@ -2069,10 +2075,10 @@ class TradingApp:
                 except Exception:
                     self.logger.debug("No se pudo limpiar store al sincronizar.", exc_info=True)
             try:
-                state = load_state()
+                state = load_state_sync()
                 open_positions = state.get("open_positions", {})
                 if open_positions.pop(symbol, None) is not None:
-                    save_state(state)
+                    save_state_sync(state)
             except Exception:
                 self.logger.debug("No se pudo limpiar state_store al sincronizar.", exc_info=True)
             try:
@@ -2100,10 +2106,10 @@ class TradingApp:
             except Exception:
                 self.logger.debug("No se pudo limpiar store al sincronizar.", exc_info=True)
             try:
-                state = load_state()
+                state = load_state_sync()
                 open_positions = state.get("open_positions", {})
                 if open_positions.pop(sym, None) is not None:
-                    save_state(state)
+                    save_state_sync(state)
             except Exception:
                 self.logger.debug("No se pudo limpiar state_store al sincronizar.", exc_info=True)
             try:
@@ -2456,7 +2462,7 @@ class TradingApp:
                         return dict(entry)
                 return None
 
-            state_before = load_state()
+            state_before = await load_state()
             snapshot_before = _find_open_snapshot(state_before)
             sl_before: Optional[float] = None
             tp_before: Optional[float] = None
@@ -2560,7 +2566,7 @@ class TradingApp:
             if bal_before is not None and bal_after is not None:
                 pnl_real = float(bal_after) - float(bal_before)
 
-            state_after = load_state()
+            state_after = await load_state()
             closed_snapshot = _latest_closed(state_after)
 
             summary = dict(summary_base)
