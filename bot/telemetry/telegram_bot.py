@@ -127,6 +127,7 @@ POSITION_TEXT_RE_PATTERN_SINGULAR = r"(?i)^(posicion|posición|position)$"
 POSITION_TEXT_RE_PATTERN_PLURAL = r"(?i)^(posiciones|posiciónes|positions)$"
 
 LOGS_TEXT_RE_PATTERN = r"(?i)^(logs?|ver\s+logs|log\s+tail)$"
+SL_TEXT_RE_PATTERN = r"(?i)^\s*sl\s+(\$?\s*[\d.,]+)\s*$"
 
 CLOSE_TEXT_RE = re.compile(CLOSE_TEXT_RE_PATTERN)
 OPEN_TEXT_RE = re.compile(OPEN_TEXT_RE_PATTERN)
@@ -2486,119 +2487,220 @@ async def control_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await message.reply_text("ℹ️ No encontré posición LIVE en el exchange.")
 
 
+async def _active_position_for_sl(engine) -> Optional[dict[str, Any]]:
+    symbol_conf = "BTC/USDT"
+    if engine is not None:
+        try:
+            cfg = getattr(engine, "config", None) or {}
+            if isinstance(cfg, dict):
+                symbol_conf = cfg.get("symbol", symbol_conf)
+        except Exception:
+            symbol_conf = "BTC/USDT"
+
+    service = getattr(trading, "POSITION_SERVICE", None)
+    if service is not None:
+        get_status = getattr(service, "get_status", None)
+        if callable(get_status):
+            try:
+                status = get_status() or {}
+            except Exception:
+                logger.debug("sl_command: fallo al obtener estado del PositionService", exc_info=True)
+                status = {}
+            side = str(status.get("side", "FLAT")).upper()
+            try:
+                qty_val = float(status.get("qty") or status.get("pos_qty") or 0.0)
+            except Exception:
+                qty_val = 0.0
+            try:
+                entry_val = float(status.get("entry_price") or status.get("avg_price") or 0.0)
+            except Exception:
+                entry_val = 0.0
+            symbol_val = status.get("symbol") or symbol_conf
+            if side in {"LONG", "SHORT"} and abs(qty_val) > 0 and entry_val > 0:
+                signed_amt = qty_val if side == "LONG" else -abs(qty_val)
+                return {
+                    "symbol": symbol_val,
+                    "side": side,
+                    "entryPrice": entry_val,
+                    "positionAmt": signed_amt,
+                }
+
+    exchange = getattr(engine, "exchange", None) if engine is not None else None
+    if exchange is not None and hasattr(exchange, "get_open_position"):
+        try:
+            pos_data = await exchange.get_open_position(symbol_conf)
+        except Exception:
+            logger.debug("sl_command: get_open_position falló", exc_info=True)
+            pos_data = None
+        if isinstance(pos_data, dict) and pos_data:
+            side = str(pos_data.get("side") or "").upper()
+            amt_raw = pos_data.get("positionAmt") or pos_data.get("contracts")
+            entry_raw = pos_data.get("entryPrice") or pos_data.get("entry_price")
+            try:
+                amt_val = float(amt_raw or 0.0)
+            except Exception:
+                amt_val = 0.0
+            try:
+                entry_val = float(entry_raw or 0.0)
+            except Exception:
+                entry_val = 0.0
+            if side in {"LONG", "SHORT"} and abs(amt_val) > 0 and entry_val > 0:
+                signed_amt = amt_val if side == "LONG" else -abs(amt_val)
+                return {
+                    "symbol": pos_data.get("symbol") or symbol_conf,
+                    "side": side,
+                    "entryPrice": entry_val,
+                    "positionAmt": signed_amt,
+                }
+
+    return None
+
+
 async def sl_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    app = _get_app_from_context(context)
-    if app is None:
+    engine = _get_app_from_context(context)
+    message = update.effective_message
+    if engine is None or message is None:
         return
+
+    engine_cfg = getattr(engine, "config", None)
+    default_symbol = "BTC/USDT"
+    if isinstance(engine_cfg, dict):
+        default_symbol = engine_cfg.get("symbol", default_symbol)
+
+    text_raw = (message.text or "").strip()
+    arg = (context.args[0] if context.args else "").strip()
+
+    if not arg:
+        handled = await _handle_position_controls(
+            engine,
+            lambda txt: reply_markdown_safe(message, txt),
+            text_raw,
+        )
+        if not handled:
+            await reply_markdown_safe(message, "Usá: sl 7   o   sl $10400")
+        return
+
+    raw = arg.replace(" ", "").replace(",", ".")
+    is_abs = raw.startswith("$")
+    try:
+        value = float(raw[1:] if is_abs else raw)
+    except Exception:
+        await reply_markdown_safe(message, "Formato inválido. Ej: sl 7  ó  sl $10400")
+        return
+
+    pos = await _active_position_for_sl(engine)
+    if not pos:
+        await reply_markdown_safe(message, "No hay posición abierta para setear SL.")
+        return
+
+    try:
+        entry = float(pos.get("entryPrice") or 0.0)
+    except Exception:
+        entry = 0.0
+    try:
+        amt = float(pos.get("positionAmt") or 0.0)
+    except Exception:
+        amt = 0.0
+
+    side = "LONG" if amt > 0 else "SHORT"
+
+    if entry <= 0 or abs(amt) <= 0:
+        await reply_markdown_safe(
+            message,
+            "No se pudo determinar el precio o tamaño de la posición actual.",
+        )
+        return
+
+    if is_abs:
+        sl_price = value
+    else:
+        pct = value / 100.0
+        if side == "LONG":
+            sl_price = entry * (1 - pct)
+        else:
+            sl_price = entry * (1 + pct)
+
+    updated = False
+    error_msg: Optional[str] = None
+    service = getattr(trading, "POSITION_SERVICE", None)
+    if service is not None:
+        update_sl = getattr(service, "update_stop_loss", None)
+        if callable(update_sl):
+            try:
+                update_sl(sl_price)
+                updated = True
+            except TypeError:
+                try:
+                    update_sl(pos.get("symbol"), sl_price)
+                    updated = True
+                except Exception:
+                    logger.debug(
+                        "sl_command: update_stop_loss falló con firma alternativa",
+                        exc_info=True,
+                    )
+            except Exception:
+                logger.debug("sl_command: update_stop_loss falló", exc_info=True)
+
+    exchange = getattr(engine, "exchange", None)
+    if not updated and exchange is not None and hasattr(exchange, "update_protections"):
+        try:
+            symbol = pos.get("symbol") or default_symbol
+            result = await exchange.update_protections(
+                symbol=symbol or "BTC/USDT",
+                side=side,
+                qty=abs(float(amt)),
+                sl=float(sl_price),
+            )
+            if isinstance(result, dict):
+                updated = bool(result.get("ok", True))
+                if not updated:
+                    error_msg = str(result.get("reason") or "error")
+            else:
+                updated = True
+        except Exception as exc:
+            error_msg = str(exc)
+            logger.debug("sl_command: update_protections falló", exc_info=True)
+
+    if not updated:
+        await reply_markdown_safe(
+            message,
+            f"❌ No pude actualizar SL: {error_msg or 'error'}",
+        )
+        return
+
+    pct_label = "abs" if is_abs else f"-{value:.2f}%"
+    await reply_markdown_safe(
+        message,
+        f"✅ SL seteado en {_num(sl_price)} ({pct_label}; {side})",
+    )
+
+
+async def cmd_sl_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Permite "sl 5", "sl 7", "sl $10400" SIN barra.
+    Reusa el handler /sl pasando args normalizados.
+    """
 
     message = update.effective_message
     if message is None:
         return
 
-    service = getattr(trading, "POSITION_SERVICE", None)
-    text_raw = (message.text or "").strip()
-    has_args = len(text_raw.split()) > 1
-
-    service_open = False
-    if service is not None:
-        is_open_attr = getattr(service, "is_open", None)
-        if callable(is_open_attr):
-            try:
-                service_open = bool(is_open_attr())
-            except Exception:
-                logger.debug("sl_command: fallo al consultar POSITION_SERVICE.is_open", exc_info=True)
-        elif is_open_attr is not None:
-            service_open = bool(is_open_attr)
-
-    if service_open and has_args and app:
-        pos_getter = getattr(service, "get_position", None)
-        try:
-            pos = pos_getter() if callable(pos_getter) else pos_getter
-        except Exception:
-            logger.debug("sl_command: fallo al obtener la posición actual", exc_info=True)
-            pos = None
-        if not pos:
-            # Si no hay posición obtenible desde el servicio, seguimos con el flujo por defecto
-            await _handle_position_controls(
-                None,
-                lambda txt: reply_markdown_safe(message, txt),
-                text_raw,
-            )
-            return
-
-        entry_px = getattr(pos, "entry_price", None)
-        if entry_px is None and isinstance(pos, dict):
-            entry_px = pos.get("entry_price") or pos.get("entryPrice")
-        side = getattr(pos, "side", "")
-        if not side and isinstance(pos, dict):
-            side = pos.get("side")
-
-        if entry_px is None:
-            await message.reply_text("No se pudo determinar el precio de entrada de la posición actual.")
-            return
-
-        try:
-            entry_px = float(entry_px)
-        except (TypeError, ValueError):
-            await message.reply_text("No se pudo interpretar el precio de entrada de la posición actual.")
-            return
-
-        m_sl_abs = re.match(r"^(?:/?sl)\s*\$?\s*(\d+(?:\.\d+)?)\s*$", text_raw, re.IGNORECASE)
-        m_sl_pct = re.match(r"^(?:/?sl)\s*([+\-]?)(\d+(?:\.\d+)?)%?\s*$", text_raw, re.IGNORECASE)
-
-        new_sl_price: Optional[float] = None
-
-        if m_sl_abs:
-            new_sl_price = float(m_sl_abs.group(1))
-        elif m_sl_pct:
-            pct_val = float(m_sl_pct.group(2)) / 100.0
-            pct_val = abs(pct_val)
-
-            if str(side).upper() == "LONG":
-                new_sl_price = entry_px * (1.0 - pct_val)
-            else:
-                new_sl_price = entry_px * (1.0 + pct_val)
-
-        if new_sl_price is not None:
-            try:
-                new_sl_price = float(new_sl_price)
-            except (TypeError, ValueError):
-                new_sl_price = None
-
-        if new_sl_price is not None:
-            update_sl = getattr(service, "update_stop_loss", None)
-            updated = False
-            if callable(update_sl):
-                try:
-                    update_sl(new_sl_price)
-                    updated = True
-                except TypeError:
-                    try:
-                        update_sl(app.config.get("symbol"), new_sl_price)
-                        updated = True
-                    except Exception:
-                        logger.debug("sl_command: update_stop_loss falló con firma alternativa", exc_info=True)
-                except Exception:
-                    logger.debug("sl_command: update_stop_loss falló", exc_info=True)
-            if updated:
-                await reply_markdown_safe(
-                    message,
-                    f"✅ SL de la posición LIVE actualizado a: **{new_sl_price:,.2f}**",
-                )
-                return
-            await message.reply_text("No se pudo actualizar el SL de la posición.")
-            return
-
-        await message.reply_text(
-            "Formato inválido. Usá `sl 6` (pct) o `sl $104500` (precio), o solo `sl` para consultar."
-        )
+    text = (message.text or "").strip()
+    match = re.match(SL_TEXT_RE_PATTERN, text)
+    if not match:
         return
 
-    await _handle_position_controls(
-        None,
-        lambda txt: reply_markdown_safe(message, txt),
-        text_raw,
-    )
+    raw = match.group(1).strip().replace(" ", "")
+    raw = raw.replace(",", ".")
+
+    if raw.startswith("$"):
+        args = [f"${raw[1:]}"]
+    else:
+        args = [raw]
+
+    setattr(context, "args", args)
+
+    return await sl_command(update, context)
 
 
 async def tp_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3523,7 +3625,11 @@ def register_commands(application: Application) -> None:
             logs_command,
         )
     )
-    application.add_handler(MessageHandler(filters.COMMAND, _slash_router))
+    application.add_handler(
+        MessageHandler(filters.Regex(SL_TEXT_RE_PATTERN), cmd_sl_text),
+        group=0,
+    )
+    application.add_handler(MessageHandler(filters.COMMAND, _slash_router), group=0)
     application.add_handler(
         MessageHandler(filters.Regex(r"(?i)^(status|estado)$"), _status_plaintext_handler) # CORRECCIÓN
     )
@@ -3546,7 +3652,8 @@ def register_commands(application: Application) -> None:
     generic_filter = generic_filter & (~filters.Regex(POSITION_TEXT_RE_PATTERN_PLURAL))
     generic_filter = generic_filter & (~filters.Regex(r"(?i)^(status|estado)$")) # CORRECCIÓN
     generic_filter = generic_filter & (~filters.Regex(LOGS_TEXT_RE_PATTERN))
-    application.add_handler(MessageHandler(generic_filter, on_unknown_text))
+    generic_filter = generic_filter & (~filters.Regex(SL_TEXT_RE_PATTERN))
+    application.add_handler(MessageHandler(generic_filter, on_unknown_text), group=1)
     setattr(application, "_chaulet_router_registered", True)
     logger.info(
         "Router central de comandos registrado (%d comandos).",
