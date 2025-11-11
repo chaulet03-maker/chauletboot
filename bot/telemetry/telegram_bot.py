@@ -1,4 +1,5 @@
 import os
+import sys
 import math
 import logging
 import asyncio
@@ -41,6 +42,8 @@ from bot.settings_utils import get_val, read_config_raw
 from bot.telemetry.command_registry import CommandRegistry, normalize
 from bot.telemetry.formatter import open_msg
 from state_store import load_state, update_open_position
+from bot.telemetry.notifier import notify
+from ccxt.base.errors import AuthenticationError
 import trading
 from position_service import (
     EPS_QTY,
@@ -53,6 +56,43 @@ from core.reasons import render_reasons_simple
 logger = logging.getLogger("telegram")
 
 REGISTRY = CommandRegistry()
+
+
+def _escape_markdown(text: str) -> str:
+    raw = str(text)
+    escaped = raw.replace("\\", "\\\\")
+    for char in ("_", "*", "[", "]", "(", ")", "~", "`", ">", "#", "+", "-", "=", "|", "{", "}"):
+        escaped = escaped.replace(char, f"\\{char}")
+    return escaped
+
+
+async def _send_critical_alert(message: str) -> None:
+    try:
+        await asyncio.to_thread(
+            notify,
+            message,
+            parse_mode="Markdown",
+            disable_preview=True,
+        )
+    except Exception:
+        logger.debug(
+            "No se pudo enviar la alerta crítica de autenticación a Telegram.",
+            exc_info=True,
+        )
+
+
+async def _handle_authentication_failure(exc: Exception) -> None:
+    detail = _escape_markdown(str(exc))
+    logger.critical(
+        "FALLO DE AUTENTICACIÓN (API KEY). Deteniendo el bot. %s", detail, exc_info=True
+    )
+    message = (
+        "🛑 *ERROR CRÍTICO: Autenticación fallida*\n"
+        "La API Key de Binance fue rechazada. El bot se detendrá inmediatamente.\n"
+        f"Detalle: `{detail}`"
+    )
+    await _send_critical_alert(message)
+    sys.exit(1)
 
 
 async def _is_auth(exchange) -> bool:
@@ -385,117 +425,139 @@ async def _resolve_equity_usdt(exchange: Any) -> float:
     Retorna 0.0 si no puede leer.
     """
 
-    mode = (runtime_get_mode() or "paper").lower()
-    if mode not in {"real", "live"}:
-        try:
-            return float(get_equity_sim())
-        except Exception:
+    try:
+        mode = (runtime_get_mode() or "paper").lower()
+        if mode not in {"real", "live"}:
+            try:
+                return float(get_equity_sim())
+            except Exception:
+                return 0.0
+
+        if not exchange:
             return 0.0
 
-    if not exchange:
-        return 0.0
+        def _extract_usdt(balance: dict) -> float:
+            # 1) totalWalletBalance (root o dentro de info)
+            twb = (
+                balance.get("totalWalletBalance")
+                or balance.get("info", {}).get("totalWalletBalance")
+            )
+            if twb is not None:
+                try:
+                    v = float(twb)
+                    if math.isfinite(v):
+                        return v
+                except Exception:
+                    pass
 
-    import asyncio
-
-    def _extract_usdt(balance: dict) -> float:
-        # 1) totalWalletBalance (root o dentro de info)
-        twb = (balance.get("totalWalletBalance")
-               or balance.get("info", {}).get("totalWalletBalance"))
-        if twb is not None:
+            # 2) info.assets[].walletBalance (formato crudo de Binance Futures)
             try:
-                v = float(twb)
+                for a in (balance.get("info", {}).get("assets", []) or []):
+                    if str(a.get("asset")) == "USDT":
+                        wb = (
+                            a.get("walletBalance")
+                            or a.get("crossWalletBalance")
+                            or "0"
+                        )
+                        v = float(wb)
+                        if math.isfinite(v):
+                            return v
+            except Exception:
+                pass
+
+            # 3) CCXT normalizado
+            try:
+                v = float((balance.get("total") or {}).get("USDT") or 0.0)
                 if math.isfinite(v):
                     return v
             except Exception:
                 pass
 
-        # 2) info.assets[].walletBalance (formato crudo de Binance Futures)
-        try:
-            for a in (balance.get("info", {}).get("assets", []) or []):
-                if str(a.get("asset")) == "USDT":
-                    wb = a.get("walletBalance") or a.get("crossWalletBalance") or "0"
-                    v = float(wb)
-                    if math.isfinite(v):
-                        return v
-        except Exception:
-            pass
+            return 0.0
 
-        # 3) CCXT normalizado
-        try:
-            v = float((balance.get("total") or {}).get("USDT") or 0.0)
-            if math.isfinite(v):
-                return v
-        except Exception:
-            pass
+        # --- 1) Tu wrapper: fetch_balance_usdt puede ser async o sync
+        if hasattr(exchange, "fetch_balance_usdt"):
+            try:
+                fn = exchange.fetch_balance_usdt  # puede ser coroutinefunction
+
+                # Llamado robusto: si es coroutine -> await; si es sync -> to_thread
+                if inspect.iscoroutinefunction(fn):
+                    try:
+                        maybe_balance = await fn("future")  # preferimos pasar tipo
+                    except TypeError:
+                        maybe_balance = await fn()
+                else:
+                    try:
+                        maybe_balance = await asyncio.to_thread(fn, "future")
+                    except TypeError:
+                        maybe_balance = await asyncio.to_thread(fn)
+
+                # Por si devuelve una coroutine:
+                if inspect.iscoroutine(maybe_balance):
+                    maybe_balance = await maybe_balance
+
+                if isinstance(maybe_balance, (int, float)):
+                    v = float(maybe_balance)
+                    return v if math.isfinite(v) else 0.0
+                if isinstance(maybe_balance, dict):
+                    v = _extract_usdt(maybe_balance)
+                    if v >= 0:
+                        return v
+            except AuthenticationError as exc:
+                await _handle_authentication_failure(exc)
+            except Exception:
+                logger.error("Wrapper.fetch_balance_usdt falló.", exc_info=True)
+
+        # --- 2) Cliente CCXT expuesto (.ccxt o ._ccxt)
+        ccxt_client = getattr(exchange, "ccxt", None) or getattr(exchange, "_ccxt", None)
+        if ccxt_client and hasattr(ccxt_client, "fetch_balance"):
+            try:
+                bal = await asyncio.to_thread(ccxt_client.fetch_balance, {"type": "future"})
+                v = _extract_usdt(bal)
+                if v >= 0:
+                    return v
+            except AuthenticationError as exc:
+                await _handle_authentication_failure(exc)
+            except Exception:
+                try:
+                    bal = await asyncio.to_thread(ccxt_client.fetch_balance)
+                    v = _extract_usdt(bal)
+                    if v >= 0:
+                        return v
+                except AuthenticationError as exc:
+                    await _handle_authentication_failure(exc)
+                except Exception:
+                    logger.error("ccxt.fetch_balance falló.", exc_info=True)
+
+        # --- 3) A veces el cliente está en .client
+        client = getattr(exchange, "client", None)
+        if client and hasattr(client, "fetch_balance"):
+            try:
+                bal = await asyncio.to_thread(client.fetch_balance, {"type": "future"})
+                v = _extract_usdt(bal)
+                if v >= 0:
+                    return v
+            except AuthenticationError as exc:
+                await _handle_authentication_failure(exc)
+            except Exception:
+                try:
+                    bal = await asyncio.to_thread(client.fetch_balance)
+                    v = _extract_usdt(bal)
+                    if v >= 0:
+                        return v
+                except AuthenticationError as exc:
+                    await _handle_authentication_failure(exc)
+                except Exception:
+                    logger.error("client.fetch_balance falló.", exc_info=True)
 
         return 0.0
-
-    # --- 1) Tu wrapper: fetch_balance_usdt puede ser async o sync
-    if hasattr(exchange, "fetch_balance_usdt"):
-        try:
-            fn = exchange.fetch_balance_usdt  # puede ser coroutinefunction
-
-            # Llamado robusto: si es coroutine -> await; si es sync -> to_thread
-            if inspect.iscoroutinefunction(fn):
-                try:
-                    maybe_balance = await fn("future")   # preferimos pasar tipo
-                except TypeError:
-                    maybe_balance = await fn()
-            else:
-                try:
-                    maybe_balance = await asyncio.to_thread(fn, "future")
-                except TypeError:
-                    maybe_balance = await asyncio.to_thread(fn)
-
-            # Por si devuelve una coroutine:
-            if inspect.iscoroutine(maybe_balance):
-                maybe_balance = await maybe_balance
-
-            if isinstance(maybe_balance, (int, float)):
-                v = float(maybe_balance)
-                return v if math.isfinite(v) else 0.0
-            if isinstance(maybe_balance, dict):
-                v = _extract_usdt(maybe_balance)
-                if v >= 0:
-                    return v
-        except Exception:
-            logger.error("Wrapper.fetch_balance_usdt falló.", exc_info=True)
-
-    # --- 2) Cliente CCXT expuesto (.ccxt o ._ccxt)
-    ccxt_client = getattr(exchange, "ccxt", None) or getattr(exchange, "_ccxt", None)
-    if ccxt_client and hasattr(ccxt_client, "fetch_balance"):
-        try:
-            bal = await asyncio.to_thread(ccxt_client.fetch_balance, {"type": "future"})
-            v = _extract_usdt(bal)
-            if v >= 0:
-                return v
-        except Exception:
-            try:
-                bal = await asyncio.to_thread(ccxt_client.fetch_balance)
-                v = _extract_usdt(bal)
-                if v >= 0:
-                    return v
-            except Exception:
-                logger.error("ccxt.fetch_balance falló.", exc_info=True)
-
-    # --- 3) A veces el cliente está en .client
-    client = getattr(exchange, "client", None)
-    if client and hasattr(client, "fetch_balance"):
-        try:
-            bal = await asyncio.to_thread(client.fetch_balance, {"type": "future"})
-            v = _extract_usdt(bal)
-            if v >= 0:
-                return v
-        except Exception:
-            try:
-                bal = await asyncio.to_thread(client.fetch_balance)
-                v = _extract_usdt(bal)
-                if v >= 0:
-                    return v
-            except Exception:
-                logger.error("client.fetch_balance falló.", exc_info=True)
-
-    return 0.0
+    except AuthenticationError as exc:
+        await _handle_authentication_failure(exc)
+    except Exception:
+        logger.error(
+            "Error al obtener el saldo (Equity) de Binance Futures.", exc_info=True
+        )
+        return 0.0
 
 
 def _merge_position_entry(entry: Any) -> Dict[str, Any]:

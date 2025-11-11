@@ -14,3 +14,4 @@ httpx==0.25.2
 websockets==10.4
 binance-connector==3.6.*
 python-binance==1.0.19
+aioredis
