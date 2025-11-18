@@ -2386,6 +2386,12 @@ async def handle_open_manual(update: Update, context: ContextTypes.DEFAULT_TYPE)
     symbol_clean = symbol.replace("/", "")
 
     def _set_leverage():
+        # Primero aseguramos marginType CROSS en Binance
+        try:
+            client.futures_change_margin_type(symbol=symbol_clean, marginType="CROSSED")  # type: ignore[attr-defined]
+        except Exception:
+            # Si ya está en CROSS o el endpoint devuelve error no crítico, lo ignoramos
+            pass
         return client.futures_change_leverage(symbol=symbol_clean, leverage=leverage)
 
     try:
