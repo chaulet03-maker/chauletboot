@@ -861,14 +861,21 @@ class Exchange:
 
         await self.upgrade_to_real_if_needed()
 
-        # Algunos exchanges exponen set_margin_mode, otros set_marginMode
         fn = getattr(self.client, "set_margin_mode", None) or getattr(self.client, "set_marginMode", None)
         if callable(fn):
-            try:
-                await fn("cross", sym)
-                logger.info("Margin mode CROSS establecido para %s", sym)
-            except Exception as exc:
-                logger.warning("No se pudo establecer margin mode CROSS para %s: %s", sym, exc)
+            # Probamos primero el valor estilo CCXT ("cross") y luego el estilo Binance ("CROSSED")
+            for mode in ("cross", "CROSSED"):
+                try:
+                    await fn(mode, sym)
+                    logger.info("Margin mode %s establecido para %s", mode, sym)
+                    break
+                except Exception as exc:
+                    logger.warning(
+                        "No se pudo establecer margin mode %s para %s: %s",
+                        mode,
+                        sym,
+                        exc,
+                    )
 
         self._margin_mode_cross_set_for.add(sym)
 

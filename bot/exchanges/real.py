@@ -143,12 +143,23 @@ class RealExchange:
 
     async def _ensure_cross_margin(self, symbol: str):
         """Intenta poner CROSS para el símbolo dado."""
-        try:
-            fn = getattr(self.client, "set_margin_mode", None) or getattr(self.client, "set_marginMode", None)
-            if callable(fn):
-                await fn("cross", symbol)
-        except Exception as exc:
-            self.log.warning("No se pudo establecer margin_mode CROSS para %s: %s", symbol, exc)
+        fn = getattr(self.client, "set_margin_mode", None) or getattr(self.client, "set_marginMode", None)
+        if not callable(fn):
+            return
+
+        # Probamos variantes de nombre de modo, por las dudas
+        for mode in ("cross", "CROSSED"):
+            try:
+                await fn(mode, symbol)
+                self.log.info("margin_mode %s establecido para %s", mode, symbol)
+                break
+            except Exception as exc:
+                self.log.warning(
+                    "No se pudo establecer margin_mode %s para %s: %s",
+                    mode,
+                    symbol,
+                    exc,
+                )
 
     async def set_leverage(self, symbol: str, lev: int):
         """Wrapper compatible con CCXT Python para USDM."""
