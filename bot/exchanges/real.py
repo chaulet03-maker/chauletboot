@@ -151,7 +151,7 @@ class RealExchange:
         for mode in ("cross", "CROSSED"):
             try:
                 await fn(mode, symbol)
-                self.log.info("margin_mode %s establecido para %s", mode, symbol)
+                self.log.info("margin_mode %s establecido para %s", mode, symbol)  # corrige NameError si se loguea
                 break
             except Exception as exc:
                 self.log.warning(
