@@ -78,6 +78,8 @@ class Exchange:
         self._hedge_mode = self._determine_hedge_mode()
         self.public_client = None
         self.client = self._setup_client()
+        # Trackea en qué símbolos ya intentamos poner CROSS
+        self._margin_mode_cross_set_for: set[str] = set()
         # Asegurar que CCXT apunte a Futuros USD-M
         try:
             opts = getattr(self.client, "options", {}) or {}
@@ -842,6 +844,34 @@ class Exchange:
                 exc_info=True,
             )
 
+    async def _ensure_margin_mode_cross(self, symbol: str) -> None:
+        """Intenta asegurar que el símbolo opere en margin mode CROSS.
+
+        No rompe si el exchange no soporta set_margin_mode o si ya está en CROSS.
+        """
+        if self.is_paper():
+            return
+
+        sym = symbol or self.config.get('symbol', 'BTC/USDT')
+        sym = str(sym or '').upper()
+
+        # Evitar repetir llamadas innecesarias
+        if sym in self._margin_mode_cross_set_for:
+            return
+
+        await self.upgrade_to_real_if_needed()
+
+        # Algunos exchanges exponen set_margin_mode, otros set_marginMode
+        fn = getattr(self.client, "set_margin_mode", None) or getattr(self.client, "set_marginMode", None)
+        if callable(fn):
+            try:
+                await fn("cross", sym)
+                logger.info("Margin mode CROSS establecido para %s", sym)
+            except Exception as exc:
+                logger.warning("No se pudo establecer margin mode CROSS para %s: %s", sym, exc)
+
+        self._margin_mode_cross_set_for.add(sym)
+
     async def _ensure_auth_for_private(self):
         if self.is_paper():
             return
@@ -992,6 +1022,8 @@ class Exchange:
             logger.info("PAPER: skipping set_leverage(%s, %s)", lev_int, sym)
             return
 
+        # Aseguramos margin mode CROSS antes de tocar el leverage
+        await self._ensure_margin_mode_cross(sym)
         await self._ensure_auth_for_private()
         await self.client.set_leverage(lev_int, sym)
         logger.info("Apalancamiento establecido en x%s para %s", lev_int, sym)

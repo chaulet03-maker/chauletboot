@@ -141,10 +141,20 @@ class RealExchange:
             one_way,
         )
 
+    async def _ensure_cross_margin(self, symbol: str):
+        """Intenta poner CROSS para el símbolo dado."""
+        try:
+            fn = getattr(self.client, "set_margin_mode", None) or getattr(self.client, "set_marginMode", None)
+            if callable(fn):
+                await fn("cross", symbol)
+        except Exception as exc:
+            self.log.warning("No se pudo establecer margin_mode CROSS para %s: %s", symbol, exc)
+
     async def set_leverage(self, symbol: str, lev: int):
         """Wrapper compatible con CCXT Python para USDM."""
         try:
             lev_int = int(float(lev))
+            await self._ensure_cross_margin(symbol)
             # Preferir la API de alto nivel de CCXT
             return await self.client.set_leverage(lev_int, symbol)
         except Exception as e:
