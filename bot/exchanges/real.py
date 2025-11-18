@@ -18,14 +18,17 @@ async def _create_order_tolerant(
     params: Optional[dict] = None,
     logger: Optional[logging.Logger] = None,
 ):
-    """Intenta crear una orden sin ``positionSide`` y reintenta en modo hedge."""
-
+    """
+    Intenta crear una orden sin positionSide y,
+    si Binance se queja por modo hedge, reintenta con positionSide LONG/SHORT.
+    """
     params_dict = dict(params or {})
     side_u = (side or "").upper()
 
     try:
         order = await place_order(symbol, order_type, side_u, qty, price, params_dict)
         return order, params_dict
+
     except ExchangeError as exc:
         msg = str(exc or "").lower()
         code = getattr(exc, "code", None)
@@ -38,7 +41,7 @@ async def _create_order_tolerant(
         retry_params = dict(params_dict)
         retry_params["positionSide"] = "LONG" if side_u in {"BUY", "LONG"} else "SHORT"
 
-        if logger is not None:
+        if logger:
             logger.debug(
                 "Reintento de orden con positionSide=%s tras mismatch de modo de posición",
                 retry_params["positionSide"],
@@ -47,12 +50,14 @@ async def _create_order_tolerant(
         order = await place_order(symbol, order_type, side_u, qty, price, retry_params)
         return order, retry_params
 
+
 @dataclass
 class Fill:
     price: float
     qty: float
     side: str
     ts: float
+
 
 class RealExchange:
     def __init__(
@@ -73,6 +78,9 @@ class RealExchange:
         self._sym_noslash = default_symbol.replace("/", "")
         self._native_client = native_client
 
+    # ------------------------------------------------------------------
+    # Helpers internos
+    # ------------------------------------------------------------------
     def _idemp_key(self, prefix: str, **fields) -> str:
         raw = prefix + "|" + "|".join(f"{k}={fields[k]}" for k in sorted(fields.keys()))
         h = hashlib.sha1(raw.encode("utf-8")).hexdigest()[:24]
@@ -86,6 +94,72 @@ class RealExchange:
             return "SELL"
         raise ValueError(f"Lado de orden inválido: {side}")
 
+    async def _place(self, fn, *args, retries: int = 4, base_delay: float = 0.25, **kwargs):
+        last = None
+        for i in range(retries):
+            try:
+                return await fn(*args, **kwargs)
+            except Exception as e:
+                last = e
+                await asyncio.sleep(base_delay * (1.8 ** i) * 1.2)
+        raise last
+
+    async def set_position_mode(self, one_way: bool = True):
+        self.log.debug(
+            "set_position_mode(one_way=%s) omitido: se utiliza el modo configurado en la cuenta",
+            one_way,
+        )
+
+    # ------------------------------------------------------------------
+    # Margin mode CROSS
+    # ------------------------------------------------------------------
+    async def _ensure_cross_margin(self, symbol: str):
+        """
+        Intenta poner CROSS para el símbolo dado.
+        Usa tanto 'set_margin_mode' como 'set_marginMode' según el exchange.
+        """
+        fn = getattr(self.client, "set_margin_mode", None) or getattr(self.client, "set_marginMode", None)
+        if not callable(fn):
+            return
+
+        # Probamos variantes del modo de margen por las dudas
+        for mode in ("cross", "CROSSED"):
+            try:
+                await fn(mode, symbol)
+                self.log.info("margin_mode %s establecido para %s", mode, symbol)
+                break
+            except Exception as exc:
+                self.log.warning(
+                    "No se pudo establecer margin_mode %s para %s: %s",
+                    mode,
+                    symbol,
+                    exc,
+                )
+
+    # ------------------------------------------------------------------
+    # Leverage
+    # ------------------------------------------------------------------
+    async def set_leverage(self, symbol: str, lev: int):
+        """Wrapper compatible con CCXT Python para USDM."""
+        try:
+            lev_int = int(float(lev))
+            await self._ensure_cross_margin(symbol)
+            # Preferir la API de alto nivel de CCXT
+            return await self.client.set_leverage(lev_int, symbol)
+        except Exception as e:
+            # Fallback explícito al endpoint oficial si hiciera falta
+            try:
+                m = self.client.market(symbol)  # m["id"] -> 'BTCUSDT'
+                return await self.client.fapiPrivatePostLeverage(
+                    {"symbol": m["id"], "leverage": lev_int}
+                )
+            except Exception as ex:
+                self.log.warning("set_leverage(%s,%s) failed: %s / %s", symbol, lev_int, e, ex)
+                raise
+
+    # ------------------------------------------------------------------
+    # Órdenes
+    # ------------------------------------------------------------------
     async def _place_order(
         self,
         symbol: str,
@@ -124,60 +198,6 @@ class RealExchange:
             params,
             logger=self.log,
         )
-
-    async def _place(self, fn, *args, retries=4, base_delay=0.25, **kwargs):
-        last = None
-        for i in range(retries):
-            try:
-                return await fn(*args, **kwargs)
-            except Exception as e:
-                last = e
-                await asyncio.sleep(base_delay * (1.8 ** i) * (1 + 0.2))
-        raise last
-
-    async def set_position_mode(self, one_way: bool = True):
-        self.log.debug(
-            "set_position_mode(one_way=%s) omitido: se utiliza el modo configurado en la cuenta",
-            one_way,
-        )
-
-    async def _ensure_cross_margin(self, symbol: str):
-        """Intenta poner CROSS para el símbolo dado."""
-        fn = getattr(self.client, "set_margin_mode", None) or getattr(self.client, "set_marginMode", None)
-        if not callable(fn):
-            return
-
-        # Probamos variantes de nombre de modo, por las dudas
-        for mode in ("cross", "CROSSED"):
-            try:
-                await fn(mode, symbol)
-                self.log.info("margin_mode %s establecido para %s", mode, symbol)
-                break
-            except Exception as exc:
-                self.log.warning(
-                    "No se pudo establecer margin_mode %s para %s: %s",
-                    mode,
-                    symbol,
-                    exc,
-                )
-
-    async def set_leverage(self, symbol: str, lev: int):
-        """Wrapper compatible con CCXT Python para USDM."""
-        try:
-            lev_int = int(float(lev))
-            await self._ensure_cross_margin(symbol)
-            # Preferir la API de alto nivel de CCXT
-            return await self.client.set_leverage(lev_int, symbol)
-        except Exception as e:
-            # Fallback explícito al endpoint oficial si hiciera falta
-            try:
-                m = self.client.market(symbol)  # m["id"] -> 'BTCUSDT'
-                return await self.client.fapiPrivatePostLeverage(
-                    {"symbol": m["id"], "leverage": lev_int}
-                )
-            except Exception as ex:
-                self.log.warning("set_leverage(%s,%s) failed: %s / %s", symbol, lev_int, e, ex)
-                raise
 
     async def market_order(self, symbol: str, side: str, qty: float, price_hint: float = None):
         params = {"newClientOrderId": self._idemp_key("MO", symbol=symbol, side=side, qty=qty)}
@@ -257,6 +277,9 @@ class RealExchange:
 
         return order
 
+    # ------------------------------------------------------------------
+    # Nativo / posiciones
+    # ------------------------------------------------------------------
     def _format_symbol(self, symbol: str) -> str:
         if not symbol:
             return symbol
@@ -295,7 +318,6 @@ class RealExchange:
                 for entry in pos_list or []:
                     info = entry.get("info") or {}
                     exch_sym = str(info.get("symbol") or entry.get("symbol") or "").upper()
-                    # normalizar para comparar: quitar "/"
                     exch_id = exch_sym.replace("/", "")
                     if exch_id != target.upper():
                         continue
@@ -334,7 +356,6 @@ class RealExchange:
                 return None
             for pos in account.get("positions", []):
                 exch_sym = str(pos.get("symbol") or "").upper()
-                # normalizar para comparar: quitar "/"
                 exch_id = exch_sym.replace("/", "")
                 if exch_id != target.upper():
                     continue
@@ -447,17 +468,24 @@ class RealExchange:
             return []
         return out
 
-    # =============================================================
-    # === PARCHE APLICADO AQUÍ ===
-    # =============================================================
-    async def place_protections(self, symbol: str, side: str, qty: float,
-                                sl: float = 0.0, tp1: float = 0.0, tp2: float = 0.0,
-                                position_side: str = None):
+    # ------------------------------------------------------------------
+    # Protecciones
+    # ------------------------------------------------------------------
+    async def place_protections(
+        self,
+        symbol: str,
+        side: str,
+        qty: float,
+        sl: float = 0.0,
+        tp1: float = 0.0,
+        tp2: float = 0.0,
+        position_side: str | None = None,
+    ):
         """
         REAL: envía un único SL y un único TP (compat con firmas previas).
         Si vienen tp1 y tp2, prioriza tp2; si no, usa tp1.
         """
-        placed = []
+        placed: list[Any] = []
         if qty <= 0:
             return placed
 
@@ -466,14 +494,19 @@ class RealExchange:
         s = (side or "").lower()
         closing_side = "sell" if s == "long" else "buy"
         closing_order_side = self._normalize_order_side(closing_side)
-        params_base = {"reduceOnly": True}
+        params_base: dict[str, Any] = {"reduceOnly": True}
         if position_side:
             params_base["positionSide"] = position_side
 
         # --- STOP LOSS ---
         if sl and sl > 0:
             coid_sl = self._idemp_key("SL", symbol=symbol, side=closing_side, qty=qty, sl=sl)
-            params_sl = dict(params_base, newClientOrderId=coid_sl, stopPrice=float(sl), workingType="CONTRACT_PRICE")
+            params_sl = dict(
+                params_base,
+                newClientOrderId=coid_sl,
+                stopPrice=float(sl),
+                workingType="CONTRACT_PRICE",
+            )
             try:
                 o_sl, _ = await self._create_order_adaptive(
                     symbol,
@@ -490,7 +523,12 @@ class RealExchange:
         # --- TAKE PROFIT (único) ---
         if tp_final:
             coid_tp = self._idemp_key("TP", symbol=symbol, side=closing_side, qty=qty, tp=tp_final)
-            params_tp = dict(params_base, newClientOrderId=coid_tp, stopPrice=float(tp_final), workingType="CONTRACT_PRICE")
+            params_tp = dict(
+                params_base,
+                newClientOrderId=coid_tp,
+                stopPrice=float(tp_final),
+                workingType="CONTRACT_PRICE",
+            )
             try:
                 o_tp, _ = await self._create_order_adaptive(
                     symbol,
@@ -506,6 +544,7 @@ class RealExchange:
 
         return placed
 
+    # ------------------------------------------------------------------
     async def close_all(self, positions: dict):
         for sym, lots in positions.items():
             net = sum(l["qty"] if l["side"] == "long" else -l["qty"] for l in lots)
@@ -513,8 +552,18 @@ class RealExchange:
                 continue
             side = "sell" if net > 0 else "buy"
             try:
-                await self._place(self.client.create_order, sym, "market", side, abs(net), None,
-                                  {"reduceOnly": True, "newClientOrderId": self._idemp_key("CLOSE", symbol=sym, side=side, qty=abs(net))})
+                await self._place(
+                    self.client.create_order,
+                    sym,
+                    "market",
+                    side,
+                    abs(net),
+                    None,
+                    {
+                        "reduceOnly": True,
+                        "newClientOrderId": self._idemp_key("CLOSE", symbol=sym, side=side, qty=abs(net)),
+                    },
+                )
             except Exception as e:
                 self.log.warning("close_all %s failed: %s", sym, e)
 
