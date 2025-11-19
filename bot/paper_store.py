@@ -3,8 +3,9 @@ import os
 import time
 
 from paths import get_runtime_path
+from bot.runtime_state import BOT_ID
 
-PATH = str(get_runtime_path("paper_state.json"))
+PATH = str(get_runtime_path(f"paper_state_{BOT_ID}.json"))
 
 
 def _ensure():

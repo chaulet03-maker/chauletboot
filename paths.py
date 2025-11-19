@@ -6,6 +6,18 @@ from pathlib import Path
 from typing import Optional
 
 
+def _resolve_bot_id() -> str:
+    try:
+        cwd = os.path.abspath(os.getcwd())
+    except Exception:
+        return "bot"
+    base = os.path.basename(cwd) or "bot"
+    return base.replace(" ", "_")
+
+
+BOT_ID = _resolve_bot_id()
+
+
 def _resolve_base_dir() -> Path:
     raw = os.getenv("APP_ROOT")
     if raw:
@@ -44,12 +56,16 @@ def _resolve_under_data(raw_path: Optional[str], default_name: str) -> Path:
 
 @lru_cache(maxsize=1)
 def get_paper_store_path() -> Path:
-    return _resolve_under_data(os.getenv("PAPER_STORE_PATH"), "paper_state.json")
+    return _resolve_under_data(
+        os.getenv("PAPER_STORE_PATH"), f"paper_state_{BOT_ID}.json"
+    )
 
 
 @lru_cache(maxsize=1)
 def get_live_store_path() -> Path:
-    return _resolve_under_data(os.getenv("LIVE_STORE_PATH"), "live_bot_position.json")
+    return _resolve_under_data(
+        os.getenv("LIVE_STORE_PATH"), f"live_bot_position_{BOT_ID}.json"
+    )
 
 
 @lru_cache(maxsize=1)
