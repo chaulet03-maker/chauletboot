@@ -3,7 +3,9 @@ import sqlite3
 import time
 from typing import Optional, Tuple, Dict, Any
 
-DB_PATH = os.getenv("LEDGER_DB_PATH", "data/runtime/ledger.db")
+from bot.runtime_state import BOT_ID
+
+DB_PATH = os.getenv("LEDGER_DB_PATH", f"data/runtime/ledger_{BOT_ID}.db")
 os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
 
 
