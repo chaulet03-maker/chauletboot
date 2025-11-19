@@ -70,6 +70,14 @@ class Trader:
 
     async def get_balance(self, exchange=None) -> float:
         """Devuelve el balance actual de la cuenta."""
+        mode = runtime_get_mode()
+        if mode == "simulado":
+            from bot.paper_store import get_equity
+
+            eq = get_equity()
+            if eq is None or eq <= 0:
+                return 1000.0
+            return float(eq)
         self._ensure_mode_consistency()
         if _runtime_is_paper():
             try:

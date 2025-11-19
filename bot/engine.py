@@ -1736,6 +1736,13 @@ class TradingApp:
                 self.strategy.calculate_tp(entry_price, qty, eq_on_open, side, leverage)
             )
 
+            # bloquear múltiples posiciones simuladas
+            if runtime_get_mode() == "simulado":
+                from bot.paper_store import PaperStore
+
+                if PaperStore().state.get("pos_qty", 0) > 0:
+                    return
+
             order_result = await self.exchange.create_order(signal, qty, sl_price, tp_price)
 
             # 1) Verificar FILL > 0 (evita anuncios falsos)
@@ -1833,19 +1840,19 @@ class TradingApp:
                 + f"tp : {f'${tp_price:.2f}' if tp_price is not None else 'N/A'}\n"
                 + f"sl:  ${sl_price:.2f}"
             )
-            # Registrar simulación en paper_store
-            from bot.paper_store import PaperStore
+            # Registrar posición simulada en PaperStore
+            if runtime_get_mode() == "simulado":
+                from bot.paper_store import PaperStore
 
-            store = PaperStore()
-            store.set_position(
-                symbol=symbol_cfg,
-                qty=filled_qty,
-                side=signal,
-                entry=float(entry_price),
-                leverage=float(leverage),
-                tp=float(tp_price) if tp_price else None,
-                sl=float(sl_price) if sl_price else None,
-            )
+                ps = PaperStore()
+                ps.set_position(
+                    qty=float(filled_qty),
+                    side=signal,
+                    entry=float(entry_price),
+                    leverage=float(leverage),
+                    tp=float(tp_price) if tp_price else None,
+                    sl=float(sl_price) if sl_price else None,
+                )
             self._risk_usd_trade = abs(entry_price - sl_price) * qty
             self._eq_on_open = eq_on_open
             self._entry_ts = now_ts
