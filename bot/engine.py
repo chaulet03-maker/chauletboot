@@ -1541,6 +1541,14 @@ class TradingApp:
                 if is_open:
                     blocked_reason = "position_service_open"
 
+            if blocked_reason is None:
+                # Bloqueo total de múltiples posiciones
+                from bot.paper_store import PaperStore
+
+                ps = PaperStore()
+                if float(ps.state.get("pos_qty", 0)) > 0:
+                    blocked_reason = "paper_store_open"
+
             if blocked_reason is None and self.has_open_position():
                 blocked_reason = "local_state_open"
 
@@ -1824,6 +1832,19 @@ class TradingApp:
                 + f"precio: ${entry_price:.2f}\n"
                 + f"tp : {f'${tp_price:.2f}' if tp_price is not None else 'N/A'}\n"
                 + f"sl:  ${sl_price:.2f}"
+            )
+            # Registrar simulación en paper_store
+            from bot.paper_store import PaperStore
+
+            store = PaperStore()
+            store.set_position(
+                symbol=symbol_cfg,
+                qty=filled_qty,
+                side=signal,
+                entry=float(entry_price),
+                leverage=float(leverage),
+                tp=float(tp_price) if tp_price else None,
+                sl=float(sl_price) if sl_price else None,
             )
             self._risk_usd_trade = abs(entry_price - sl_price) * qty
             self._eq_on_open = eq_on_open

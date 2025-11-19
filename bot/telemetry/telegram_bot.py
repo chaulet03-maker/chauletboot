@@ -51,6 +51,7 @@ from bot.runtime_state import (
     set_equity_sim,
     update_protection_defaults,
 )
+from bot.paper_store import PaperStore
 from bot.settings_utils import get_val, read_config_raw
 from bot.telemetry.command_registry import CommandRegistry, normalize
 from bot.telemetry.formatter import open_msg
@@ -851,7 +852,11 @@ async def posicion_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     total = (split_data or {}).get("total") or {}
     qty = _safe_float(total.get("qty"))
-    if qty <= 0:
+    store = PaperStore()
+    paper_state = store.get_state()
+    paper_qty = _safe_float(paper_state.get("pos_qty"))
+
+    if qty <= 0 and paper_qty <= 0:
         await message.reply_text("No hay posiciones abiertas.")
         return
 
@@ -861,13 +866,33 @@ async def posicion_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     mark_txt = f"{_safe_float(mark_price):,.2f}" if _safe_float(mark_price) > 0 else "—"
     pnl = _safe_float(total.get("pnl"))
 
-    text = (
-        f"<b>📍 {symbol_cfg} {side}</b>\n"
-        f"• Qty: {qty:.6f}\n"
-        f"• Entrada: {entry_txt} | Mark: {mark_txt}\n"
-        f"• PnL: {pnl:+,.2f}"
-    )
-    await message.reply_html(text)
+    sections: List[str] = []
+    if qty > 0:
+        text = (
+            f"<b>📍 REAL {symbol_cfg} {side}</b>\n"
+            f"• Qty: {qty:.6f}\n"
+            f"• Entrada: {entry_txt} | Mark: {mark_txt}\n"
+            f"• PnL: {pnl:+,.2f}"
+        )
+        sections.append(text)
+
+    if paper_qty > 0:
+        paper_side = str(paper_state.get("side") or "FLAT").upper()
+        paper_entry = _safe_float(paper_state.get("avg_price"))
+        paper_entry_txt = f"{paper_entry:,.2f}" if paper_entry > 0 else "—"
+        paper_mark = _safe_float(paper_state.get("mark"))
+        paper_mark_txt = f"{paper_mark:,.2f}" if paper_mark > 0 else "—"
+        paper_tp = _safe_float(paper_state.get("tp"))
+        paper_sl = _safe_float(paper_state.get("sl"))
+        paper_symbol = str(paper_state.get("symbol") or symbol_cfg)
+        sections.append(
+            f"<b>📍 SIMULADO {paper_symbol} {paper_side}</b>\n"
+            f"• Qty: {paper_qty:.6f}\n"
+            f"• Entrada: {paper_entry_txt} | Mark: {paper_mark_txt}\n"
+            f"• TP: {_fmt_usd(paper_tp)} | SL: {_fmt_usd(paper_sl)}"
+        )
+
+    await message.reply_html("\n\n".join(sections))
 
 
 async def posiciones_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -886,6 +911,9 @@ async def posiciones_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     # Bloque principal (símbolo configurado) si hay posición abierta
     total = (split_data or {}).get("total") or {}
     total_qty = _safe_float(total.get("qty"))
+    store = PaperStore()
+    paper_state = store.get_state()
+    paper_qty = _safe_float(paper_state.get("pos_qty"))
     if total_qty > 0:
         side = str(total.get("side") or "FLAT").upper()
         entry_px = _safe_float(total.get("entry_price"))
@@ -897,6 +925,22 @@ async def posiciones_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
             f"• Qty: {total_qty:.6f}\n"
             f"• Entrada: {entry_txt} | Mark: {mark_txt}\n"
             f"• PnL: {pnl:+,.2f}"
+        )
+
+    if paper_qty > 0:
+        paper_side = str(paper_state.get("side") or "FLAT").upper()
+        paper_entry = _safe_float(paper_state.get("avg_price"))
+        paper_entry_txt = f"{paper_entry:,.2f}" if paper_entry > 0 else "—"
+        paper_mark = _safe_float(paper_state.get("mark"))
+        paper_mark_txt = f"{paper_mark:,.2f}" if paper_mark > 0 else "—"
+        paper_tp = _safe_float(paper_state.get("tp"))
+        paper_sl = _safe_float(paper_state.get("sl"))
+        paper_symbol = str(paper_state.get("symbol") or symbol_cfg)
+        sections.append(
+            f"<b>📍 SIMULADO {paper_symbol} {paper_side}</b>\n"
+            f"• Qty: {paper_qty:.6f}\n"
+            f"• Entrada: {paper_entry_txt} | Mark: {paper_mark_txt}\n"
+            f"• TP: {_fmt_usd(paper_tp)} | SL: {_fmt_usd(paper_sl)}"
         )
 
     try:

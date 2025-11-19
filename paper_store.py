@@ -21,6 +21,8 @@ DEFAULT_STATE: Dict[str, Any] = {
     "tp": None,
     "sl": None,
     "leverage": 1,
+    "symbol": "",
+    "side": "FLAT",
     "updated": 0,
 }
 
@@ -103,6 +105,51 @@ class PaperStore:
             self._write(state)
             self.state = state
             return dict(state)
+
+    def get_state(self) -> Dict[str, Any]:
+        """Devuelve una copia del estado persistido."""
+
+        with self.lock:
+            self.state = self._safe_read()
+            return dict(self.state)
+
+    def set_position(
+        self,
+        *,
+        symbol: str,
+        qty: float,
+        side: str,
+        entry: float,
+        leverage: float = 1.0,
+        tp: float | None = None,
+        sl: float | None = None,
+        mark: float | None = None,
+    ) -> Dict[str, Any]:
+        """Persistir una posición simulada."""
+
+        with self.lock:
+            state = self._safe_read()
+            state.update(
+                {
+                    "symbol": str(symbol),
+                    "pos_qty": float(qty),
+                    "side": str(side).upper(),
+                    "avg_price": float(entry),
+                    "leverage": float(leverage),
+                    "tp": tp if tp is None else float(tp),
+                    "sl": sl if sl is None else float(sl),
+                }
+            )
+            if mark is not None:
+                try:
+                    state["mark"] = float(mark)
+                except Exception:
+                    pass
+            if state.get("equity") is None:
+                state["equity"] = self.start_equity
+            self._write(state)
+            self.state = state
+            return dict(self.state)
 
 
 __all__ = ["PaperStore", "DEFAULT_STATE"]

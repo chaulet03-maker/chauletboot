@@ -56,8 +56,11 @@ def _resolve_under_data(raw_path: Optional[str], default_name: str) -> Path:
 
 @lru_cache(maxsize=1)
 def get_paper_store_path() -> Path:
+    import os as _os
+
+    bot_name = _os.path.basename(_os.getcwd())
     return _resolve_under_data(
-        os.getenv("PAPER_STORE_PATH"), f"paper_state_{BOT_ID}.json"
+        _os.getenv("PAPER_STORE_PATH"), f"paper_store_{bot_name}.json"
     )
 
 
