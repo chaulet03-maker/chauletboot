@@ -56,9 +56,31 @@ def _resolve_under_data(raw_path: Optional[str], default_name: str) -> Path:
 
 @lru_cache(maxsize=1)
 def get_paper_store_path() -> Path:
-    return _resolve_under_data(
-        os.getenv("PAPER_STORE_PATH"), f"paper_state_{BOT_ID}.json"
-    )
+    """Return the path that stores paper-mode state.
+
+    Historically the default filename included the repository name
+    (``paper_state_<repo>.json``).  That made it hard to predict the
+    location and broke external tooling/tests that expect the legacy
+    ``paper_state.json`` name.  To retain backwards compatibility we now
+    prefer the deterministic filename while still honoring the old file
+    if it already exists.  Users can always override the path via the
+    ``PAPER_STORE_PATH`` environment variable.
+    """
+
+    env_override = os.getenv("PAPER_STORE_PATH")
+    if env_override:
+        return _resolve_under_data(env_override, "paper_state.json")
+
+    data_dir = get_data_dir()
+    default_path = data_dir / "paper_state.json"
+    legacy_path = data_dir / f"paper_state_{BOT_ID}.json"
+
+    if legacy_path.exists() and not default_path.exists():
+        legacy_path.parent.mkdir(parents=True, exist_ok=True)
+        return legacy_path
+
+    default_path.parent.mkdir(parents=True, exist_ok=True)
+    return default_path
 
 
 @lru_cache(maxsize=1)
