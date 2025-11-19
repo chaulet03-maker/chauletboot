@@ -8,12 +8,16 @@ from typing import Any, Literal, Optional, Tuple
 import yaml
 
 from bot.runtime_state import get_mode as runtime_get_mode, set_mode as runtime_set_mode
+from paths import get_data_dir
 
 log = logging.getLogger(__name__)
 
 Mode = Literal["real", "simulado"]
 
 CONFIG_PATH = os.getenv("CONFIG_PATH", "config.yaml")
+DATA_DIR = get_data_dir()
+BOT_NAME = os.path.basename(os.getcwd())
+RUNTIME_MODE_FILE = DATA_DIR / f"runtime_mode_{BOT_NAME}.json"
 
 
 @dataclass

@@ -1,32 +1,16 @@
-import json
-import os
-import time
-
-from paths import get_runtime_path
-from bot.runtime_state import BOT_ID
-
-PATH = str(get_runtime_path(f"paper_state_{BOT_ID}.json"))
+from paper_store import PaperStore
 
 
-def _ensure():
-    os.makedirs(os.path.dirname(PATH), exist_ok=True)
-    if not os.path.exists(PATH):
-        with open(PATH, "w", encoding="utf-8") as f:
-            json.dump({"equity": 0.0, "updated": int(time.time())}, f)
+def _store() -> PaperStore:
+    return PaperStore()
 
 
 def set_equity(value: float):
-    _ensure()
-    with open(PATH, "r", encoding="utf-8") as f:
-        data = json.load(f)
-    data["equity"] = float(value)
-    data["updated"] = int(time.time())
-    with open(PATH, "w", encoding="utf-8") as f:
-        json.dump(data, f)
+    store = _store()
+    store.save(equity=float(value))
 
 
 def get_equity() -> float:
-    _ensure()
-    with open(PATH, "r", encoding="utf-8") as f:
-        data = json.load(f)
-    return float(data.get("equity", 0.0))
+    store = _store()
+    state = store.get_state()
+    return float(state.get("equity", 0.0))
