@@ -1522,6 +1522,37 @@ class TradingApp:
                 logging.warning("No se pudo obtener el precio de entrada actual.")
                 _emit_motive({"reasons": ["exchange_error: precio de entrada no disponible"]}, side_value=signal)
                 return
+
+            blocked_reason = None
+            service = getattr(trading, "POSITION_SERVICE", None)
+            if service is not None:
+                try:
+                    status = service.get_status() or {}
+                    is_open = bool(status.get("is_open"))
+                    if not is_open:
+                        qty_status = float(status.get("qty") or status.get("pos_qty") or 0.0)
+                        is_open = abs(qty_status) > 0.0
+                except Exception as exc:
+                    self.logger.debug(
+                        "Bloqueo de posición: no se pudo consultar POSITION_SERVICE: %s",
+                        exc,
+                    )
+                    is_open = False
+                if is_open:
+                    blocked_reason = "position_service_open"
+
+            if blocked_reason is None and self.has_open_position():
+                blocked_reason = "local_state_open"
+
+            if blocked_reason:
+                logging.info("Bloqueada apertura: ya hay una posición activa (%s).", blocked_reason)
+                _emit_motive(
+                    {"reasons": ["position_open_detected", blocked_reason]},
+                    price_value=price_signal,
+                    side_value=signal,
+                )
+                return
+
             entry_price = float(entry_price)
             # --- Tamaño por equity ---
             # Prioridad: config["equity"] -> config["order_sizing"]["default_pct"] -> ENV EQUITY_PCT -> risk_pct

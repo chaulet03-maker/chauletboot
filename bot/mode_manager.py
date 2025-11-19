@@ -74,6 +74,19 @@ def set_mode_in_yaml(mode: Mode) -> None:
     log.info("Config actualizada: trading_mode=%s", cfg["trading_mode"])
     runtime_set_mode("live" if mode == "real" else "paper")
 
+    # Limpiar PositionService para evitar arrastrar estados entre modos
+    try:
+        import trading  # import local para evitar ciclos
+
+        svc = getattr(trading, "POSITION_SERVICE", None)
+        if svc is not None:
+            reset = getattr(svc, "reset", None)
+            if callable(reset):
+                reset()
+        trading.POSITION_SERVICE = None
+    except Exception:
+        log.debug("No se pudo resetear POSITION_SERVICE tras cambiar modo.", exc_info=True)
+
 
 def _env_key_candidates() -> Tuple[Tuple[str, str], ...]:
     return (
