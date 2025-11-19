@@ -126,10 +126,16 @@ class Trader:
                 _warn("TRADER", "No se pudo leer equity desde bot.paper_store.", exc=exc, level="debug")
 
         if equity is None:
-            equity = cached
+            if cached <= 0 and _runtime_is_paper():
+                equity = 1000.0
+            else:
+                equity = cached
 
         if not math.isfinite(equity):
-            equity = 0.0
+            equity = cached if math.isfinite(cached) else 0.0
+
+        if equity <= 0 and _runtime_is_paper():
+            equity = 1000.0
 
         self._balance = float(equity)
         return self._balance

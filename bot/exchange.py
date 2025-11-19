@@ -31,6 +31,24 @@ def _get_brokers_module():
 
 logger = logging.getLogger(__name__)
 
+
+class _AutoCreatingEventLoopPolicy(asyncio.DefaultEventLoopPolicy):
+    """Política que vuelve a crear un loop si fue cerrado (compatibilidad Py3.11)."""
+
+    def get_event_loop(self):  # type: ignore[override]
+        try:
+            return super().get_event_loop()
+        except RuntimeError:
+            loop = self.new_event_loop()
+            self.set_event_loop(loop)
+            return loop
+
+
+try:
+    asyncio.set_event_loop_policy(_AutoCreatingEventLoopPolicy())
+except Exception:
+    logger.debug("No se pudo establecer política custom de event loop.", exc_info=True)
+
 async def create_order_smart(
     symbol: str,
     side: str,
@@ -888,13 +906,24 @@ class Exchange:
         """Obtiene las velas (klines) de un par."""
         sym = symbol or self.config.get('symbol', 'BTC/USDT')
         logger.debug("Solicitando klines %s para %s", timeframe, sym)
+        params = {"timestamp": int(time.time() * 1000)}
         try:
-            return await self.client.fetch_ohlcv(sym, timeframe=timeframe, limit=limit)
+            return await self.client.fetch_ohlcv(
+                sym,
+                timeframe=timeframe,
+                limit=limit,
+                params=params,
+            )
         except Exception:
             alt = sym.replace('/', '')
             if alt != sym:
                 logger.debug("Fallo al obtener klines para %s, probando %s", sym, alt)
-                return await self.client.fetch_ohlcv(alt, timeframe=timeframe, limit=limit)
+                return await self.client.fetch_ohlcv(
+                    alt,
+                    timeframe=timeframe,
+                    limit=limit,
+                    params={"timestamp": int(time.time() * 1000)},
+                )
             raise
 
     def get_price_age_sec(self, symbol: Optional[str] = None) -> float:

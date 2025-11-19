@@ -377,6 +377,16 @@ class PositionService:
             return "real"
         return "simulado"
 
+    def reset(self) -> None:
+        """Limpia caches y reevalúa el modo activo para evitar mezclas entre entornos."""
+
+        self._cache.clear()
+        self._rehydrate_block_until.clear()
+        try:
+            self.mode = self._resolve_mode(None)
+        except Exception:
+            self.mode = "simulado" if _runtime_is_paper() else "real"
+
     def _cache_key(self, symbol: Optional[str] = None) -> str:
         base = symbol or self.symbol or ""
         normalized = normalize_exchange_symbol(base)
@@ -936,6 +946,11 @@ class PositionService:
             # priorizamos el modo configurado explícitamente.
             use_paper = False
         status = self._status_paper() if use_paper else self._status_live()
+        try:
+            qty_val = float(status.get("qty") or status.get("pos_qty") or 0.0)
+        except Exception:
+            qty_val = 0.0
+        status.setdefault("is_open", abs(qty_val) > EPS_QTY)
         self._cache[self._cache_key(self.symbol)] = dict(status)
         return status
 

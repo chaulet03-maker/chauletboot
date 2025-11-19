@@ -6,7 +6,20 @@ from typing import Any, Dict, Optional
 
 from paths import get_runtime_path
 
-STATE_PATH = str(get_runtime_path("state.json"))
+
+def _resolve_bot_id() -> str:
+    """Deriva un identificador estable para el bot según la carpeta actual."""
+
+    try:
+        cwd = os.path.abspath(os.getcwd())
+    except Exception:
+        return "bot"
+    base = os.path.basename(cwd) or "bot"
+    return base.replace(" ", "_")
+
+
+BOT_ID = _resolve_bot_id()
+STATE_PATH = str(get_runtime_path(f"state_{BOT_ID}.json"))
 
 
 def _load_state() -> Dict[str, Any]:
