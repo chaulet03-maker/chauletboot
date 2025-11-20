@@ -51,7 +51,6 @@ from bot.runtime_state import (
     set_equity_sim,
     update_protection_defaults,
 )
-from bot.paper_store import PaperStore
 from bot.settings_utils import get_val, read_config_raw
 from bot.telemetry.command_registry import CommandRegistry, normalize
 from bot.telemetry.formatter import open_msg
@@ -852,8 +851,9 @@ async def posicion_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     total = (split_data or {}).get("total") or {}
     qty = _safe_float(total.get("qty"))
-    store = PaperStore()
-    paper_state = store.get_state()
+    from bot.exchanges.paper import PaperAccount
+
+    paper_state = PaperAccount().get_state()
     paper_qty = _safe_float(paper_state.get("pos_qty"))
 
     if qty <= 0 and paper_qty <= 0:
@@ -911,8 +911,9 @@ async def posiciones_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     # Bloque principal (símbolo configurado) si hay posición abierta
     total = (split_data or {}).get("total") or {}
     total_qty = _safe_float(total.get("qty"))
-    store = PaperStore()
-    paper_state = store.get_state()
+    from bot.exchanges.paper import PaperAccount
+
+    paper_state = PaperAccount().get_state()
     paper_qty = _safe_float(paper_state.get("pos_qty"))
     if total_qty > 0:
         side = str(total.get("side") or "FLAT").upper()

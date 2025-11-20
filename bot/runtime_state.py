@@ -43,9 +43,15 @@ def _save_state(state: Dict[str, Any]) -> None:
 def get_mode(default: str = "simulado") -> str:
     st = _load_state()
     mode = str(st.get("mode") or default).lower()
-    if mode.lower() in ("paper", "simulated", "simul", "simulado"):
+    if mode.lower() in ("paper", "simulado", "simul", "simulated"):
         return "simulado"
     return "real" if mode in {"real", "live"} else "simulado"
+
+
+def get_runtime_mode(default: str = "simulado") -> str:
+    """Alias estable para obtener el modo de ejecución actual."""
+
+    return get_mode(default)
 
 
 def set_mode(mode: str) -> None:

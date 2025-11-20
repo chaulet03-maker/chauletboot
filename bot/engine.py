@@ -1738,9 +1738,9 @@ class TradingApp:
 
             # bloquear múltiples posiciones simuladas
             if runtime_get_mode() == "simulado":
-                from bot.paper_store import PaperStore
+                from bot.exchanges.paper import PaperAccount
 
-                if PaperStore().state.get("pos_qty", 0) > 0:
+                if PaperAccount().get_state().get("pos_qty", 0) > 0:
                     return
 
             order_result = await self.exchange.create_order(signal, qty, sl_price, tp_price)
@@ -1840,16 +1840,18 @@ class TradingApp:
                 + f"tp : {f'${tp_price:.2f}' if tp_price is not None else 'N/A'}\n"
                 + f"sl:  ${sl_price:.2f}"
             )
-            # Registrar posición simulada en PaperStore
-            if runtime_get_mode() == "simulado":
-                from bot.paper_store import PaperStore
+            # Registrar posición simulada
+            from bot.runtime_state import get_runtime_mode
 
-                ps = PaperStore()
-                ps.set_position(
+            if get_runtime_mode() == "simulado":
+                from bot.exchanges.paper import PaperAccount
+
+                PaperAccount().open_position(
                     qty=float(filled_qty),
                     side=signal,
                     entry=float(entry_price),
                     leverage=float(leverage),
+                    symbol=str(self.config.get("symbol", "")),
                     tp=float(tp_price) if tp_price else None,
                     sl=float(sl_price) if sl_price else None,
                 )
