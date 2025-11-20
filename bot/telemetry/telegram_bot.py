@@ -241,14 +241,17 @@ async def collect_status_snapshot(app) -> Dict[str, Any]:
     try:
         mode_value = getattr(app, "mode", None)
         if mode_value:
-            snapshot["mode_display"] = str(mode_value).upper()
+            mode_norm = str(mode_value).lower()
         else:
-            runtime_mode = runtime_get_mode()
-            snapshot["mode_display"] = (
-                "LIVE" if str(runtime_mode or "paper").lower() in {"real", "live"} else "PAPER"
-            )
+            mode_norm = str(runtime_get_mode() or "simulado").lower()
+
+        if mode_norm in {"real", "live"}:
+            snapshot["mode_display"] = "REAL"
+        else:
+            snapshot["mode_display"] = "SIMULADO"
     except Exception:
         snapshot["mode_display"] = None
+
     snapshot["mode_human"] = snapshot.get("mode_display") or "—"
 
     exchange = getattr(app, "exchange", None)
@@ -287,7 +290,11 @@ async def collect_status_snapshot(app) -> Dict[str, Any]:
     equity_val = await _resolve_equity_usdt(exchange)
     snapshot["equity"] = float(equity_val or 0.0)
     snapshot["equity_usdt"] = snapshot["equity"]
-    snapshot["equity_src"] = "FUTURES"
+    try:
+        mode_norm = str(runtime_get_mode() or "simulado").lower()
+        snapshot["equity_src"] = "FUTURES" if mode_norm in {"real", "live"} else "SIM"
+    except Exception:
+        snapshot["equity_src"] = "FUTURES"
 
     funding_rate = None
     try:

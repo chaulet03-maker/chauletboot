@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import math
 from typing import Any, Dict, Optional
 
 from paths import get_runtime_path
@@ -61,10 +62,23 @@ def set_mode(mode: str) -> None:
 
 
 def get_equity_sim() -> float:
+    """
+    Equity usado en modo SIMULADO.
+    Si no hay nada guardado o el valor es inválido/≤0, usa 1000 USDT por defecto.
+    """
+
+    st = _load_state()
+    raw = st.get("equity_sim", None)
     try:
-        return float(_load_state().get("equity_sim", 0.0) or 0.0)
+        # Si nunca se guardó, o viene algo choto, usar 1000
+        if raw is None:
+            return 1000.0
+        value = float(raw)
+        if not math.isfinite(value) or value <= 0:
+            return 1000.0
+        return value
     except Exception:
-        return 0.0
+        return 1000.0
 
 
 def set_equity_sim(value: float) -> None:
