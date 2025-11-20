@@ -44,7 +44,7 @@ from core.strategy import Strategy
 from core.indicators import add_indicators
 from config import S
 import trading
-from position_service import reconcile_bot_store_with_account
+from position_service import EPS_QTY, reconcile_bot_store_with_account
 from risk_guards import (
     clear_pause_if_expired,
     get_pause_manager,
@@ -1736,12 +1736,36 @@ class TradingApp:
                 self.strategy.calculate_tp(entry_price, qty, eq_on_open, side, leverage)
             )
 
-            # bloquear múltiples posiciones simuladas
-            if runtime_get_mode() == "simulado":
-                from bot.exchanges.paper import PaperAccount
+            # bloquear múltiples entradas y evitar mezclar simulada/real
+            from bot.exchanges.paper import PaperAccount
 
-                if PaperAccount().get_state().get("pos_qty", 0) > 0:
-                    return
+            def _has_paper_position() -> bool:
+                try:
+                    return abs(float(PaperAccount().get_state().get("pos_qty") or 0.0)) > EPS_QTY
+                except Exception:
+                    return False
+
+            def _has_live_position() -> bool:
+                try:
+                    if trading.POSITION_SERVICE is not None:
+                        st = trading.POSITION_SERVICE.get_status() or {}
+                        qty_val = st.get("qty")
+                        if qty_val is None:
+                            qty_val = st.get("bot_qty") or st.get("total_qty")
+                        return abs(float(qty_val or 0.0)) > EPS_QTY
+                except Exception:
+                    logging.debug("No se pudo chequear posición viva", exc_info=True)
+                return False
+
+            if _has_paper_position() or _has_live_position():
+                try:
+                    await self.notifier.send(
+                        "⚠️ Ya hay una posición abierta (simulada o real). Se ignora la nueva señal."
+                    )
+                except Exception:
+                    logging.debug("No se pudo notificar bloqueo de posición duplicada", exc_info=True)
+                _emit_motive({"reasons": ["position_block:already_open"]}, side_value=signal)
+                return
 
             order_result = await self.exchange.create_order(signal, qty, sl_price, tp_price)
 
@@ -1846,14 +1870,24 @@ class TradingApp:
             if get_runtime_mode() == "simulado":
                 from bot.exchanges.paper import PaperAccount
 
+                try:
+                    mark_px = float(
+                        (cached_position or {}).get("markPrice")
+                        or (cached_position or {}).get("mark")
+                        or entry_from_result
+                    )
+                except Exception:
+                    mark_px = float(entry_from_result)
+
                 PaperAccount().open_position(
                     qty=float(filled_qty),
                     side=signal,
-                    entry=float(entry_price),
+                    entry=float(entry_from_result),
                     leverage=float(leverage),
                     symbol=str(self.config.get("symbol", "")),
                     tp=float(tp_price) if tp_price else None,
                     sl=float(sl_price) if sl_price else None,
+                    mark=mark_px,
                 )
             self._risk_usd_trade = abs(entry_price - sl_price) * qty
             self._eq_on_open = eq_on_open
