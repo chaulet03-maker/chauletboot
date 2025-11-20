@@ -68,6 +68,20 @@ class Trader:
         if curr != getattr(self, "_last_mode", curr):
             self.reset_caches()
 
+    def get_balance_usdm(self):
+        from bot.runtime_state import get_runtime_mode
+
+        mode = get_runtime_mode()
+        if mode == "simulado":
+            from bot.exchanges.paper import PaperAccount
+
+            eq = PaperAccount().get_equity()
+            if eq is None or eq <= 0:
+                return 1000.0
+            return float(eq)
+
+        return self.equity()
+
     async def get_balance(self, exchange=None) -> float:
         """Devuelve el balance actual de la cuenta."""
         mode = runtime_get_mode()
