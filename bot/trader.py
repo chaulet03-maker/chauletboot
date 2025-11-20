@@ -122,17 +122,14 @@ class Trader:
     def equity(self, force_refresh: bool = False) -> float:
         """Devuelve el equity actual (USDT) usando las fuentes disponibles."""
         mode = runtime_get_mode()
-        if str(mode or "").lower() == "simulado":
-            # equity simulado persistente
+        if str(mode).lower() == "simulado":
             try:
                 eq = paper_get_equity()
                 if eq is None or eq <= 0:
-                    eq = 1000.0
-                self._balance = float(eq)
-                return self._balance
+                    return 1000.0
+                return float(eq)
             except Exception:
-                self._balance = 1000.0
-                return self._balance
+                return 1000.0
 
         self._ensure_mode_consistency()
         trading.ensure_initialized()
