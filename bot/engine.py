@@ -139,9 +139,9 @@ def _quantize_amount(
 
 def _runtime_mode_value() -> str:
     try:
-        return (runtime_get_mode() or "paper").lower()
+        return (runtime_get_mode() or "simulado").lower()
     except Exception:
-        return "paper"
+        return "simulado"
 
 
 def _runtime_is_paper() -> bool:

@@ -40,7 +40,7 @@ def _save_state(state: Dict[str, Any]) -> None:
     os.replace(tmp, STATE_PATH)
 
 
-def get_mode(default: str = "paper") -> str:
+def get_mode(default: str = "simulado") -> str:
     st = _load_state()
     mode = str(st.get("mode") or default).lower()
     if mode.lower() in ("paper", "simulated", "simul", "simulado"):
@@ -50,7 +50,7 @@ def get_mode(default: str = "paper") -> str:
 
 def set_mode(mode: str) -> None:
     st = _load_state()
-    st["mode"] = "real" if str(mode).lower() in {"real", "live"} else "paper"
+    st["mode"] = "real" if str(mode).lower() in {"real", "live"} else "simulado"
     _save_state(st)
 
 
