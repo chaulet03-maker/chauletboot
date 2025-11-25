@@ -5,7 +5,6 @@ import time
 from typing import Any, Dict, Optional
 
 from paper_store import DEFAULT_STATE, PaperStore
-from bot.storage.order_store import OrderStore
 
 
 class PaperAccount:
@@ -52,25 +51,11 @@ class PaperAccount:
             sym = symbol or ""
 
         try:
-            entry_price = float(entry)
-            qty_float = float(qty)
-            pos = {
-                "symbol": sym,
-                "side": side.upper(),
-                "qty": qty_float,
-                "entry": float(entry_price),
-                "timestamp": time.time(),
-                "mode": "SIM",
-            }
-
-            store = OrderStore()
-            store.save_position(pos)
-
             return self.store.set_position(
                 symbol=sym,
-                qty=qty_float,
+                qty=float(qty),
                 side=side,
-                entry=entry_price,
+                entry=float(entry),
                 leverage=float(leverage),
                 tp=tp if tp is None else float(tp),
                 sl=sl if sl is None else float(sl),
