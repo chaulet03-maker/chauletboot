@@ -660,13 +660,10 @@ async def _compute_position_split(app) -> tuple[Dict[str, Dict[str, Any]], float
 
     trader = getattr(app, "trader", None)
     bot_pos = None
-    if mode == "simulado" and trader and hasattr(trader, "check_open_position"):
-        try:
-            bot_pos = await trader.check_open_position(exchange=None)
-        except Exception:
-            bot_pos = None
-    else:
-        bot_pos = None
+    if mode == "simulado":
+        from trading import POSITION_SERVICE
+
+        bot_pos = POSITION_SERVICE.get_status()
 
     mark_price = None
     if exchange and hasattr(exchange, "get_current_price"):
@@ -858,9 +855,9 @@ async def posicion_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     total = (split_data or {}).get("total") or {}
     qty = _safe_float(total.get("qty"))
-    from bot.exchanges.paper import PaperAccount
+    from trading import POSITION_SERVICE
 
-    paper_state = PaperAccount().get_state()
+    paper_state = POSITION_SERVICE.store.get_state()
     paper_qty = _safe_float(paper_state.get("pos_qty"))
 
     if qty <= 0 and paper_qty <= 0:
@@ -918,9 +915,9 @@ async def posiciones_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     # Bloque principal (símbolo configurado) si hay posición abierta
     total = (split_data or {}).get("total") or {}
     total_qty = _safe_float(total.get("qty"))
-    from bot.exchanges.paper import PaperAccount
+    from trading import POSITION_SERVICE
 
-    paper_state = PaperAccount().get_state()
+    paper_state = POSITION_SERVICE.store.get_state()
     paper_qty = _safe_float(paper_state.get("pos_qty"))
     if total_qty > 0:
         side = str(total.get("side") or "FLAT").upper()
