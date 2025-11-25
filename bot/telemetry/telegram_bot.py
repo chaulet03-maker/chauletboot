@@ -902,116 +902,26 @@ async def posicion_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await message.reply_html("\n\n".join(sections))
 
 
-async def posiciones_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    app = _get_app_from_context(context)
-    message = update.effective_message
-    if app is None or message is None:
+from bot.storage.order_store import OrderStore
+
+
+async def posiciones_command(update, context):
+    store = OrderStore()
+    posiciones = store.load_positions()
+
+    if not posiciones:
+        await update.message.reply_text("No hay posiciones abiertas en SIM.")
         return
 
-    try:
-        split_data, mark_price, symbol_cfg = await _compute_position_split(app)
-    except Exception as exc:
-        await message.reply_text(f"No pude obtener la información de posiciones: {exc}")
-        return
-
-    sections: List[str] = []
-    # Bloque principal (símbolo configurado) si hay posición abierta
-    total = (split_data or {}).get("total") or {}
-    total_qty = _safe_float(total.get("qty"))
-    from bot.exchanges.paper import PaperAccount
-
-    paper_state = PaperAccount().get_state()
-    paper_qty = _safe_float(paper_state.get("pos_qty"))
-    if total_qty > 0:
-        side = str(total.get("side") or "FLAT").upper()
-        entry_px = _safe_float(total.get("entry_price"))
-        entry_txt = f"{entry_px:,.2f}" if entry_px > 0 else "—"
-        mark_txt = f"{_safe_float(mark_price):,.2f}" if _safe_float(mark_price) > 0 else "—"
-        pnl = _safe_float(total.get("pnl"))
-        sections.append(
-            f"<b>📍 {symbol_cfg} {side}</b>\n"
-            f"• Qty: {total_qty:.6f}\n"
-            f"• Entrada: {entry_txt} | Mark: {mark_txt}\n"
-            f"• PnL: {pnl:+,.2f}"
+    partes = []
+    for p in posiciones:
+        partes.append(
+            f"<b>{p['symbol']}</b> {p['side']}<br>"
+            f"Qty: {p['qty']}<br>"
+            f"Entrada: {p['entry']}"
         )
 
-    if paper_qty > 0:
-        paper_side = str(paper_state.get("side") or "FLAT").upper()
-        paper_entry = _safe_float(paper_state.get("avg_price"))
-        paper_entry_txt = f"{paper_entry:,.2f}" if paper_entry > 0 else "—"
-        paper_mark = _safe_float(paper_state.get("mark"))
-        paper_mark_txt = f"{paper_mark:,.2f}" if paper_mark > 0 else "—"
-        paper_tp = _safe_float(paper_state.get("tp"))
-        paper_sl = _safe_float(paper_state.get("sl"))
-        paper_symbol = str(paper_state.get("symbol") or symbol_cfg)
-        sections.append(
-            f"<b>📍 SIMULADO {paper_symbol} {paper_side}</b>\n"
-            f"• Qty: {paper_qty:.6f}\n"
-            f"• Entrada: {paper_entry_txt} | Mark: {paper_mark_txt}\n"
-            f"• TP: {_fmt_usd(paper_tp)} | SL: {_fmt_usd(paper_sl)}"
-        )
-
-    try:
-        allpos = await app.exchange.list_open_positions()
-    except Exception:
-        allpos = []
-
-    symbol_norm = _normalized_symbol(symbol_cfg)
-    other_sections: List[str] = []
-    for entry in allpos or []:
-        merged = _merge_position_entry(entry)
-        sym_raw = str(merged.get("symbol") or "").replace("/", "")
-        if not sym_raw:
-            continue
-        if sym_raw.upper() == symbol_norm:
-            continue
-        qty = _safe_float(
-            merged.get("contracts")
-            or merged.get("positionAmt")
-            or merged.get("qty")
-            or merged.get("size")
-        )
-        if qty <= 0:
-            continue
-        side = str(merged.get("side") or merged.get("positionSide") or "FLAT").upper()
-        entry_px = _safe_float(merged.get("entryPrice") or merged.get("avgPrice"))
-        mark_px = _safe_float(merged.get("markPrice") or merged.get("mark"))
-        leverage_raw = merged.get("leverage") or merged.get("isolatedLeverage")
-        leverage = _safe_float(leverage_raw) if leverage_raw not in (None, "") else 1.0
-        if leverage <= 0:
-            leverage = 1.0
-        leverage_disp = f"{leverage:g}"
-        pnl = 0.0
-        if entry_px > 0 and mark_px > 0:
-            pnl = (mark_px - entry_px) * qty
-            if side == "SHORT":
-                pnl = -pnl
-        entry_txt = f"{entry_px:,.2f}" if entry_px > 0 else "—"
-        mark_txt = f"{mark_px:,.2f}" if mark_px > 0 else "—"
-        sl_px = _safe_float(merged.get("stopLoss") or merged.get("slOrderPrice"))
-        tp_px = _safe_float(merged.get("takeProfit") or merged.get("tpOrderPrice"))
-        symbol_disp = merged.get("symbol") or merged.get("pair") or sym_raw
-        protections_line = (
-            f"• SL: {_fmt_usd(sl_px)} | TP: {_fmt_usd(tp_px)}" if sl_px or tp_px else ""
-        )
-        other_sections.append(
-            f"<b>{symbol_disp} {side}</b> (x{leverage_disp})\n"
-            f"• Qty: {qty:.6f}\n"
-            f"• Entrada: {entry_txt} | Mark: {mark_txt}\n"
-            f"• PnL: {pnl:+,.2f}"
-            + (f"\n{protections_line}" if protections_line else "")
-        )
-
-    if other_sections:
-        sections.append("<b>📈 Otras posiciones</b>")
-        sections.append("\n\n".join(other_sections))
-
-    # Si no hay sección principal ni otras, no hay posiciones
-    if not sections:
-        await message.reply_text("No hay posiciones abiertas.")
-        return
-
-    await message.reply_html("\n\n".join(sections))
+    await update.message.reply_html("<br><br>".join(partes))
 
 
 # Valores por defecto para TP/SL expresados como % del precio de entrada.
