@@ -2416,9 +2416,15 @@ async def handle_open_manual(update: Update, context: ContextTypes.DEFAULT_TYPE)
     app = _get_app_from_context(context)
     if app is None:
         return
-    if not getattr(app, "is_live", False):
-        await message.reply_text("Abrir manual está disponible sólo en modo REAL.")
-        return
+    from bot.mode_manager import get_mode as get_mode_bot
+
+    try:
+        mode_value = get_mode_bot() or runtime_get_mode()
+    except Exception:
+        mode_value = runtime_get_mode()
+
+    mode_norm = str(mode_value or "simulado").lower()
+    is_real = mode_norm in {"real", "live"} or getattr(app, "is_live", False)
 
     side_txt = match.group(1).upper()
     leverage = int(match.group(2))
@@ -2427,6 +2433,53 @@ async def handle_open_manual(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
 
     symbol = app.config.get("symbol", "BTC/USDT") if getattr(app, "config", None) else "BTC/USDT"
+
+    # --- ruta SIMULADO: operar solo sobre PaperStore / POSITION_SERVICE ---
+    if not is_real:
+        from trading import POSITION_SERVICE
+
+        svc = POSITION_SERVICE
+        store = getattr(svc, "store", None) if svc is not None else None
+        if store is None:
+            await message.reply_text("Modo SIMULADO: store paper no inicializado, no puedo abrir manual.")
+            return
+
+        # Precio de referencia para la entrada simulada
+        price = await asyncio.to_thread(trading.get_latest_price, symbol)
+        if price is None or price <= 0:
+            await message.reply_text("No pude obtener el precio actual para abrir en SIMULADO.")
+            return
+
+        state = store.get_state()
+        equity = float(state.get("equity") or 0.0)
+        if equity <= 0:
+            equity = 1000.0  # fallback por las dudas
+
+        risk_pct = float(MANUAL_OPEN_RISK_PCT or 0.5)
+        notional = equity * (risk_pct / 100.0) * leverage
+        qty_raw = notional / price if price else 0.0
+        if qty_raw <= 0:
+            await message.reply_text("Qty simulada resultó 0. Ajustá MANUAL_OPEN_RISK_PCT o el leverage.")
+            return
+
+        qty = float(qty_raw)
+        signed_qty = qty if side_txt == "LONG" else -qty
+
+        store.set_position(
+            symbol=symbol,
+            qty=signed_qty,
+            side=side_txt,
+            entry=float(price),
+            leverage=float(leverage),
+            mark=float(price),
+        )
+
+        await message.reply_text(
+            f"✅ [SIM] Abierta {side_txt} x{leverage} qty={qty:.6f} a precio≈{price:,.2f}"
+        )
+        return
+
+    # --- a partir de acá queda tu ruta REAL tal cual estaba ---
     client = trading.get_live_client()
     if client is None:
         await message.reply_text("No hay cliente LIVE disponible para abrir la posición.")
