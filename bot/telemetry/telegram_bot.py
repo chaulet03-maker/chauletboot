@@ -2455,15 +2455,28 @@ async def handle_open_manual(update: Update, context: ContextTypes.DEFAULT_TYPE)
         if equity <= 0:
             equity = 1000.0  # fallback por las dudas
 
-        risk_pct = float(MANUAL_OPEN_RISK_PCT or 0.5)
-        notional = equity * (risk_pct / 100.0) * leverage
+        from bot.telemetry.telegram_bot import _get_equity_fraction
+
+        risk_frac = float(_get_equity_fraction(app))  # ej: 0.98
+        notional = equity * risk_frac * leverage
         qty_raw = notional / price if price else 0.0
         if qty_raw <= 0:
-            await message.reply_text("Qty simulada resultó 0. Ajustá MANUAL_OPEN_RISK_PCT o el leverage.")
+            await message.reply_text("Qty simulada resultó 0. Ajustá el equity % o el leverage.")
             return
 
         qty = float(qty_raw)
         signed_qty = qty if side_txt == "LONG" else -qty
+
+        # evitar doble posicion en SIM
+        current_state = store.get_state()
+        if abs(float(current_state.get("pos_qty") or 0.0)) > 0:
+            await message.reply_text("⚠ Ya hay una posición SIM abierta. Cerrala antes de abrir otra.")
+            return
+
+        # calculo basico de tp/sl
+        tp1 = price * 1.05
+        tp2 = price * 1.10
+        sl = price * 0.975
 
         store.set_position(
             symbol=symbol,
@@ -2472,11 +2485,25 @@ async def handle_open_manual(update: Update, context: ContextTypes.DEFAULT_TYPE)
             entry=float(price),
             leverage=float(leverage),
             mark=float(price),
+            tp=tp1,
+            sl=sl
         )
 
-        await message.reply_text(
-            f"✅ [SIM] Abierta {side_txt} x{leverage} qty={qty:.6f} a precio≈{price:,.2f}"
+        now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+
+        msg = (
+            f"📌 SIMULADO - NUEVA POSICIÓN\n"
+            f"• Hora: {now}\n"
+            f"• Lado: {side_txt}\n"
+            f"• Qty: {qty:.6f}\n"
+            f"• Entrada: {price:,.2f}\n"
+            f"• TP1: {tp1:,.2f} | TP2: {tp2:,.2f}\n"
+            f"• SL: {sl:,.2f}\n"
+            f"• Equity usado: {notional/leverage:,.2f} USD\n"
+            f"• Lev: x{leverage}\n"
         )
+
+        await message.reply_text(msg)
         return
 
     # --- a partir de acá queda tu ruta REAL tal cual estaba ---
