@@ -2444,6 +2444,11 @@ async def handle_open_manual(update: Update, context: ContextTypes.DEFAULT_TYPE)
             await message.reply_text("Modo SIMULADO: store paper no inicializado, no puedo abrir manual.")
             return
 
+        status = svc.get_status() or {}
+        if status.get("is_open"):
+            await message.reply_text("⚠ Ya hay una posición abierta.")
+            return
+
         # Precio de referencia para la entrada simulada
         price = await asyncio.to_thread(trading.get_latest_price, symbol)
         if price is None or price <= 0:
@@ -2487,6 +2492,19 @@ async def handle_open_manual(update: Update, context: ContextTypes.DEFAULT_TYPE)
             mark=float(price),
             tp=tp1,
             sl=sl
+        )
+
+        # 🔥 SINCRONIZACIÓN CRÍTICA (esta línea faltaba)
+        update_open_position(
+            symbol=symbol,
+            side=side_txt,
+            qty=signed_qty,
+            entry=float(price),
+            leverage=float(leverage),
+            mark=float(price),
+            tp1=tp1,
+            tp2=tp2,
+            sl=sl,
         )
 
         now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
