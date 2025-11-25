@@ -1,15 +1,8 @@
 import sqlite3
 import logging
-import os
 import pandas as pd
 from datetime import datetime, timedelta
 from typing import Optional
-
-__path__ = [os.path.join(os.path.dirname(__file__), "storage")]
-try:
-    __spec__.submodule_search_locations = __path__
-except Exception:
-    pass
 
 class Storage:
     def __init__(self, cfg):
